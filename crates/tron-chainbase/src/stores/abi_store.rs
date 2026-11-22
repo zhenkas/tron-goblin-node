@@ -44,6 +44,12 @@ impl AbiStore {
         Ok(())
     }
 
+    /// Whether a row exists for `address` — an EMPTY row counts (java-tron
+    /// `AbiStore.has`). A contract created without an ABI still gets a row.
+    pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
+        Ok(self.backend.get(address.as_bytes())?.is_some())
+    }
+
     /// Remove an ABI row -- SELFDESTRUCT cleanup. Idempotent.
     pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
         self.backend.delete(address.as_bytes())?;

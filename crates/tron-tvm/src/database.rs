@@ -851,6 +851,20 @@ impl DatabaseCommit for TronDatabase {
                 contracts
                     .put(&tron_addr, &smart_contract)
                     .expect("db error in DatabaseCommit::commit writing contract row");
+                // java `RepositoryImpl.commitContractCache`: every contract
+                // written to the root also gets an ABI row unless one exists
+                // (`if (!abiStore.has(key)) abiStore.put(key, new
+                // AbiCapsule(contractCapsule))`). A nested deploy has no ABI,
+                // so the row is empty — but it is there.
+                if let Some(abi) = &self.abi {
+                    if !abi
+                        .contains(&tron_addr)
+                        .expect("db error in DatabaseCommit::commit reading contract abi")
+                    {
+                        abi.put_raw(&tron_addr, &[])
+                            .expect("db error in DatabaseCommit::commit writing contract abi");
+                    }
+                }
             }
 
             // Apply storage diffs.

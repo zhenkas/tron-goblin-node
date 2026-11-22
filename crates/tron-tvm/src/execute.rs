@@ -2074,10 +2074,19 @@ fn execute_create_inner(
                         .put(&tron_contract_addr, &row)
                         .expect("db error in execute_create writing contract row");
                 }
-                if let (Some(abi_store), Some(abi)) = (&stores.abi, &smart_contract.abi) {
-                    abi_store
-                        .put(&tron_contract_addr, abi)
-                        .expect("db error in execute_create writing contract abi");
+                // java `RepositoryImpl.commitContractCache`: the ABI row is
+                // written whenever none exists yet — also for a contract
+                // deployed without an ABI, whose row is then empty.
+                if let Some(abi_store) = &stores.abi {
+                    if !abi_store
+                        .contains(&tron_contract_addr)
+                        .expect("db error in execute_create reading contract abi")
+                    {
+                        let abi = smart_contract.abi.clone().unwrap_or_default();
+                        abi_store
+                            .put(&tron_contract_addr, &abi)
+                            .expect("db error in execute_create writing contract abi");
+                    }
                 }
                 VmOutcome::Success {
                     return_data: tron_contract_addr.as_bytes().to_vec(),
