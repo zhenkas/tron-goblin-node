@@ -982,6 +982,56 @@ pub fn reset_energy_pre_consume(
     Ok(())
 }
 
+/// java `TransactionTrace.pay` for a SUCCESS that used NO energy, under
+/// `ALLOW_TVM_RESOURCE_OPTIMIZATION` (proposal #104):
+///
+/// ```java
+/// if (dynamicPropertiesStore.allowTvmResourceOptimization()
+///     && receipt.getEnergyUsageTotal() <= 0) {
+///   if (origin != null && !caller.getAddress().equals(origin.getAddress())) {
+///     accountStore.put(origin.getAddress().toByteArray(), origin);
+///   }
+///   accountStore.put(caller.getAddress().toByteArray(), caller);
+/// }
+/// ```
+///
+/// i.e. the `resetAccountUsage`d origin (first, distinct and existing only) and
+/// caller are stored even though `ReceiptCapsule.payEnergyBill` returns early.
+/// Before #104 nothing stores them, so the caller must NOT run any reset for a
+/// zero-energy success: the committed budget reservation simply stays.
+///
+/// Unlike [`reset_energy_pre_consume`] an account WITHOUT a budget capture is
+/// reset and stored as well, with an all-zero capture — java feeds
+/// `resetAccountUsage` the receipt's fields, which are all zero when
+/// `VMActuator.call` computed no budget (a contract with no code). That leaves
+/// the usage as it is but rewrites the window. Same `supportUnfreezeDelay()`
+/// gate as the reset itself.
+pub fn store_zero_usage_energy_reset(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    caller: &Address,
+    origin: Option<&Address>,
+) -> Result<(), EnergyError> {
+    if !dyn_props.support_unfreeze_delay() {
+        return Ok(());
+    }
+    let support_v2 = dyn_props.support_allow_cancel_all_unfreeze_v2();
+    let reset_and_store = |addr: &Address| -> Result<(), EnergyError> {
+        if let Some(mut a) = accounts.get(addr)? {
+            let cap = get_pre_tx_energy(addr).unwrap_or_default();
+            reset_account_usage(&mut a, &cap, support_v2);
+            accounts.put(addr, &a)?;
+        }
+        Ok(())
+    };
+    if let Some(o) = origin {
+        if o != caller {
+            reset_and_store(o)?;
+        }
+    }
+    reset_and_store(caller)
+}
+
 /// VM-REVERT energy handling: on a non-Success VM outcome java NEVER commits the
 /// budget pre-consume (it lives in the discarded `rootRepository` cache), so
 /// `payEnergyBill` reads the ORIGINAL `accountStore` row and `useEnergy` decays

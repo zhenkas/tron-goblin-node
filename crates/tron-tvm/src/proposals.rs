@@ -120,6 +120,18 @@ pub struct ProposalSet {
     pub fork_4_8_2_3: bool,
     /// Effective storage optimization (proposal 99 or 102): 48-byte row keys.
     pub allow_optimize_tvm_storage: bool,
+    /// `ALLOW_TVM_VOTE_POWER_OPTIMIZATION` (proposal #103 / TIP-944, java
+    /// `VMConfig.allowTvmVotePowerOptimization()`). Only takes effect together
+    /// with `supportAllowNewResourceModel()`: the Stake-1.0 FREEZE / UNFREEZE,
+    /// VOTEWITNESS and SELFDESTRUCT bridges then maintain `old_tron_power`
+    /// the way the actuators do (`TronDatabase::optimize_vote_power_state`).
+    pub allow_tvm_vote_power_optimization: bool,
+    /// `ALLOW_TVM_RESOURCE_OPTIMIZATION` (proposal #104 / TIP-945, java
+    /// `VMConfig.allowTvmResourceOptimization()`): SELFDESTRUCT re-floors the
+    /// Stake-2.0 weights, a nested CREATE keeps a constructor REVERT whose
+    /// data starts with 0xEF, and `TransactionTrace.pay` stores the energy
+    /// reset of a zero-energy success.
+    pub allow_tvm_resource_optimization: bool,
 }
 
 impl ProposalSet {
@@ -162,6 +174,8 @@ impl ProposalSet {
             fork_4_8_2_2: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
             fork_4_8_2_3: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_3),
             allow_optimize_tvm_storage: dps.allow_tvm_storage_optimization(),
+            allow_tvm_vote_power_optimization: flag(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION"),
+            allow_tvm_resource_optimization: flag(b"ALLOW_TVM_RESOURCE_OPTIMIZATION"),
         }
     }
 
@@ -201,6 +215,9 @@ impl ProposalSet {
             fork_4_8_2_2: true,
             fork_4_8_2_3: true,
             allow_optimize_tvm_storage: false,
+            // Proposals 103 / 104 (java-tron 4.8.3) are not active on mainnet.
+            allow_tvm_vote_power_optimization: false,
+            allow_tvm_resource_optimization: false,
         }
     }
 
@@ -368,5 +385,30 @@ mod tests {
         dps.save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_2, &[1u8; 27]);
         dps.save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_3, &[1u8; 27]);
         assert_eq!(ProposalSet::from_store(&dps), ProposalSet::all_enabled());
+    }
+
+    /// Proposals 103 / 104 (java-tron 4.8.3): absent and `0` read as off,
+    /// only the exact value `1` activates each, independently of the other.
+    #[test]
+    fn from_store_reads_the_4_8_3_tvm_optimization_flags() {
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let dps = DynamicPropertiesStore::new(backend);
+        let p = ProposalSet::from_store(&dps);
+        assert!(!p.allow_tvm_vote_power_optimization);
+        assert!(!p.allow_tvm_resource_optimization);
+
+        dps.put_long(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION", 0);
+        dps.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 1);
+        let p = ProposalSet::from_store(&dps);
+        assert!(!p.allow_tvm_vote_power_optimization);
+        assert!(p.allow_tvm_resource_optimization);
+
+        dps.put_long(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION", 1);
+        dps.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 0);
+        let p = ProposalSet::from_store(&dps);
+        assert!(p.allow_tvm_vote_power_optimization);
+        assert!(!p.allow_tvm_resource_optimization);
     }
 }

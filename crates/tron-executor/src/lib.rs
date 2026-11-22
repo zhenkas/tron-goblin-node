@@ -1176,6 +1176,10 @@ pub enum BlockExecError {
     Structural(#[from] BlockValidateError),
     #[error("block has no header / raw_data")]
     NoHeader,
+    /// java 4.8.3 `Manager.validateTransactionSignatureLengths` under
+    /// `ALLOW_STRICT_ECDSA_VALIDATION`: a signature longer than 68 bytes.
+    #[error("transaction signature size is {0}")]
+    TransactionSignatureLength(usize),
     #[error(
         "account_state_root mismatch at block {block_num}: expected {expected}, computed {computed}"
     )]
@@ -2572,6 +2576,20 @@ pub fn expected_block_signer(
 /// handed in. The top-level [`execute_block_inner`] dispatches here
 /// either against base backends directly (no undo) or against a
 /// [`BlockSession`] overlay (undo path).
+/// `SignUtils.isValidLength`: `PER_SIGN_LENGTH..=MAX_PER_SIGN_LENGTH`.
+const STRICT_SIGNATURE_LENGTHS: std::ops::RangeInclusive<usize> = 65..=68;
+
+/// The first transaction signature whose length strict ECDSA validation
+/// rejects, in block order.
+fn strict_signature_length_violation(block: &Block) -> Option<usize> {
+    block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.signature.iter())
+        .map(|sig| sig.len())
+        .find(|len| !STRICT_SIGNATURE_LENGTHS.contains(len))
+}
+
 fn execute_block_logic(
     state: &StateBackends,
     block: &Block,
@@ -2603,6 +2621,21 @@ fn execute_block_logic(
         // every delegated cold/hot-key SR. See [`expected_block_signer`].
         let expected = expected_block_signer(block, state)?;
         verify_witness_signature(block, Some(&expected))?;
+    }
+
+    // java 4.8.3, proposal 100: once strict ECDSA validation is active every
+    // transaction signature must be 65..=68 bytes, otherwise the whole block
+    // is rejected before any signature is verified. The lower bound already
+    // fails signer recovery below. The witness signature is deliberately not
+    // bounded here: java truncates an over-long one to 65 bytes on network
+    // receipt (`BlockCapsule.sanitize`) before its strict length check runs.
+    if DynamicPropertiesStore::new(state.dyn_props.clone())
+        .get_long(b"ALLOW_STRICT_ECDSA_VALIDATION")
+        == Some(1)
+    {
+        if let Some(len) = strict_signature_length_violation(block) {
+            return Err(BlockExecError::TransactionSignatureLength(len));
+        }
     }
 
     // Lift the header out once — needed both by the per-tx loop (for
@@ -4282,6 +4315,32 @@ fn vm_energy_budget_for_trigger(
     budget.max(0) as u64
 }
 
+/// java `VMActuator.call`: `!isNotEmpty(rootRepository.getCode(contractAddress))`
+/// for a contract that exists — the case in which java builds no `Program` and
+/// computes no energy budget. Code is resolved the way the VM's database does
+/// (`TronDatabase::basic_ref`): keyed by the contract address (java's layout),
+/// falling back to the account's `code_hash` key. A target whose account row is
+/// missing is NOT reported here; it keeps the regular budget path.
+fn trigger_target_has_no_code(
+    view: &StateBackends,
+    code: &Arc<dyn KvBackend>,
+    contract_addr: Option<&Address>,
+) -> bool {
+    let Some(contract_addr) = contract_addr else {
+        return false;
+    };
+    let accounts = tron_chainbase::AccountStore::new(view.accounts.clone() as _);
+    let Ok(Some(account)) = accounts.get(contract_addr) else {
+        return false;
+    };
+    let code = tron_chainbase::CodeStore::new(code.clone() as _);
+    let stored = |key: &[u8]| matches!(code.get(key), Ok(Some(bytes)) if !bytes.is_empty());
+    if stored(contract_addr.as_bytes()) {
+        return false;
+    }
+    !(account.code_hash.len() == 32 && stored(&account.code_hash))
+}
+
 /// Real `CreateSmartContract` VM energy budget — java
 /// `getAccountEnergyLimitWithFixRatio(caller, feeLimit, callValue)` (the
 /// creator IS the caller, so no origin split).
@@ -4520,16 +4579,27 @@ fn execute_vm_tx(
             // with the full budget = caller's staked + balance-buyable energy
             // (capped by feeLimit) PLUS the contract creator's subsidy. Lenient
             // mode (unsigned/test) keeps the historical fallback.
+            //
+            // java `VMActuator.call` computes that budget — and with it the
+            // Stake-2.0 frozen-energy reservation — only inside
+            // `if (isNotEmpty(code))`. A contract with no code gets no
+            // `Program`, no budget and no reservation: the accounts' energy
+            // rows are not touched before `TransactionTrace.pay`.
             let energy_limit = if config.require_fee_limit {
-                vm_energy_budget_for_trigger(
-                    view,
-                    &dp,
-                    caller.as_ref(),
-                    contract_addr.as_ref(),
-                    trigger.call_value,
-                    fee_limit,
-                    now_slot,
-                )
+                if trigger_target_has_no_code(view, code, contract_addr.as_ref()) {
+                    energy::clear_pre_tx_energy_quota();
+                    energy_limit
+                } else {
+                    vm_energy_budget_for_trigger(
+                        view,
+                        &dp,
+                        caller.as_ref(),
+                        contract_addr.as_ref(),
+                        trigger.call_value,
+                        fee_limit,
+                        now_slot,
+                    )
+                }
             } else {
                 energy_limit
             };
@@ -4651,9 +4721,13 @@ fn execute_vm_tx(
     // PERSISTED it before the VM so an in-VM UNDELEGATE/DELEGATE read the
     // un-decayed base. Now reconcile it like java `TransactionTrace.pay`:
     //   * SUCCESS → `resetAccountUsage(V2)`: give back the unused pre-consume so
-    //     the charge bills off the post-decay base. Runs even when
-    //     energy_used == 0 (java resets regardless), so it's OUTSIDE the
-    //     `energy_used > 0` guard.
+    //     the charge bills off the post-decay base. java resets the in-memory
+    //     capsules regardless of the energy used, but only
+    //     `ReceiptCapsule.payEnergyBill` stores them and it returns early when
+    //     `energyUsageTotal <= 0`. So for a zero-energy success the reset is
+    //     persisted only under ALLOW_TVM_RESOURCE_OPTIMIZATION (#104, which
+    //     adds the missing `accountStore.put`); before it the reservation the
+    //     budget committed stays on the accounts.
     //   * REVERT/HALT/etc. → UNDO the pre-consume: java never committed it (it
     //     lived in the discarded rootRepository cache), so the charge must decay
     //     from the ORIGINAL row. Our budget persisted to the outer session
@@ -4684,9 +4758,26 @@ fn execute_vm_tx(
             // leaves an exception set — so the pre-consume is NOT reset (it was
             // never committed in java's discarded rootRepository), and the energy
             // charge below decays from the original row.
-            if matches!(&outcome, Some(tron_tvm::execute::VmOutcome::Success { .. })) {
-                let _ =
-                    energy::reset_energy_pre_consume(&accounts, &dp_store, &caller, origin.as_ref());
+            if let Some(tron_tvm::execute::VmOutcome::Success { energy_used, .. }) = &outcome {
+                if *energy_used > 0 {
+                    let _ = energy::reset_energy_pre_consume(
+                        &accounts,
+                        &dp_store,
+                        &caller,
+                        origin.as_ref(),
+                    );
+                } else if dp_store
+                    .get_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION")
+                    .unwrap_or(0)
+                    == 1
+                {
+                    let _ = energy::store_zero_usage_energy_reset(
+                        &accounts,
+                        &dp_store,
+                        &caller,
+                        origin.as_ref(),
+                    );
+                }
             } else {
                 let _ = energy::revert_energy_pre_consume(
                     &accounts,
@@ -5420,5 +5511,31 @@ mod standby_ranking_tests {
             a1
         };
         assert_eq!(out[0].0, expected_first, "flag-off tie-break must be hashCode DESC");
+    }
+}
+
+#[cfg(test)]
+mod strict_signature_length_tests {
+    use super::*;
+
+    fn block_with_signature_lengths(lengths: &[usize]) -> Block {
+        Block {
+            transactions: lengths
+                .iter()
+                .map(|len| tron_proto::Transaction {
+                    signature: vec![vec![1u8; *len]],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strict_validation_accepts_65_to_68_bytes_only() {
+        assert_eq!(strict_signature_length_violation(&block_with_signature_lengths(&[65, 66, 67, 68])), None);
+        assert_eq!(strict_signature_length_violation(&block_with_signature_lengths(&[65, 69, 70])), Some(69));
+        assert_eq!(strict_signature_length_violation(&block_with_signature_lengths(&[64])), Some(64));
+        assert_eq!(strict_signature_length_violation(&block_with_signature_lengths(&[])), None);
     }
 }

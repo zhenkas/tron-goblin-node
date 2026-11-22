@@ -954,3 +954,28 @@ fn swap_is_rejected_until_harden_exchange_activates() {
         "got: {err:?}"
     );
 }
+
+// java 4.8.3 (TIP-937): CLOSE_EXCHANGE level 1 closes create / inject / trade,
+// level 2 closes withdraw as well. The check precedes every other validation.
+#[test]
+fn close_exchange_levels_gate_each_contract() {
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000, 1_024_000_000);
+    let create = tron_proto::ExchangeCreateContract::default();
+    let inject = tron_proto::ExchangeInjectContract::default();
+    let withdraw = tron_proto::ExchangeWithdrawContract::default();
+    let trade = tron_proto::ExchangeTransactionContract::default();
+    let closed = |r: Result<(), ActuatorError>| matches!(r, Err(ActuatorError::ExchangeCloseLevel(_)));
+    let run = |ctx: &Ctx| {
+        (
+            closed(exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &create)),
+            closed(exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &inject)),
+            closed(exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &withdraw)),
+            closed(exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &trade)),
+        )
+    };
+    assert_eq!(run(&ctx), (false, false, false, false));
+    ctx.dp.put_long(b"CLOSE_EXCHANGE", 1);
+    assert_eq!(run(&ctx), (true, true, false, true));
+    ctx.dp.put_long(b"CLOSE_EXCHANGE", 2);
+    assert_eq!(run(&ctx), (true, true, true, true));
+}

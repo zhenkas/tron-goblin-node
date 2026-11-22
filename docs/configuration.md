@@ -47,7 +47,10 @@ Controls discovery, outbound sync, inbound serving, and peer persistence.
 - `use_mainnet_seeds`: mix built-in seeds into an explicit peer set.
 - `discover_enable`: enable UDP discovery.
 - `discover_tree_urls`: DNS discovery trees walked at startup.
-- `advertise_port`: port announced in handshakes and used for inbound listener.
+- `advertise_port`: port announced in handshakes and used for inbound listener
+  (1..65535; the node refuses to start otherwise).
+- `advertise_host`: optional IPv4 address announced in handshakes and discovery
+  packets. Unset announces `127.0.0.1`; the bind address is never announced.
 - `listen`: accept inbound peers and serve sync protocol.
 - `progress_log_interval`: sync progress heartbeat interval.
 - `disabled`: run without the P2P sync loop.

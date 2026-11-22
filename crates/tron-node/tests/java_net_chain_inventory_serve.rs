@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 use tron_chainbase::{BlockIndexStore, KvBackend, MemBackend};
-use tron_node::sync::serve_sync_block_chain_ids;
+use tron_node::sync::{chain_inventory_ends_below_announced_head, serve_sync_block_chain_ids};
 use tron_types::BlockId;
 
 /// java `NetConstants.SYNC_FETCH_BATCH_NUM`.
@@ -212,5 +212,120 @@ fn served_ids_are_consecutive() {
     let (ids, _) = serve_sync_block_chain_ids(&bi, 120, &loc);
     for pair in ids.windows(2) {
         assert_eq!(pair[1].num(), pair[0].num() + 1);
+    }
+}
+
+// ---- java-tron 4.8.3: rules for a terminal (remainNum == 0) answer ----
+
+/// The checks java-tron 4.8.3 added to `ChainInventoryMsgHandler.check` for
+/// `remainNum == 0` (plus the negative-remain guard), restricted to what
+/// depends on the answer, the locator, and the head our Hello announced on
+/// that connection. Returns the java exception message on rejection. The
+/// third 4.8.3 rule (a block inventory we advertised in the previous 15 s)
+/// needs the peer's own state and is covered by the caller folding every
+/// announced block into `hello_head_num`.
+fn java_483_terminal_answer_check(
+    ids: &[BlockId],
+    remain_num: i64,
+    peer_locator: &[tron_proto::block_inventory::BlockId],
+    hello_head_num: i64,
+) -> Result<(), String> {
+    if remain_num < 0 {
+        return Err(format!("remainNum is negative: {remain_num}"));
+    }
+    if remain_num != 0 {
+        return Ok(());
+    }
+    let last = ids.last().expect("non-empty answer");
+    let last_num = last.num() as i64;
+    if last_num < hello_head_num {
+        return Err(format!(
+            "lastNum {last_num} (remainNum=0) is below hello head {hello_head_num}"
+        ));
+    }
+    if ids.len() > 1
+        && peer_locator
+            .iter()
+            .any(|e| e.hash.as_slice() == last.as_bytes().as_slice())
+    {
+        return Err("terminal block already in summary".into());
+    }
+    Ok(())
+}
+
+/// The truncated answer of `truncated_index_walk_answers_within_javas_receive_rules`
+/// passes the 4.8.2.4 checks but not the 4.8.3 ones once our Hello has
+/// claimed the head it cannot reach. `chain_inventory_ends_below_announced_head`
+/// is what keeps it off the wire.
+#[test]
+fn truncated_answer_below_the_hello_head_is_refused_by_483_and_not_sent() {
+    let bi = BlockIndexStore::new(mem());
+    for num in 1..=20 {
+        bi.put(&id_at(num, 0xaa)).unwrap();
+    }
+    bi.put(&id_at(30, 0xaa)).unwrap();
+    let loc = locator(&[5], 0xaa);
+    let (ids, remain) = serve_sync_block_chain_ids(&bi, 30, &loc);
+    assert_eq!((ids.last().unwrap().num(), remain), (20, 0));
+
+    let err = java_483_terminal_answer_check(&ids, remain, &loc, 30).unwrap_err();
+    assert!(err.contains("below hello head 30"), "{err}");
+    assert!(chain_inventory_ends_below_announced_head(&ids, remain, 30));
+
+    // Had the Hello announced a head at or below the gap, the same answer
+    // is one 4.8.3 accepts, and it is still sent.
+    java_483_terminal_answer_check(&ids, remain, &loc, 20).unwrap();
+    assert!(!chain_inventory_ends_below_announced_head(&ids, remain, 20));
+}
+
+/// The truncation can also leave a single id — the peer's own block — when
+/// the index has nothing after it. 4.8.2.4 read that as "in sync"; 4.8.3
+/// holds it against the Hello head like any other terminal answer.
+#[test]
+fn single_id_answer_short_of_the_hello_head_is_not_sent() {
+    let bi = BlockIndexStore::new(mem());
+    bi.put(&id_at(7, 0xaa)).unwrap();
+    let loc = locator(&[7], 0xaa);
+    let (ids, remain) = serve_sync_block_chain_ids(&bi, 1_000, &loc);
+    assert_eq!((ids.len(), remain), (1, 0));
+    assert!(java_483_terminal_answer_check(&ids, remain, &loc, 1_000).is_err());
+    assert!(chain_inventory_ends_below_announced_head(&ids, remain, 1_000));
+}
+
+/// A reorg can leave the head below what the Hello announced. The walk is
+/// complete and honest, but 4.8.3 still refuses it ("allow a fresh HELLO on
+/// reconnect"), so it is not sent either.
+#[test]
+fn answer_after_the_head_dropped_below_the_hello_head_is_not_sent() {
+    let bi = indexed_chain(35, 0xaa);
+    let loc = locator(&[10], 0xaa);
+    let (ids, remain) = serve_sync_block_chain_ids(&bi, 35, &loc);
+    assert_eq!((ids.last().unwrap().num(), remain), (35, 0));
+    assert!(java_483_terminal_answer_check(&ids, remain, &loc, 40).is_err());
+    assert!(chain_inventory_ends_below_announced_head(&ids, remain, 40));
+}
+
+/// On an intact index nothing changes: for every head, every Hello head at
+/// or below it (the head only grows after the Hello) and locators at either
+/// end of the chain, the answer passes both rule sets and is sent.
+#[test]
+fn intact_chain_answers_pass_483_and_are_always_sent() {
+    for head in [1i64, 2, 50, 1_999, 2_000, 2_001, 2_002, 4_500] {
+        let bi = indexed_chain(head, 0xaa);
+        for hello_head in [1, (head + 1) / 2, head] {
+            for loc_nums in [vec![1], vec![1, head], vec![1, (head + 1) / 2]] {
+                let loc = locator(&loc_nums, 0xaa);
+                let (ids, remain) = serve_sync_block_chain_ids(&bi, head, &loc);
+                let ctx = format!("head {head}, hello head {hello_head}, locator {loc_nums:?}");
+                java_chain_inventory_check(&ids, remain, &loc)
+                    .unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                java_483_terminal_answer_check(&ids, remain, &loc, hello_head)
+                    .unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                assert!(
+                    !chain_inventory_ends_below_announced_head(&ids, remain, hello_head),
+                    "{ctx}: a servable answer must be sent"
+                );
+            }
+        }
     }
 }

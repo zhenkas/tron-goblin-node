@@ -250,6 +250,9 @@ pub trait TronDatabaseExt {
         0
     }
 
+    /// See [`crate::host::Host::tron_vote_witness_rejected`].
+    fn tron_vote_witness_rejected(&mut self) {}
+
     /// `WITHDRAWREWARD` (0xd9).
     fn tron_withdraw_reward(&mut self, _caller: Address) -> i64 {
         0
@@ -384,6 +387,11 @@ pub trait TronDatabaseExt {
 
     /// See [`crate::host::Host::tron_allow_tvm_constantinople`].
     fn tron_allow_tvm_constantinople(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_resource_optimization`].
+    fn tron_allow_tvm_resource_optimization(&self) -> bool {
         false
     }
 

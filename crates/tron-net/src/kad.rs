@@ -531,6 +531,32 @@ impl KadHandle {
     }
 }
 
+/// The `from` endpoint of every packet we send.
+///
+/// java-tron validates it before anything else (`KadMessage.valid` →
+/// `NetUtil.validNode`) and drops the packet with `BAD_MESSAGE` when the
+/// IPv4 text does not match `PATTERN_IPv4` — which `0.0.0.0` does not. The
+/// address itself is not what java replies to or stores: for an IPv4 sender
+/// `KadService.handleEvent` takes the host from the UDP source address and
+/// only the port from this endpoint. So an address that is not usable here
+/// (unspecified, or `0.x.x.x`) is replaced by
+/// [`crate::DEFAULT_ADVERTISE_HOST`] rather than sent.
+fn home_endpoint(home_id: Vec<u8>, public_addr: SocketAddr) -> Endpoint {
+    let (address, address_ipv6) = match public_addr.ip() {
+        IpAddr::V4(ip) if crate::is_valid_advertise_ipv4(&ip.to_string()) => {
+            (ip.to_string().into_bytes(), vec![])
+        }
+        IpAddr::V6(ip) if !ip.is_unspecified() => (vec![], ip.to_string().into_bytes()),
+        _ => (crate::DEFAULT_ADVERTISE_HOST.as_bytes().to_vec(), vec![]),
+    };
+    Endpoint {
+        address,
+        port: public_addr.port() as i32,
+        node_id: home_id,
+        address_ipv6,
+    }
+}
+
 impl KadService {
     /// Bind a UDP socket and prepare a routing table seeded with
     /// `home_id`. Does not yet send anything — call [`Self::run`] to
@@ -543,12 +569,7 @@ impl KadService {
         seeds: Vec<SocketAddr>,
     ) -> std::io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(bind).await?);
-        let home = Endpoint {
-            address: public_addr.ip().to_string().into_bytes(),
-            port: public_addr.port() as i32,
-            node_id: home_id.clone(),
-            address_ipv6: vec![],
-        };
+        let home = home_endpoint(home_id.clone(), public_addr);
         let table = Arc::new(RwLock::new(RoutingTable::new(home_id)));
         Ok(Self {
             socket,
@@ -1251,6 +1272,76 @@ mod tests {
         assert_eq!(pong.echo, 11_111);
 
         recv.abort();
+    }
+
+    /// java-tron drops a discovery packet whose `from` address fails
+    /// `NetUtil.validIpV4` (`KadMessage.valid`). A service built with an
+    /// unspecified public address must therefore still put a valid one on the
+    /// wire: drive a real PING and inspect the `from` of the PONG we send.
+    #[tokio::test]
+    async fn kad_never_sends_an_unspecified_home_address() {
+        let kad = KadService::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![0xAAu8; 64],
+            SocketAddr::from(([0, 0, 0, 0], 18_889)),
+            11_111,
+            vec![],
+        )
+        .await
+        .expect("bind kad");
+        let bound = kad.socket.local_addr().unwrap();
+        let me = Arc::new(kad);
+        let recv = {
+            let me = me.clone();
+            tokio::spawn(async move { me.recv_loop().await })
+        };
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ping = PingMessage {
+            from: Some(Endpoint {
+                address: b"127.0.0.1".to_vec(),
+                port: peer.local_addr().unwrap().port() as i32,
+                node_id: vec![0xCC; 64],
+                address_ipv6: vec![],
+            }),
+            to: None,
+            version: 11_111,
+            timestamp: now_ms(),
+        };
+        peer.send_to(&encode_packet(KAD_PING, &ping.encode_to_vec()), bound)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; UDP_MAX_PACKET_BYTES];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("pong timeout")
+            .unwrap();
+        let (ty, payload) = decode_packet(&buf[..n]).unwrap();
+        assert_eq!(ty, KAD_PONG);
+        let from = PongMessage::decode(payload).unwrap().from.expect("pong from");
+        assert_eq!(from.address, b"127.0.0.1".to_vec());
+        assert!(from.address_ipv6.is_empty());
+        assert_eq!(from.port, 18_889);
+        assert_eq!(from.node_id, vec![0xAAu8; 64]);
+
+        recv.abort();
+    }
+
+    #[test]
+    fn home_endpoint_keeps_usable_addresses_and_replaces_the_rest() {
+        let ep = |addr: &str| home_endpoint(vec![1u8; 64], addr.parse().unwrap());
+        // A configured public IPv4 address goes out unchanged.
+        assert_eq!(ep("203.0.113.7:18889").address, b"203.0.113.7".to_vec());
+        // `0.x.x.x` fails java's first-octet rule just like `0.0.0.0`.
+        assert_eq!(ep("0.1.2.3:18889").address, b"127.0.0.1".to_vec());
+        // IPv6 belongs in its own field; the IPv4 field stays empty.
+        let v6 = ep("[2001:db8::1]:18889");
+        assert!(v6.address.is_empty());
+        assert_eq!(v6.address_ipv6, b"2001:db8::1".to_vec());
+        let any6 = ep("[::]:18889");
+        assert_eq!(any6.address, b"127.0.0.1".to_vec());
+        assert!(any6.address_ipv6.is_empty());
     }
 
     #[tokio::test]

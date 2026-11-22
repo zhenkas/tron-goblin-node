@@ -1125,6 +1125,18 @@ pub struct P2pConfig {
     /// a valid port.
     #[serde(default = "default_advertise_port")]
     pub advertise_port: i32,
+    /// IPv4 address we name as our own in Hello messages and discovery
+    /// packets — the address other nodes can reach `advertise_port` on.
+    /// Optional; unset advertises `127.0.0.1` (valid for java-tron's
+    /// `NetUtil.validNode`, promising nothing). The listener's bind address
+    /// (`listen_host`, `0.0.0.0` by default) is never advertised: java-tron
+    /// rejects an unspecified address and drops the message carrying it.
+    /// java-tron does not dial this address back or compare it with the
+    /// socket's source address; it only keeps it out of its own dial list
+    /// while we are connected, so setting it is a courtesy, not a
+    /// requirement.
+    #[serde(default)]
+    pub advertise_host: Option<String>,
     /// Maximum number of concurrent peer connections. java-tron's
     /// default is 30 on mainnet (`maxConnections`). Each peer holds
     /// one tokio task + one open TCP socket; capping prevents
@@ -1336,6 +1348,7 @@ impl Default for P2pConfig {
             disabled: false,
             progress_log_interval: default_progress_log_interval(),
             advertise_port: default_advertise_port(),
+            advertise_host: None,
             max_peers: default_max_peers(),
             listen: default_listen(),
             listen_host: default_listen_host(),
@@ -1355,6 +1368,38 @@ impl Default for P2pConfig {
             mempool: false,
             mempool_json: None,
         }
+    }
+}
+
+impl P2pConfig {
+    /// Reject an endpoint java-tron would refuse before it reaches the wire.
+    /// `NetUtil.validNode` requires a port in `1..=65535` and an IPv4 address
+    /// matching `PATTERN_IPv4`; a Hello or discovery packet failing either is
+    /// dropped by the peer, so a node configured that way connects to nobody.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=65_535).contains(&self.advertise_port) {
+            return Err(format!(
+                "p2p.advertise_port must be 1..65535, got {}",
+                self.advertise_port
+            ));
+        }
+        if let Some(host) = &self.advertise_host {
+            if !tron_net::is_valid_advertise_ipv4(host) {
+                return Err(format!(
+                    "p2p.advertise_host must be an IPv4 address peers can use \
+                     (not 0.0.0.0, not a hostname), got {host:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The IPv4 address for our own endpoints: the configured
+    /// `advertise_host`, else [`tron_net::DEFAULT_ADVERTISE_HOST`].
+    pub fn advertise_host(&self) -> &str {
+        self.advertise_host
+            .as_deref()
+            .unwrap_or(tron_net::DEFAULT_ADVERTISE_HOST)
     }
 }
 
@@ -2401,6 +2446,47 @@ mod tests {
         assert_eq!(cfg.index.commitment.max_lag_blocks, 256);
         // No [witness] table → sync-only.
         assert!(cfg.witness.is_none());
+        // The shipped example names no advertise address and passes the
+        // endpoint check as-is.
+        assert!(cfg.p2p.advertise_host.is_none());
+        cfg.p2p.validate().expect("example [p2p] is valid");
+    }
+
+    // ---- [p2p] advertised endpoint ----
+
+    #[test]
+    fn p2p_advertise_host_defaults_to_loopback_never_the_bind_address() {
+        let cfg: NodeConfig = toml::from_str("").expect("empty TOML");
+        assert_eq!(cfg.p2p.listen_host, "0.0.0.0");
+        assert!(cfg.p2p.advertise_host.is_none());
+        assert_eq!(cfg.p2p.advertise_host(), "127.0.0.1");
+        cfg.p2p.validate().expect("defaults are valid");
+
+        let cfg: NodeConfig =
+            toml::from_str("[p2p]\nadvertise_host = \"203.0.113.7\"\n").expect("parse");
+        assert_eq!(cfg.p2p.advertise_host(), "203.0.113.7");
+        cfg.p2p.validate().expect("public IPv4 is valid");
+    }
+
+    #[test]
+    fn p2p_validate_rejects_endpoints_java_refuses() {
+        let with_port = |port: i32| P2pConfig { advertise_port: port, ..P2pConfig::default() };
+        for port in [0, -1, 65_536] {
+            let err = with_port(port).validate().expect_err("port out of range");
+            assert!(err.contains("advertise_port"), "{err}");
+        }
+        for port in [1, 18_888, 65_535] {
+            with_port(port).validate().expect("port in range");
+        }
+
+        let with_host = |host: &str| P2pConfig {
+            advertise_host: Some(host.to_string()),
+            ..P2pConfig::default()
+        };
+        for host in ["0.0.0.0", "0.1.2.3", "node.example.org", "::1", ""] {
+            let err = with_host(host).validate().expect_err("unusable address");
+            assert!(err.contains("advertise_host"), "{err}");
+        }
     }
 
     // ---- [index] schema ----

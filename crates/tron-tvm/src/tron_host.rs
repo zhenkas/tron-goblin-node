@@ -267,6 +267,31 @@ impl TronDatabase {
         }
         dyn_props.add_total_tron_power_weight_unclamped(delta);
     }
+
+    /// java `Program.optimizeVotePowerState` (and the identical inline gate in
+    /// `FreezeBalanceProcessor` / `UnfreezeBalanceProcessor` /
+    /// `VoteWitnessProcessor`): `VMConfig.allowTvmVotePowerOptimization()`
+    /// (proposal #103, `ALLOW_TVM_VOTE_POWER_OPTIMIZATION`) AND
+    /// `supportAllowNewResourceModel()`. Absent keys read as off.
+    fn optimize_vote_power_state(dyn_props: &tron_chainbase::DynamicPropertiesStore) -> bool {
+        dyn_props
+            .get_long(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION")
+            .unwrap_or(0)
+            == 1
+            && dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1
+    }
+}
+
+/// java `Program.accountFrozenV2Weights`: the three Stake-2.0 weights one
+/// account contributes — `getFrozenV2BalanceWithDelegated(BANDWIDTH)`,
+/// `getFrozenV2BalanceWithDelegated(ENERGY)` and
+/// `getTronPowerFrozenV2Balance()`, each floored to whole TRX.
+fn account_frozen_v2_weights(account: &tron_proto::Account) -> [i64; 3] {
+    [
+        frozen_v2_basis_with_delegated(account, 0) / TRX_PRECISION,
+        frozen_v2_basis_with_delegated(account, 1) / TRX_PRECISION,
+        frozen_v2_basis_with_delegated(account, 2) / TRX_PRECISION,
+    ]
 }
 
 impl TronDatabaseExt for TronDatabase {
@@ -466,6 +491,16 @@ impl TronDatabaseExt for TronDatabase {
         // (spend-all, UNKNOWN) when a transfer validation fails.
         match &self.dyn_props {
             Some(dp) => dp.get_long(b"ALLOW_TVM_CONSTANTINOPLE").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_tvm_resource_optimization(&self) -> bool {
+        // java `VMConfig.allowTvmResourceOptimization()` — the
+        // `ALLOW_TVM_RESOURCE_OPTIMIZATION` proposal (#104). Absent store /
+        // absent key read as inactive, like every other proposal gate.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION").unwrap_or(0) == 1,
             None => false,
         }
     }
@@ -673,6 +708,10 @@ impl TronDatabaseExt for TronDatabase {
             .get_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION")
             .unwrap_or(0)
             == 1;
+        // java `Program.optimizeVotePowerState(repo)` (proposal #103) and
+        // `VMConfig.allowTvmResourceOptimization()` (proposal #104).
+        let optimize_vote_power = Self::optimize_vote_power_state(&dyn_props);
+        let resource_optimization = self.tron_allow_tvm_resource_optimization();
 
         // ---- validation: canSuicide (pre-#94) / canSuicide2 (#94) ----
         let delegated_v1_clear = owner_account.delegated_frozen_balance_for_bandwidth == 0
@@ -792,7 +831,12 @@ impl TronDatabaseExt for TronDatabase {
                     self.put_votes_journaled(&votes_store, &owner_t, &votes_row);
                 }
                 owner_account.votes.clear();
-                owner_account.old_tron_power = 0;
+                // java `withdrawRewardAndCancelVote`: `setOldTronPower(0)` is
+                // skipped under `optimizeVotePowerState` (#103) — the sweeps
+                // below invalidate it instead.
+                if !optimize_vote_power {
+                    owner_account.old_tron_power = 0;
+                }
             }
             // Fold allowance into balance: chainbase keeps the
             // allowance/latest-withdraw fields, the EVM journal gets the
@@ -946,6 +990,13 @@ impl TronDatabaseExt for TronDatabase {
                 .unwrap_or(0);
             self.add_net_weight_journaled(&dyn_props, -frozen_bw / TRX_PRECISION);
             self.add_energy_weight_journaled(&dyn_props, -frozen_energy / TRX_PRECISION);
+            // java `transferDelegatedResourceToInheritor` under
+            // `optimizeVotePowerState` (#103): an owner that held Stake-1.0
+            // frozen balance gets `invalidateOldTronPower()` (and the row is
+            // written — ours is written once at the end of this bridge).
+            if optimize_vote_power && (frozen_bw > 0 || frozen_energy > 0) {
+                owner_account.old_tron_power = -1;
+            }
             let total = frozen_bw.saturating_add(frozen_energy);
             if total != 0 {
                 self.pending_balance_deltas
@@ -969,6 +1020,27 @@ impl TronDatabaseExt for TronDatabase {
                     .support_allow_cancel_all_unfreeze_v2(),
             };
             let now_slot = dyn_props.head_slot();
+
+            // java `transferFrozenV2BalanceToInheritor`: both the #104 weight
+            // capture and the #103 power transition apply only when the owner
+            // holds a positive FreezeV2 entry.
+            let owner_has_frozen_v2 = owner_account.frozen_v2.iter().any(|f| f.amount > 0);
+            // `frozenV2Weights(ownerCapsule, inheritorCapsule)` BEFORE the
+            // move (#104). Owner and inheritor are always distinct accounts
+            // here (a self-target destroy inherits to the blackhole), which is
+            // java's `!isEqual(source, beneficiary)` arm: the two are summed.
+            let weights_before = (resource_optimization && owner_has_frozen_v2).then(|| {
+                let o = account_frozen_v2_weights(&owner_account);
+                let i = account_frozen_v2_weights(&inheritor_account);
+                [o[0] + i[0], o[1] + i[1], o[2] + i[2]]
+            });
+            // #103: snapshot the inheritor's legacy power BEFORE it receives
+            // the stake (`initializeOldTronPower` only acts on the 0
+            // sentinel), and invalidate the owner's.
+            if optimize_vote_power && owner_has_frozen_v2 {
+                crate::votes::initialize_old_tron_power(&mut inheritor_account);
+                owner_account.old_tron_power = -1;
+            }
 
             // Transfer frozen v2 entries by type.
             for f in owner_account.frozen_v2.iter().filter(|f| f.amount > 0) {
@@ -1044,6 +1116,19 @@ impl TronDatabaseExt for TronDatabase {
             res::set_new_window_size(&mut owner_account, ResourceKind::Bandwidth, 0);
             res::set_usage(&mut owner_account, ResourceKind::Energy, 0);
             res::set_new_window_size(&mut owner_account, ResourceKind::Energy, 0);
+
+            // #104: each account floors its own stake to whole TRX, so merging
+            // two fractional stakes can carry one unit the per-account weights
+            // never counted. java re-reads both rows after `updateAccount` and
+            // adds `weightsAfter - weightsBefore` to the three totals; the
+            // in-memory rows here are exactly what gets written below.
+            if let Some(before) = weights_before {
+                let o = account_frozen_v2_weights(&owner_account);
+                let i = account_frozen_v2_weights(&inheritor_account);
+                self.add_net_weight_journaled(&dyn_props, o[0] + i[0] - before[0]);
+                self.add_energy_weight_journaled(&dyn_props, o[1] + i[1] - before[1]);
+                self.add_tron_power_weight_journaled(&dyn_props, o[2] + i[2] - before[2]);
+            }
         }
 
         self.put_account_journaled(&owner_t, &owner_account);
@@ -1167,6 +1252,14 @@ impl TronDatabaseExt for TronDatabase {
         };
 
         // ---- java `FreezeBalanceProcessor.execute` ----
+        //
+        // Under `allowTvmVotePowerOptimization() && supportAllowNewResourceModel()`
+        // (#103) the owner's legacy power is snapshotted first
+        // (`oldTronPowerIsNotInitialized()` -> `initializeOldTronPower()`),
+        // BEFORE this freeze is added to it.
+        if Self::optimize_vote_power_state(&dyn_props) {
+            crate::votes::initialize_old_tron_power(&mut owner_account);
+        }
         if let Some(receiver_account) = receiver_account.as_mut() {
             // `delegateResource`: insert-or-update the (owner, receiver)
             // DelegatedResource row, then credit the receiver's acquired
@@ -1346,6 +1439,31 @@ impl TronDatabaseExt for TronDatabase {
         };
 
         // ---- java `UnfreezeBalanceProcessor.execute` ----
+        //
+        // Under `allowTvmVotePowerOptimization() && supportAllowNewResourceModel()`
+        // (#103) execute opens with `VoteRewardUtil.withdrawReward(owner)` and
+        // then snapshots the owner's legacy power — both BEFORE the stake is
+        // released, so the snapshot still counts it. The settle only touches
+        // `allowance` and the reward-cycle rows, none of which validate read.
+        let optimize_vote_power = Self::optimize_vote_power_state(&dyn_props);
+        if optimize_vote_power {
+            if let Some(delegation) = self.delegation.clone() {
+                self.snapshot_account(&owner);
+                self.snapshot_delegation_rows(&delegation, &owner);
+                crate::reward::withdraw_reward_tvm(
+                    &owner,
+                    &self.accounts,
+                    &delegation,
+                    &dyn_props,
+                    self.reward_vi.as_deref(),
+                )
+                .expect("db error in TronDatabaseExt::tron_unfreeze settling rewards");
+                if let Ok(Some(settled)) = self.accounts.get(&owner) {
+                    owner_account = settled;
+                }
+            }
+            crate::votes::initialize_old_tron_power(&mut owner_account);
+        }
         let unfreeze_balance: i64;
         if let Some(record) = record.as_mut() {
             // Zero the un-delegated resource on the row, give the stake back to
@@ -1425,13 +1543,39 @@ impl TronDatabaseExt for TronDatabase {
         }
         self.put_account_journaled(&owner, &owner_account);
 
+        // #103 with Stake 2.0 live (`optimizeVotePower && allowTvmFreezeV2()`):
+        // releasing Stake-1.0 balance drops EVERY vote and invalidates the
+        // legacy power, unless it already was invalid. The `Votes` row is taken
+        // (or built from the account's votes), its new votes cleared, and both
+        // rows are written — even for an account that never voted, which gets
+        // an empty `Votes` row exactly as java's `repo.updateVotes` stores one.
+        // java then returns, skipping the proportional check below.
+        let clear_all_votes = optimize_vote_power && dyn_props.support_unfreeze_delay();
+        if clear_all_votes && owner_account.old_tron_power != -1 {
+            if let Some(votes_store) = self.votes.clone() {
+                let mut votes_row = match votes_store.get(&owner) {
+                    Ok(Some(row)) => row,
+                    _ => tron_proto::Votes {
+                        address: owner.as_bytes().to_vec(),
+                        old_votes: owner_account.votes.clone(),
+                        new_votes: Vec::new(),
+                    },
+                };
+                votes_row.new_votes.clear();
+                self.put_votes_journaled(&votes_store, &owner, &votes_row);
+            }
+            owner_account.votes.clear();
+            owner_account.old_tron_power = -1;
+            self.put_account_journaled(&owner, &owner_account);
+        }
+
         // java's post-unstake vote reconciliation, gated on ALLOW_TVM_VOTE:
         // once the account's TRON Power no longer covers the votes it has cast,
         // the pending rewards are settled and the whole vote list is dropped.
         // The account is re-read after the settle (which writes `allowance`)
         // before the votes are cleared, exactly as java re-reads from its
         // Repository.
-        if self.tron_allow_tvm_vote() && !owner_account.votes.is_empty() {
+        if !clear_all_votes && self.tron_allow_tvm_vote() && !owner_account.votes.is_empty() {
             let used_tron_power: i64 = owner_account
                 .votes
                 .iter()
@@ -1470,8 +1614,19 @@ impl TronDatabaseExt for TronDatabase {
                     settled.votes.clear();
                     self.put_votes_journaled(&votes_store, &owner, &votes_row);
                     self.put_account_journaled(&owner, &settled);
+                    // java reassigns `accountCapsule` to this re-read row, so
+                    // the #103 invalidation below starts from it.
+                    owner_account = settled;
                 }
             }
+        }
+
+        // #103 without Stake 2.0: after the legacy reconciliation the legacy
+        // power is invalidated (`invalidateOldTronPower()` + `updateAccount`)
+        // unless it already was.
+        if optimize_vote_power && !clear_all_votes && owner_account.old_tron_power != -1 {
+            owner_account.old_tron_power = -1;
+            self.put_account_journaled(&owner, &owner_account);
         }
 
         // Credit the unlocked amount back to the caller's journaled
@@ -1480,6 +1635,12 @@ impl TronDatabaseExt for TronDatabase {
             self.last_balance_delta = Some((caller, unfreeze_balance));
         }
         1
+    }
+
+    fn tron_vote_witness_rejected(&mut self) {
+        // java `Program.voteWitness`: increaseNonce at the top, before the
+        // array-length and amount-range checks that return false.
+        self.note_internal_tx_nonce();
     }
 
     fn tron_vote_witness(&mut self, caller: Address, witnesses: &[(Address, i64)]) -> i64 {
@@ -1585,6 +1746,18 @@ impl TronDatabaseExt for TronDatabase {
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
             return 0;
         };
+        // java `VoteWitnessProcessor.execute` under
+        // `allowTvmVotePowerOptimization() && supportAllowNewResourceModel()`
+        // (#103): snapshot the legacy power right after the settle. The power
+        // check above is unaffected — `getAllTronPower()` reads the 0 sentinel
+        // as "legacy power counts", which is the value the snapshot stores.
+        if self
+            .dyn_props
+            .as_ref()
+            .is_some_and(|dp| Self::optimize_vote_power_state(dp))
+        {
+            crate::votes::initialize_old_tron_power(&mut owner_account);
+        }
         let mut votes_capsule = match votes_store.get(&owner) {
             Ok(Some(v)) => v,
             _ => tron_proto::Votes {
@@ -3242,6 +3415,9 @@ mod tests {
             db.create_nonce, 10,
             "10 staking opcodes, one nonce bump each"
         );
+        // A VOTEWITNESS rejected before the vote processor still bumps it.
+        db.tron_vote_witness_rejected();
+        assert_eq!(db.create_nonce, 11);
     }
 
     /// SELFDESTRUCT bumps the nonce once (after `canSuicide` validation, which
@@ -3338,6 +3514,501 @@ mod tests {
         for e in &entries {
             assert!(ordered.contains(e));
         }
+    }
+
+    // ---- java-tron 4.8.3: ALLOW_TVM_VOTE_POWER_OPTIMIZATION (#103) and
+    //      ALLOW_TVM_RESOURCE_OPTIMIZATION (#104) in the staking bridges ----
+
+    use tron_proto::account::Frozen;
+    use tron_proto::{Vote, Votes};
+
+    const NOW_MS: i64 = 1_000_000;
+
+    /// `make_staking_db` plus a head timestamp. `vote_power` sets proposal
+    /// #103, `new_model` sets `ALLOW_NEW_RESOURCE_MODEL`; java's gate needs
+    /// both (`Program.optimizeVotePowerState`).
+    fn db_4_8_3(vote_power: bool, new_model: bool) -> (TronDatabase, Arc<DynamicPropertiesStore>) {
+        let (db, dyn_props) = make_staking_db();
+        dyn_props.save_latest_block_header_timestamp(NOW_MS);
+        if vote_power {
+            dyn_props.put_long(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION", 1);
+        }
+        if new_model {
+            dyn_props.put_long(b"ALLOW_NEW_RESOURCE_MODEL", 1);
+        }
+        (db, dyn_props)
+    }
+
+    fn put_account(db: &TronDatabase, account: &Account) {
+        let raw: [u8; 21] = account.address.as_slice().try_into().unwrap();
+        db.accounts.put(&TronAddress::from_raw(raw), account).unwrap();
+    }
+
+    fn get_account(db: &TronDatabase, addr: [u8; 21]) -> Account {
+        db.accounts.get(&TronAddress::from_raw(addr)).unwrap().unwrap()
+    }
+
+    fn votes_row(db: &TronDatabase, addr: [u8; 21]) -> Option<Votes> {
+        db.votes.as_ref().unwrap().get(&TronAddress::from_raw(addr)).unwrap()
+    }
+
+    fn vote(witness: [u8; 21], count: i64) -> Vote {
+        Vote { vote_address: witness.to_vec(), vote_count: count }
+    }
+
+    /// The three flag states that must all behave like "off", then "on".
+    const GATE_STATES: [(bool, bool); 4] =
+        [(false, false), (true, false), (false, true), (true, true)];
+
+    /// `FreezeBalanceProcessor.execute`: under the #103 gate the owner's legacy
+    /// power is snapshotted BEFORE the new Stake-1.0 freeze is added; an owner
+    /// with no legacy power gets the -1 sentinel. Without the gate (either
+    /// half missing) `old_tron_power` is left alone.
+    #[test]
+    fn v1_freeze_initializes_old_tron_power_only_under_the_vote_power_gate() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, dyn_props) = db_4_8_3(vote_power, new_model);
+            // The Stake-1.0 FREEZE opcode only executes before Stake 2.0.
+            dyn_props.put_long(b"UNFREEZE_DELAY_DAYS", 0);
+            let staked = tron_addr(0x71);
+            let fresh = tron_addr(0x72);
+            put_account(&db, &Account {
+                address: staked.to_vec(),
+                balance: 100_000_000,
+                frozen: vec![Frozen { frozen_balance: 5_000_000, expire_time: NOW_MS + 1 }],
+                ..Default::default()
+            });
+            put_account(&db, &Account {
+                address: fresh.to_vec(),
+                balance: 100_000_000,
+                ..Default::default()
+            });
+            for a in [staked, fresh] {
+                assert_eq!(
+                    db.tron_freeze(evm_addr_from_tron(a), 2_000_000, 3, 0, None, 100_000_000),
+                    1
+                );
+            }
+            let gate = vote_power && new_model;
+            assert_eq!(
+                get_account(&db, staked).old_tron_power,
+                if gate { 5_000_000 } else { 0 },
+                "vote_power={vote_power} new_model={new_model}: snapshot excludes this freeze"
+            );
+            assert_eq!(
+                get_account(&db, fresh).old_tron_power,
+                if gate { -1 } else { 0 },
+                "vote_power={vote_power} new_model={new_model}: no legacy power"
+            );
+            // The freeze itself is identical in every state.
+            assert_eq!(get_account(&db, staked).frozen[0].frozen_balance, 7_000_000);
+        }
+    }
+
+    /// `VoteWitnessProcessor.execute`: same snapshot, taken after the reward
+    /// settle and before the votes are replaced.
+    #[test]
+    fn vote_witness_initializes_old_tron_power_only_under_the_vote_power_gate() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (db, _dyn_props) = db_4_8_3(vote_power, new_model);
+            let witness = tron_addr(0x7a);
+            let witnesses = Arc::new(tron_chainbase::WitnessStore::new(Arc::new(MemBackend::new())));
+            witnesses
+                .put(
+                    &TronAddress::from_raw(witness),
+                    &tron_proto::Witness { address: witness.to_vec(), ..Default::default() },
+                )
+                .unwrap();
+            let mut db = db.with_witnesses(witnesses);
+            let owner = tron_addr(0x73);
+            put_account(&db, &Account {
+                address: owner.to_vec(),
+                frozen_v2: vec![FreezeV2 { r#type: 1, amount: 10_000_000 }],
+                ..Default::default()
+            });
+            assert_eq!(
+                db.tron_vote_witness(
+                    evm_addr_from_tron(owner),
+                    &[(evm_addr_from_tron(witness), 3)]
+                ),
+                1
+            );
+            let after = get_account(&db, owner);
+            assert_eq!(after.votes, vec![vote(witness, 3)]);
+            assert_eq!(
+                after.old_tron_power,
+                if vote_power && new_model { 10_000_000 } else { 0 },
+                "vote_power={vote_power} new_model={new_model}"
+            );
+        }
+    }
+
+    /// Owner for the UNFREEZE tests: 5 TRX of matured Stake-1.0 bandwidth, 10
+    /// TRX of Stake-2.0 energy (so the legacy proportional check keeps the
+    /// 3 votes), and one vote.
+    fn unfreeze_owner(addr: [u8; 21], witness: [u8; 21], old_tron_power: i64) -> Account {
+        Account {
+            address: addr.to_vec(),
+            balance: 1_000_000,
+            frozen: vec![Frozen { frozen_balance: 5_000_000, expire_time: NOW_MS - 1 }],
+            frozen_v2: vec![FreezeV2 { r#type: 1, amount: 10_000_000 }],
+            votes: vec![vote(witness, 3)],
+            old_tron_power,
+            ..Default::default()
+        }
+    }
+
+    /// `UnfreezeBalanceProcessor.execute` with Stake 2.0 live: under the #103
+    /// gate the rewards are settled first, then every vote is dropped — the
+    /// `Votes` row is created from the account's votes with empty new votes —
+    /// and the legacy power is invalidated. Without the gate the legacy
+    /// proportional check runs instead, which keeps the still-covered votes
+    /// and writes no `Votes` row.
+    #[test]
+    fn v1_unfreeze_clears_votes_and_invalidates_power_under_the_gate_with_stake_v2() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, dyn_props) = db_4_8_3(vote_power, new_model);
+            dyn_props.put_long(b"ALLOW_TVM_VOTE", 1);
+            dyn_props.save_current_cycle_number(5);
+            let owner = tron_addr(0x74);
+            let witness = tron_addr(0x7a);
+            put_account(&db, &unfreeze_owner(owner, witness, 0));
+            assert_eq!(db.tron_unfreeze(evm_addr_from_tron(owner), 0, None), 1);
+
+            let after = get_account(&db, owner);
+            assert!(after.frozen.is_empty());
+            assert_eq!(after.balance, 6_000_000);
+            let delegation = db.delegation.clone().unwrap();
+            let end_cycle = delegation.get_end_cycle(&TronAddress::from_raw(owner));
+            if vote_power && new_model {
+                assert!(after.votes.is_empty(), "every vote is dropped");
+                assert_eq!(after.old_tron_power, -1);
+                assert_eq!(
+                    votes_row(&db, owner),
+                    Some(Votes {
+                        address: owner.to_vec(),
+                        old_votes: vec![vote(witness, 3)],
+                        new_votes: vec![],
+                    })
+                );
+                // `VoteRewardUtil.withdrawReward` ran first, against the votes
+                // as they stood: it closes the window at the current cycle.
+                assert_eq!(end_cycle, 6, "reward window settled before the unfreeze");
+            } else {
+                assert_eq!(after.votes, vec![vote(witness, 3)], "votes still covered: kept");
+                assert_eq!(after.old_tron_power, 0);
+                assert_eq!(votes_row(&db, owner), None);
+                // -1 is the store's "never set" answer (java `REMARK`).
+                assert_eq!(end_cycle, -1, "no settle without the gate");
+            }
+        }
+    }
+
+    /// Same path, the two edge rows java's code implies: an account whose
+    /// legacy power is ALREADY invalid keeps its votes (the block is skipped
+    /// and java returns), and an account that never voted still gets an
+    /// (empty) `Votes` row written along with the invalidation.
+    #[test]
+    fn v1_unfreeze_under_the_gate_skips_invalid_power_and_writes_empty_votes_row() {
+        let (mut db, _dyn_props) = db_4_8_3(true, true);
+        let witness = tron_addr(0x7a);
+        let invalid = tron_addr(0x75);
+        put_account(&db, &unfreeze_owner(invalid, witness, -1));
+        assert_eq!(db.tron_unfreeze(evm_addr_from_tron(invalid), 0, None), 1);
+        let after = get_account(&db, invalid);
+        assert_eq!(after.votes, vec![vote(witness, 3)]);
+        assert_eq!(after.old_tron_power, -1);
+        assert_eq!(votes_row(&db, invalid), None);
+
+        let voteless = tron_addr(0x76);
+        let mut account = unfreeze_owner(voteless, witness, 0);
+        account.votes.clear();
+        put_account(&db, &account);
+        assert_eq!(db.tron_unfreeze(evm_addr_from_tron(voteless), 0, None), 1);
+        assert_eq!(get_account(&db, voteless).old_tron_power, -1);
+        assert_eq!(
+            votes_row(&db, voteless),
+            Some(Votes { address: voteless.to_vec(), old_votes: vec![], new_votes: vec![] })
+        );
+    }
+
+    /// `UnfreezeBalanceProcessor.execute` WITHOUT Stake 2.0
+    /// (`!VMConfig.allowTvmFreezeV2()`): the legacy proportional check still
+    /// decides about the votes; the gate only adds the trailing
+    /// `invalidateOldTronPower()`.
+    #[test]
+    fn v1_unfreeze_without_stake_v2_keeps_legacy_vote_check_and_invalidates_power() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, dyn_props) = db_4_8_3(vote_power, new_model);
+            dyn_props.put_long(b"UNFREEZE_DELAY_DAYS", 0);
+            dyn_props.put_long(b"ALLOW_TVM_VOTE", 1);
+            let witness = tron_addr(0x7a);
+            let covered = tron_addr(0x77);
+            put_account(&db, &unfreeze_owner(covered, witness, 0));
+            // No other stake: after the unfreeze the 3 votes are uncovered,
+            // so the legacy block drops them (with or without the gate).
+            let uncovered = tron_addr(0x78);
+            let mut account = unfreeze_owner(uncovered, witness, 0);
+            account.frozen_v2.clear();
+            put_account(&db, &account);
+            for a in [covered, uncovered] {
+                assert_eq!(db.tron_unfreeze(evm_addr_from_tron(a), 0, None), 1);
+            }
+            let expected_power = if vote_power && new_model { -1 } else { 0 };
+            let after = get_account(&db, covered);
+            assert_eq!(after.votes, vec![vote(witness, 3)]);
+            assert_eq!(after.old_tron_power, expected_power);
+            assert_eq!(votes_row(&db, covered), None);
+
+            let after = get_account(&db, uncovered);
+            assert!(after.votes.is_empty());
+            assert_eq!(after.old_tron_power, expected_power);
+            assert_eq!(
+                votes_row(&db, uncovered),
+                Some(Votes {
+                    address: uncovered.to_vec(),
+                    old_votes: vec![vote(witness, 3)],
+                    new_votes: vec![],
+                })
+            );
+        }
+    }
+
+    /// `Program.withdrawRewardAndCancelVote`: cancelling the votes resets
+    /// `old_tron_power` to 0 — except under the #103 gate, which leaves the
+    /// stored value for the freeze sweeps to invalidate.
+    #[test]
+    fn suicide_vote_cancel_resets_old_tron_power_only_without_the_gate() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, dyn_props) = db_4_8_3(vote_power, new_model);
+            dyn_props.put_long(b"ALLOW_TVM_VOTE", 1);
+            let owner = tron_addr(0x79);
+            let obtainer = tron_addr(0x7b);
+            put_account(&db, &Account {
+                address: owner.to_vec(),
+                votes: vec![vote(tron_addr(0x7a), 3)],
+                old_tron_power: 7_000_000,
+                ..Default::default()
+            });
+            put_account(&db, &Account { address: obtainer.to_vec(), ..Default::default() });
+            assert_eq!(
+                db.tron_suicide(evm_addr_from_tron(owner), evm_addr_from_tron(obtainer), true, 0),
+                0
+            );
+            let after = get_account(&db, owner);
+            assert!(after.votes.is_empty());
+            assert_eq!(
+                after.old_tron_power,
+                if vote_power && new_model { 7_000_000 } else { 0 },
+                "vote_power={vote_power} new_model={new_model}"
+            );
+        }
+    }
+
+    /// `Program.transferDelegatedResourceToInheritor` (Stake 1.0): an owner
+    /// holding frozen bandwidth or energy is invalidated under the gate; an
+    /// owner with no Stake-1.0 balance is not.
+    #[test]
+    fn suicide_invalidates_owner_power_for_v1_frozen_only_under_the_gate() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, dyn_props) = db_4_8_3(vote_power, new_model);
+            dyn_props.put_long(b"ALLOW_TVM_FREEZE", 1);
+            let bandwidth = tron_addr(0x7c);
+            let energy = tron_addr(0x7d);
+            let unstaked = tron_addr(0x7e);
+            let obtainer = tron_addr(0x7f);
+            put_account(&db, &Account {
+                address: bandwidth.to_vec(),
+                frozen: vec![Frozen { frozen_balance: 5_000_000, expire_time: NOW_MS - 1 }],
+                old_tron_power: 5_000_000,
+                ..Default::default()
+            });
+            put_account(&db, &Account {
+                address: energy.to_vec(),
+                account_resource: Some(AccountResource {
+                    frozen_balance_for_energy: Some(Frozen {
+                        frozen_balance: 4_000_000,
+                        expire_time: NOW_MS - 1,
+                    }),
+                    ..Default::default()
+                }),
+                old_tron_power: 4_000_000,
+                ..Default::default()
+            });
+            put_account(&db, &Account {
+                address: unstaked.to_vec(),
+                old_tron_power: 3_000_000,
+                ..Default::default()
+            });
+            put_account(&db, &Account { address: obtainer.to_vec(), ..Default::default() });
+            for a in [bandwidth, energy, unstaked] {
+                assert_eq!(
+                    db.tron_suicide(evm_addr_from_tron(a), evm_addr_from_tron(obtainer), true, 0),
+                    0
+                );
+            }
+            let gate = vote_power && new_model;
+            assert_eq!(get_account(&db, bandwidth).old_tron_power, if gate { -1 } else { 5_000_000 });
+            assert_eq!(get_account(&db, energy).old_tron_power, if gate { -1 } else { 4_000_000 });
+            assert_eq!(get_account(&db, unstaked).old_tron_power, 3_000_000);
+            assert_eq!(get_account(&db, obtainer).old_tron_power, 0, "inheritor untouched by v1");
+        }
+    }
+
+    /// `Program.transferFrozenV2BalanceToInheritor` (Stake 2.0), #103: when
+    /// the owner holds a positive FreezeV2 entry the inheritor's legacy power
+    /// is snapshotted BEFORE it receives the stake (-1 when it has none) and
+    /// the owner's is invalidated. An owner without Stake-2.0 balance changes
+    /// neither account.
+    #[test]
+    fn suicide_v2_initializes_inheritor_and_invalidates_owner_under_the_gate() {
+        for (vote_power, new_model) in GATE_STATES {
+            let (mut db, _dyn_props) = db_4_8_3(vote_power, new_model);
+            let owner = tron_addr(0x81);
+            let staked_heir = tron_addr(0x82);
+            put_account(&db, &Account {
+                address: owner.to_vec(),
+                frozen_v2: vec![FreezeV2 { r#type: 1, amount: 1_500_000 }],
+                ..Default::default()
+            });
+            put_account(&db, &Account {
+                address: staked_heir.to_vec(),
+                frozen_v2: vec![FreezeV2 { r#type: 1, amount: 2_500_000 }],
+                ..Default::default()
+            });
+            assert_eq!(
+                db.tron_suicide(evm_addr_from_tron(owner), evm_addr_from_tron(staked_heir), true, 0),
+                0
+            );
+            let gate = vote_power && new_model;
+            let heir = get_account(&db, staked_heir);
+            assert_eq!(heir.frozen_v2, vec![FreezeV2 { r#type: 1, amount: 4_000_000 }]);
+            assert_eq!(heir.old_tron_power, if gate { 2_500_000 } else { 0 });
+            assert_eq!(get_account(&db, owner).old_tron_power, if gate { -1 } else { 0 });
+
+            // Second owner -> an inheritor with no stake of its own.
+            let owner2 = tron_addr(0x83);
+            let plain_heir = tron_addr(0x84);
+            put_account(&db, &Account {
+                address: owner2.to_vec(),
+                frozen_v2: vec![FreezeV2 { r#type: 0, amount: 3_000_000 }],
+                ..Default::default()
+            });
+            put_account(&db, &Account { address: plain_heir.to_vec(), ..Default::default() });
+            assert_eq!(
+                db.tron_suicide(evm_addr_from_tron(owner2), evm_addr_from_tron(plain_heir), true, 0),
+                0
+            );
+            assert_eq!(get_account(&db, plain_heir).old_tron_power, if gate { -1 } else { 0 });
+
+            // Third owner holds no Stake-2.0 balance: nothing is initialized.
+            let owner3 = tron_addr(0x85);
+            let idle_heir = tron_addr(0x86);
+            put_account(&db, &Account { address: owner3.to_vec(), ..Default::default() });
+            put_account(&db, &Account { address: idle_heir.to_vec(), ..Default::default() });
+            assert_eq!(
+                db.tron_suicide(evm_addr_from_tron(owner3), evm_addr_from_tron(idle_heir), true, 0),
+                0
+            );
+            assert_eq!(get_account(&db, idle_heir).old_tron_power, 0);
+            assert_eq!(get_account(&db, owner3).old_tron_power, 0);
+        }
+    }
+
+    /// `Program.transferFrozenV2BalanceToInheritor`, #104: the totals are
+    /// corrected by `frozenV2Weights(after) - frozenV2Weights(before)` over
+    /// owner + inheritor. Each account floors its own stake, so merging
+    /// 1.5 + 2.5 TRX of energy (weights 1 + 2) into 4.0 TRX carries one unit;
+    /// 0.6 + 0.7 TRX of TRON power (0 + 0) becomes 1; 0.2 + 0.3 TRX of
+    /// bandwidth stays 0. Without #104 the totals are not touched.
+    #[test]
+    fn suicide_v2_refloors_total_weights_only_with_resource_optimization() {
+        for resource_optimization in [false, true] {
+            let (mut db, dyn_props) = db_4_8_3(false, true);
+            if resource_optimization {
+                dyn_props.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 1);
+            }
+            dyn_props.save_total_net_weight(100);
+            dyn_props.save_total_energy_weight(100);
+            dyn_props.save_total_tron_power_weight(100);
+            let owner = tron_addr(0x87);
+            let obtainer = tron_addr(0x88);
+            put_account(&db, &Account {
+                address: owner.to_vec(),
+                frozen_v2: vec![
+                    FreezeV2 { r#type: 0, amount: 200_000 },
+                    FreezeV2 { r#type: 1, amount: 1_500_000 },
+                    FreezeV2 { r#type: 2, amount: 600_000 },
+                ],
+                ..Default::default()
+            });
+            put_account(&db, &Account {
+                address: obtainer.to_vec(),
+                frozen_v2: vec![
+                    FreezeV2 { r#type: 0, amount: 300_000 },
+                    FreezeV2 { r#type: 1, amount: 2_500_000 },
+                    FreezeV2 { r#type: 2, amount: 700_000 },
+                ],
+                ..Default::default()
+            });
+            assert_eq!(
+                db.tron_suicide(evm_addr_from_tron(owner), evm_addr_from_tron(obtainer), true, 0),
+                0
+            );
+            let carry = i64::from(resource_optimization);
+            assert_eq!(dyn_props.total_net_weight(), 100, "0.2 + 0.3 TRX: no carry");
+            assert_eq!(dyn_props.total_energy_weight(), 100 + carry, "1.5 + 2.5 TRX");
+            assert_eq!(dyn_props.total_tron_power_weight(), 100 + carry, "0.6 + 0.7 TRX");
+            // The stake itself moves identically in both states.
+            assert_eq!(
+                get_account(&db, obtainer).frozen_v2,
+                vec![
+                    FreezeV2 { r#type: 0, amount: 500_000 },
+                    FreezeV2 { r#type: 1, amount: 4_000_000 },
+                    FreezeV2 { r#type: 2, amount: 1_300_000 },
+                ]
+            );
+            assert!(get_account(&db, owner).frozen_v2.is_empty());
+        }
+    }
+
+    /// An owner without a positive FreezeV2 entry never triggers the #104
+    /// correction, whatever the inheritor holds.
+    #[test]
+    fn suicide_without_owner_stake_v2_leaves_total_weights_alone() {
+        let (mut db, dyn_props) = db_4_8_3(true, true);
+        dyn_props.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 1);
+        dyn_props.save_total_energy_weight(100);
+        let owner = tron_addr(0x89);
+        let obtainer = tron_addr(0x8a);
+        put_account(&db, &Account {
+            address: owner.to_vec(),
+            frozen_v2: vec![FreezeV2 { r#type: 1, amount: 0 }],
+            ..Default::default()
+        });
+        put_account(&db, &Account {
+            address: obtainer.to_vec(),
+            frozen_v2: vec![FreezeV2 { r#type: 1, amount: 2_500_000 }],
+            ..Default::default()
+        });
+        assert_eq!(
+            db.tron_suicide(evm_addr_from_tron(owner), evm_addr_from_tron(obtainer), true, 0),
+            0
+        );
+        assert_eq!(dyn_props.total_energy_weight(), 100);
+        assert_eq!(get_account(&db, obtainer).old_tron_power, 0);
+    }
+
+    /// The flag the frame layer reads for the nested-CREATE 0xEF rule.
+    #[test]
+    fn allow_tvm_resource_optimization_reads_the_dynamic_property_and_defaults_off() {
+        assert!(!make_db().tron_allow_tvm_resource_optimization(), "absent store");
+        let (db, dyn_props) = make_staking_db();
+        assert!(!db.tron_allow_tvm_resource_optimization(), "absent key");
+        dyn_props.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 0);
+        assert!(!db.tron_allow_tvm_resource_optimization());
+        dyn_props.put_long(b"ALLOW_TVM_RESOURCE_OPTIMIZATION", 1);
+        assert!(db.tron_allow_tvm_resource_optimization());
     }
 }
 

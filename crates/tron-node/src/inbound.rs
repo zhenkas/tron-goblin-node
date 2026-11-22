@@ -42,7 +42,10 @@ use tron_net::{
 use tron_proto::Endpoint;
 use tron_types::BlockId;
 
-use crate::sync::{random_node_id, serve_sync_block_chain_ids, serve_tx_fetch_inv_data};
+use crate::sync::{
+    chain_inventory_ends_below_announced_head, random_node_id, serve_sync_block_chain_ids,
+    serve_tx_fetch_inv_data,
+};
 
 /// Mainnet libp2p network id (java-tron `Args.getNodeP2pVersion()` default).
 const NETWORK_ID_MAINNET: i32 = 11_111;
@@ -64,6 +67,10 @@ pub struct InboundServer {
     mempool: Option<Arc<TxMempool>>,
     genesis: BlockId,
     advertise_port: i32,
+    /// IPv4 address named in our Hello endpoints (`p2p.advertise_host`).
+    /// Never the listener's bind address: that is `0.0.0.0` by default, and
+    /// java-tron's `NetUtil.validNode` refuses it.
+    advertise_host: String,
     network_id: i32,
     metrics: Option<Arc<tron_rpc::Metrics>>,
     max_inbound: usize,
@@ -93,6 +100,7 @@ impl InboundServer {
             mempool,
             genesis,
             advertise_port,
+            advertise_host: tron_net::DEFAULT_ADVERTISE_HOST.to_string(),
             network_id: MAINNET_P2P_VERSION,
             metrics,
             max_inbound: max_inbound.max(1),
@@ -112,6 +120,16 @@ impl InboundServer {
     /// every connection.
     pub fn with_inbound_budget(mut self, budget: InboundByteBudget) -> Self {
         self.inbound_budget = Some(budget);
+        self
+    }
+
+    /// Set the IPv4 address named in our Hello endpoints
+    /// (`p2p.advertise_host`). An address java-tron's `NetUtil.validIpV4`
+    /// would refuse (`0.0.0.0`, a hostname) is ignored and the default kept.
+    pub fn with_advertise_host(mut self, host: &str) -> Self {
+        if tron_net::is_valid_advertise_ipv4(host) {
+            self.advertise_host = host.to_string();
+        }
         self
     }
 
@@ -271,8 +289,16 @@ where
     // STEP 1 — libp2p connection handshake. Both sides send their Hello
     // unconditionally, so the dialer's send-then-receive helper also drives the
     // responder correctly (our Hello crosses theirs on the wire).
+    //
+    // The endpoint names our advertise address. The bind address would be
+    // `0.0.0.0`, which fails java-tron's `PATTERN_IPv4`: the peer's libp2p
+    // `Message.parse` then rejects our Hello (`HelloMessage.valid` →
+    // `NetUtil.validNode`, BAD_MESSAGE) and closes the connection. The SAME
+    // endpoint goes into the application Hello below — from 4.8.3 java
+    // validates that one too and disconnects with `UNEXPECTED_IDENTITY` if
+    // its node id differs from this one.
     let from = Endpoint {
-        address: b"0.0.0.0".to_vec(),
+        address: server.advertise_host.as_bytes().to_vec(),
         address_ipv6: Vec::new(),
         port: server.advertise_port,
         node_id: node_id.clone(),
@@ -289,6 +315,9 @@ where
     // STEP 2 — application Hello. Advertise our TRUE genesis / solid / head /
     // lowest so a strict peer (java-tron `Channel` validation) accepts us.
     let head = server.head_id();
+    // The head this connection announces; a terminal `BlockChainInventory`
+    // must not end below it (see the SyncBlockChain arm).
+    let hello_head_num = head.num() as i64;
     conn.handshake(HelloInputs {
         from,
         version: server.network_id,
@@ -424,8 +453,15 @@ where
                 let inv = match tron_proto::BlockInventory::decode(frame.payload) {
                     Ok(i) => i,
                     Err(e) => {
-                        debug!(%peer_addr, error = %e, "decode inbound SyncBlockChain");
-                        continue;
+                        // No reply is possible, and the peer waits for one:
+                        // java-tron's `PeerStatusCheck` disconnects with
+                        // TIME_OUT when a SyncBlockChain goes unanswered
+                        // (10 s from 4.8.3). java itself raises BAD_MESSAGE
+                        // and disconnects here; never drop the request
+                        // silently.
+                        debug!(%peer_addr, error = %e,
+                            "undecodable inbound SyncBlockChain; disconnecting");
+                        return Ok(());
                     }
                 };
                 let (ids, remain) = match &server.block_index {
@@ -446,6 +482,24 @@ where
                 // close the connection instead of emitting an inventory it refuses.
                 if ids.is_empty() {
                     debug!(%peer_addr, "inbound SyncBlockChain shares no common block; disconnecting");
+                    return Ok(());
+                }
+                // "That is all I have" below the head we announced on this
+                // connection is refused by java-tron 4.8.3
+                // (`ChainInventoryMsgHandler.check`, SYNC_FAIL). It can only
+                // arise when we cannot serve up to that head — an index gap,
+                // or a reorg that lowered it — so close and let the peer
+                // reconnect to a fresh Hello rather than send it.
+                #[cfg(not(feature = "devnet-fast"))]
+                let announced_head_num = hello_head_num;
+                // A head announced after the Hello counts too, less the one
+                // block java allows an announcement to run ahead.
+                #[cfg(feature = "devnet-fast")]
+                let announced_head_num = hello_head_num.max(announced_head - 1);
+                if chain_inventory_ends_below_announced_head(&ids, remain, announced_head_num) {
+                    debug!(%peer_addr, announced_head_num,
+                        last = ids.last().map(|l| l.num()),
+                        "cannot serve sync up to the announced head; disconnecting");
                     return Ok(());
                 }
                 let reply = tron_net::sync::chain_inventory_from_ids(&ids, remain);
@@ -553,13 +607,19 @@ mod tests {
 
     /// Build an `InboundServer` backed by an in-memory `1..=HEAD` chain.
     fn test_server() -> Arc<InboundServer> {
+        test_server_holding(1..=HEAD)
+    }
+
+    /// As [`test_server`], but holding only the blocks in `held` while the
+    /// head pointer still says `HEAD`.
+    fn test_server_holding(held: impl IntoIterator<Item = i64>) -> Arc<InboundServer> {
         let bi_be: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let blocks_be: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let dp_be: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let bi = BlockIndexStore::new(bi_be.clone());
         let bs = BlockStore::new(blocks_be.clone());
         let dp = DynamicPropertiesStore::new(dp_be.clone());
-        for num in 1..=HEAD {
+        for num in held {
             let id = block_id(num);
             bi.put(&id).unwrap();
             bs.put(&id, &mk_block(num)).unwrap();
@@ -745,6 +805,180 @@ mod tests {
             Err(tron_net::SyncError::Frame(_)) => {}
             other => panic!("expected peer close, got {other:?}"),
         }
+
+        drop(conn);
+        let _ = server_task.await;
+    }
+
+    /// Run the client side of both handshakes and return the two endpoints
+    /// the server named itself with: libp2p Hello first, application Hello
+    /// second.
+    async fn client_handshake<S>(conn: &mut PeerConnection<S>) -> (Endpoint, Endpoint)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let genesis = genesis_block_id(&mainnet_inputs());
+        let ts = now_ms();
+        let from = Endpoint {
+            address: b"127.0.0.1".to_vec(),
+            address_ipv6: Vec::new(),
+            port: 18_888,
+            node_id: random_node_id(),
+        };
+        let libp2p_hello = conn
+            .libp2p_handshake(Libp2pHelloInputs {
+                from: from.clone(),
+                network_id: NETWORK_ID_MAINNET,
+                version: LIBP2P_VERSION,
+                timestamp_ms: ts,
+            })
+            .await
+            .expect("client libp2p handshake");
+        let outcome = conn
+            .handshake(HelloInputs {
+                from,
+                version: MAINNET_P2P_VERSION,
+                timestamp_ms: ts,
+                genesis,
+                solid: block_id(3),
+                head: block_id(3),
+                node_type: 0,
+                lowest_block_num: 1,
+                code_version: b"test-client",
+            })
+            .await
+            .expect("client app handshake");
+        let app_hello = outcome.hello().expect("server reciprocal Hello").clone();
+        assert_eq!(app_hello.head_block_id.as_ref().unwrap().number, HEAD);
+        (
+            libp2p_hello.from.expect("libp2p Hello names an endpoint"),
+            app_hello.from.expect("app Hello names an endpoint"),
+        )
+    }
+
+    /// What java-tron's `NetUtil.validNode` demands of an endpoint: 64-byte
+    /// node id, port `1..=65535`, IPv4 text matching `PATTERN_IPv4`.
+    fn assert_java_accepts_endpoint(ep: &Endpoint) {
+        assert_eq!(ep.node_id.len(), 64, "node id length");
+        assert!((1..=65_535).contains(&ep.port), "port {}", ep.port);
+        let host = std::str::from_utf8(&ep.address).expect("ascii address");
+        assert!(tron_net::is_valid_advertise_ipv4(host), "address {host:?}");
+        assert!(ep.address_ipv6.is_empty());
+    }
+
+    /// The responder binds `0.0.0.0` but must never name it: a java peer's
+    /// libp2p `Message.parse` rejects such a Hello (BAD_MESSAGE) and from
+    /// 4.8.3 the application Hello is held to the same rule, plus the two
+    /// must carry one node id (`UNEXPECTED_IDENTITY` otherwise).
+    #[tokio::test]
+    async fn inbound_hellos_name_a_valid_endpoint_with_one_node_id() {
+        let server = test_server();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let srv = server.clone();
+        let server_task =
+            tokio::spawn(async move { serve_inbound_peer(&srv, server_io, "hello-peer").await });
+
+        let mut conn = PeerConnection::new(client_io);
+        let (libp2p_from, app_from) = client_handshake(&mut conn).await;
+        assert_java_accepts_endpoint(&libp2p_from);
+        assert_java_accepts_endpoint(&app_from);
+        assert_eq!(libp2p_from.address, b"127.0.0.1".to_vec(), "default advertise address");
+        assert_eq!(libp2p_from.port, 18_888);
+        assert_eq!(libp2p_from, app_from, "one endpoint, one node id, in both Hellos");
+
+        drop(conn);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn inbound_hellos_name_the_configured_advertise_host() {
+        let server = Arc::try_unwrap(test_server())
+            .ok()
+            .unwrap()
+            .with_advertise_host("203.0.113.7")
+            // The bind address is not an advertise address; it is ignored.
+            .with_advertise_host("0.0.0.0");
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let server_task = tokio::spawn(async move {
+            serve_inbound_peer(&server, server_io, "configured-host-peer").await
+        });
+
+        let mut conn = PeerConnection::new(client_io);
+        let (libp2p_from, app_from) = client_handshake(&mut conn).await;
+        assert_java_accepts_endpoint(&libp2p_from);
+        assert_eq!(libp2p_from.address, b"203.0.113.7".to_vec());
+        assert_eq!(libp2p_from, app_from);
+
+        drop(conn);
+        let _ = server_task.await;
+    }
+
+    /// Expect the server to close the connection without ever putting a
+    /// `BlockChainInventory` on the wire.
+    async fn assert_closed_without_inventory<S>(conn: &mut PeerConnection<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            tron_net::sync::recv_chain_inventory(conn),
+        )
+        .await
+        .expect("server must close promptly, not leave the request unanswered");
+        match reply {
+            Err(tron_net::SyncError::PeerClosed) => {}
+            Err(tron_net::SyncError::Frame(_)) => {}
+            other => panic!("expected peer close, got {other:?}"),
+        }
+    }
+
+    /// Our Hello announced `HEAD`, but the index stops at 5 (6..HEAD-1 are
+    /// missing). The walk from the peer's block 3 ends at 5 with nothing more
+    /// to offer — "remain 0" three blocks in, five short of the announced
+    /// head. java-tron 4.8.3 answers that with SYNC_FAIL
+    /// (`ChainInventoryMsgHandler.check`: "lastNum 5 (remainNum=0) is below
+    /// hello head 10"); we close instead of sending it.
+    #[tokio::test]
+    async fn inbound_terminal_reply_below_announced_head_disconnects() {
+        let server = test_server_holding((1..=5).chain([HEAD]));
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let srv = server.clone();
+        let server_task =
+            tokio::spawn(async move { serve_inbound_peer(&srv, server_io, "gap-peer").await });
+
+        let mut conn = PeerConnection::new(client_io);
+        client_handshake(&mut conn).await;
+        let locator = vec![block_id(1), block_id(2), block_id(3)];
+        tron_net::sync::send_sync_request(&mut conn, &locator)
+            .await
+            .expect("send sync request");
+        assert_closed_without_inventory(&mut conn).await;
+
+        drop(conn);
+        let _ = server_task.await;
+    }
+
+    /// A SyncBlockChain we cannot decode gets no reply, and the peer waits
+    /// for one until its own timeout (java `PeerStatusCheck`, TIME_OUT). It
+    /// is answered with a disconnect, never dropped silently.
+    #[tokio::test]
+    async fn inbound_undecodable_sync_request_disconnects() {
+        let server = test_server();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let srv = server.clone();
+        let server_task =
+            tokio::spawn(async move { serve_inbound_peer(&srv, server_io, "garbage-peer").await });
+
+        let mut conn = PeerConnection::new(client_io);
+        client_handshake(&mut conn).await;
+        // Field 1, length-delimited, declaring more bytes than follow.
+        conn.send_frame(Frame {
+            ty: MessageType::SyncBlockChain,
+            payload: Bytes::from_static(&[0x0a, 0x7f, 0x01]),
+        })
+        .await
+        .expect("send malformed sync request");
+        assert_closed_without_inventory(&mut conn).await;
 
         drop(conn);
         let _ = server_task.await;

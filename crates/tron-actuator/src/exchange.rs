@@ -34,11 +34,31 @@ pub const TRX_TOKEN_ID: &[u8] = b"_";
 // ExchangeCreateActuator
 // =============================================================================
 
+/// java 4.8.3 (TIP-937) `DynamicPropertiesStore.getCloseExchange`: 0 open,
+/// 1 creation / injection / trading closed, 2 withdrawal closed as well.
+/// java narrows the stored long to an int.
+fn close_exchange_level(dyn_props: &DynamicPropertiesStore) -> i64 {
+    dyn_props.get_long(b"CLOSE_EXCHANGE").unwrap_or(0) as i32 as i64
+}
+
+/// Rejects the contract when `closed` holds for the current close level.
+fn require_exchange_open(
+    dyn_props: &DynamicPropertiesStore,
+    closed: impl Fn(i64) -> bool,
+) -> Result<(), ActuatorError> {
+    let level = close_exchange_level(dyn_props);
+    if closed(level) {
+        return Err(ActuatorError::ExchangeCloseLevel(level));
+    }
+    Ok(())
+}
+
 pub fn validate_exchange_create(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
     contract: &ExchangeCreateContract,
 ) -> Result<(), ActuatorError> {
+    require_exchange_open(dyn_props, |level| level >= 1)?;
     let owner = require_owner(&contract.owner_address)?;
     let account = accounts
         .get(&owner)?
@@ -180,6 +200,7 @@ pub fn validate_exchange_inject(
     contract: &ExchangeInjectContract,
 ) -> Result<(), ActuatorError> {
     // java ExchangeInjectActuator.validate.
+    require_exchange_open(dyn_props, |level| level >= 1)?;
     let owner = require_owner(&contract.owner_address)?;
     let mut account = accounts
         .get(&owner)?
@@ -392,7 +413,8 @@ pub fn validate_exchange_withdraw(
     v2: &ExchangeV2Store,
     contract: &ExchangeWithdrawContract,
 ) -> Result<(), ActuatorError> {
-    // java ExchangeWithdrawActuator.validate.
+    // java ExchangeWithdrawActuator.validate. Withdrawal stays open at level 1.
+    require_exchange_open(dyn_props, |level| level == 2)?;
     let owner = require_owner(&contract.owner_address)?;
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
@@ -567,6 +589,7 @@ pub fn validate_exchange_transaction(
     dyn_props: &DynamicPropertiesStore,
     contract: &ExchangeTransactionContract,
 ) -> Result<(), ActuatorError> {
+    require_exchange_open(dyn_props, |level| level >= 1)?;
     // Ported from java ExchangeTransactionActuator.validate, in java's exact
     // order so the first failing check fires the same rejection java records.
     // The fee is 0 here, so java's `balance < calcFee()` and TRX-fee guards are

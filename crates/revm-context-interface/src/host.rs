@@ -510,6 +510,17 @@ pub trait Host {
         false
     }
 
+    /// **TRON fork** — is the `ALLOW_TVM_RESOURCE_OPTIMIZATION` proposal (#104)
+    /// active? java `VMConfig.allowTvmResourceOptimization()`. In the frame
+    /// layer it decides whether a nested CREATE/CREATE2 whose constructor
+    /// REVERTs with data starting 0xEF stays a plain revert (active) or is
+    /// turned into an invalid-code exception (inactive, the historical
+    /// `Program.createContractImpl` behaviour). Default `false`.
+    #[inline]
+    fn tron_allow_tvm_resource_optimization(&self) -> bool {
+        false
+    }
+
     /// **TRON fork** — is the `ALLOW_TVM_TRANSFER_TRC10` proposal (#18) active?
     /// java `VMConfig.allowTvmTransferTrc10()`. Among other things it decides
     /// whether `Program.suicide` follows the balance sweep with
@@ -625,6 +636,13 @@ pub trait Host {
     fn tron_vote_witness(&mut self, _caller: Address, _witnesses: &[(Address, i64)]) -> i64 {
         0
     }
+
+    /// `VOTEWITNESS` that returns false before reaching the vote processor
+    /// (array-length mismatch, amount out of `long` range). java
+    /// `Program.voteWitness` has already run `increaseNonce()` by then, and
+    /// that nonce feeds the address of a later CREATE. Default: no-op.
+    #[inline]
+    fn tron_vote_witness_rejected(&mut self) {}
 
     /// `WITHDRAWREWARD` (0xd9) — withdraw accumulated SR rewards.
     /// Returns the withdrawn amount. Default: 0.

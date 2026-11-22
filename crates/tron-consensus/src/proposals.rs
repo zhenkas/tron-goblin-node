@@ -450,7 +450,11 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         97 => b"ALLOW_HARDEN_RESOURCE_CALCULATION",
         98 => b"ALLOW_HARDEN_EXCHANGE_CALCULATION",
         99 => b"ALLOW_OPTIMIZE_TVM_STORAGE",
+        100 => b"ALLOW_STRICT_ECDSA_VALIDATION",
+        101 => b"CLOSE_EXCHANGE",
         102 => b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY",
+        103 => b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION",
+        104 => b"ALLOW_TVM_RESOURCE_OPTIMIZATION",
         _ => return None,
     })
 }
@@ -464,7 +468,12 @@ mod parameter_key_tests {
         assert_eq!(parameter_id_to_key(95), Some(&b"ALLOW_TVM_PRAGUE"[..]));
         assert_eq!(parameter_id_to_key(96), Some(&b"ALLOW_TVM_OSAKA"[..]));
         assert_eq!(parameter_id_to_key(99), Some(&b"ALLOW_OPTIMIZE_TVM_STORAGE"[..]));
-        assert_eq!(parameter_id_to_key(100), None);
+        // java 4.8.3
+        assert_eq!(parameter_id_to_key(100), Some(&b"ALLOW_STRICT_ECDSA_VALIDATION"[..]));
+        assert_eq!(parameter_id_to_key(101), Some(&b"CLOSE_EXCHANGE"[..]));
+        assert_eq!(parameter_id_to_key(103), Some(&b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION"[..]));
+        assert_eq!(parameter_id_to_key(104), Some(&b"ALLOW_TVM_RESOURCE_OPTIMIZATION"[..]));
+        assert_eq!(parameter_id_to_key(105), None);
     }
 }
 

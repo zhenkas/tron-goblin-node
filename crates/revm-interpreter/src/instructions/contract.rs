@@ -1049,6 +1049,7 @@ pub fn vote_witness<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
     // A length mismatch between the two arrays returns false without
     // halting.
     if witness_len != amount_len {
+        context.host.tron_vote_witness_rejected();
         push!(context.interpreter, U256::ZERO);
         return Ok(());
     }
@@ -1065,6 +1066,7 @@ pub fn vote_witness<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
         let amount_word =
             read_memory_word(&context.interpreter.memory, amount_off + 32 + i * 32);
         let Some(amount) = u256_to_i64_exact(&amount_word) else {
+            context.host.tron_vote_witness_rejected();
             push!(context.interpreter, U256::ZERO);
             return Ok(());
         };

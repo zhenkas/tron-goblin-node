@@ -750,6 +750,10 @@ impl<
         self.journaled_state.db().tron_allow_tvm_constantinople()
     }
 
+    fn tron_allow_tvm_resource_optimization(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_resource_optimization()
+    }
+
     fn tron_allow_tvm_transfer_trc10(&self) -> bool {
         self.journaled_state.db().tron_allow_tvm_transfer_trc10()
     }
@@ -888,6 +892,10 @@ impl<
         let result = self.journaled_state.db_mut().tron_vote_witness(caller, witnesses);
         self.apply_tron_balance_delta();
         result
+    }
+
+    fn tron_vote_witness_rejected(&mut self) {
+        self.journaled_state.db_mut().tron_vote_witness_rejected();
     }
 
     fn tron_withdraw_reward(&mut self, caller: Address) -> i64 {

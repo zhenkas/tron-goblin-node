@@ -136,6 +136,13 @@ node_discovery_persist_interval_ms = 60000
 # NetUtil.validNode rejects port 0 with BAD_PROTOCOL.
 advertise_port = 18889
 
+# IPv4 address named as our own in Hello messages and discovery packets — the
+# address peers can reach `advertise_port` on. Optional: unset advertises
+# 127.0.0.1, which java-tron accepts and which promises nothing. The bind
+# address below (0.0.0.0) is never advertised; java-tron drops a message that
+# names it. Must be a plain IPv4 address (no hostname, not 0.0.0.0).
+# advertise_host = "203.0.113.7"
+
 # Max concurrent peer connections (each = one tokio task + one TCP socket).
 # 60 spreads thinly across many ASNs to find archive-capable peers without
 # tripping any single host's same-IP cap. Also caps concurrent INBOUND peers.

@@ -169,6 +169,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
     let private_profile = crate::private_network::validate_config(&config)
         .map_err(|e| RunError::Configuration(e.to_string()))?;
     config.assist.validate().map_err(RunError::Configuration)?;
+    config.p2p.validate().map_err(RunError::Configuration)?;
 
     #[cfg(feature = "devnet-fast")]
     {
@@ -1617,9 +1618,14 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
             .parse()
             .unwrap();
         let home_id = random_node_id_64();
-        let public_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.p2p.advertise_port)
-            .parse()
-            .unwrap();
+        // The home endpoint names the advertise address, never the bind
+        // address above: java-tron drops a discovery packet whose `from`
+        // is `0.0.0.0` (`KadMessage.valid`). Both parts were checked by
+        // `P2pConfig::validate`.
+        let public_addr: std::net::SocketAddr =
+            format!("{}:{}", config.p2p.advertise_host(), config.p2p.advertise_port)
+                .parse()
+                .unwrap();
         #[cfg(not(feature = "private-network"))]
         let network_id = tron_net::MAINNET_P2P_VERSION;
         #[cfg(feature = "private-network")]
@@ -2042,7 +2048,8 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                         Some(metrics.clone()),
                         config.p2p.max_peers,
                     )
-                    .with_inbound_budget(inbound_budget.clone()),
+                    .with_inbound_budget(inbound_budget.clone())
+                    .with_advertise_host(config.p2p.advertise_host()),
                 );
                 #[cfg(feature = "private-network")]
                 let server = std::sync::Arc::new(
@@ -2393,6 +2400,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
             let assist_for_peer = assisted_sync.clone();
             let event_bus_for_peer = event_bus.clone();
             let inbound_budget_for_peer = inbound_budget.clone();
+            let advertise_host_for_peer = config.p2p.advertise_host().to_string();
             #[cfg(feature = "private-network")]
             let private_network_id = private_profile.p2p_network_id;
             #[cfg(feature = "private-network")]
@@ -2404,6 +2412,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                     .with_mempool(mempool_for_peer)
                     .with_undo_store(undo_for_peer)
                     .with_inbound_budget(inbound_budget_for_peer)
+                    .with_advertise_host(&advertise_host_for_peer)
                     .with_peer_state(peer_state_for_peer)
                     .with_node_statistics(node_stats_for_peer)
                     .with_peer_registry(peer_registry_for_peer)

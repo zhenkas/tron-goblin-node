@@ -195,6 +195,8 @@ pub enum ActuatorError {
     TokenNotInExchange,
     #[error("token balance in exchange is equal with 0, the exchange has been closed")]
     ExchangeClosed,
+    #[error("exchange contract is rejected by exchange close level {0}")]
+    ExchangeCloseLevel(i64),
     #[error("token quantity must be > 0")]
     NonPositiveTokenQuant,
     #[error("exchange balance limit exceeded")]

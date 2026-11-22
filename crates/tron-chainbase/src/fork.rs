@@ -63,13 +63,16 @@ pub const VERSION_4_8_2: i32 = 36;
 pub const VERSION_4_8_2_2: i32 = 37;
 pub const VERSION_4_8_2_3: i32 = 38;
 pub const VERSION_4_8_2_4: i32 = 39;
+pub const VERSION_4_8_3: i32 = 40;
 
 /// `Parameter.ChainConstant.BLOCK_VERSION` — the version a producing node
-/// stamps on its blocks.
+/// stamps on its blocks. java 4.8.3 stamps 40; we keep 39 until we produce
+/// with the 4.8.3 rules, while [`FORK_VERSIONS`] already tracks 40 so the
+/// fork statistics of received blocks match a 4.8.3 node.
 pub const BLOCK_VERSION: i32 = 39;
 
 /// `ForkBlockVersionEnum.values()`, in declaration order.
-pub const FORK_VERSIONS: [ForkVersion; 29] = [
+pub const FORK_VERSIONS: [ForkVersion; 30] = [
     ForkVersion { version: ENERGY_LIMIT, hard_fork_time_ms: 0, rate: 0 },
     ForkVersion { version: VERSION_3_2_2, hard_fork_time_ms: 0, rate: 0 },
     ForkVersion { version: VERSION_3_5, hard_fork_time_ms: 0, rate: 0 },
@@ -99,6 +102,7 @@ pub const FORK_VERSIONS: [ForkVersion; 29] = [
     ForkVersion { version: VERSION_4_8_2_2, hard_fork_time_ms: HARD_FORK_TIME_2020_08_07, rate: 70 },
     ForkVersion { version: VERSION_4_8_2_3, hard_fork_time_ms: HARD_FORK_TIME_2020_08_07, rate: 70 },
     ForkVersion { version: VERSION_4_8_2_4, hard_fork_time_ms: HARD_FORK_TIME_2020_08_07, rate: 70 },
+    ForkVersion { version: VERSION_4_8_3, hard_fork_time_ms: HARD_FORK_TIME_2020_08_07, rate: 80 },
 ];
 
 const STATS_KEY_PREFIX: &[u8] = b"FORK_VERSION_";

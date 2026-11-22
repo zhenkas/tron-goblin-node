@@ -760,3 +760,62 @@ fn storage_key_proposal_only_accepts_one_and_cannot_be_reenabled() {
     ctx.dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
     assert!(proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).is_err());
 }
+
+// java 4.8.3: parameters 100 / 101 / 103 / 104 need VERSION_4_8_3 to pass.
+fn pass_version_4_8_3(ctx: &Ctx) {
+    ctx.dp.save_latest_block_header_timestamp(1_790_000_000_000);
+    ctx.dp.save_fork_stats(tron_chainbase::fork::VERSION_4_8_3, &[1u8; 27]);
+}
+
+fn create_ok(ctx: &Ctx, id: i64, value: i64) -> bool {
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: BTreeMap::from([(id, value)]),
+    };
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).is_ok()
+}
+
+#[test]
+fn parameters_of_4_8_3_require_the_fork_and_value_one() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_storage_key_fork(&ctx);
+    for id in [100, 101, 103, 104] {
+        assert!(!create_ok(&ctx, id, 1), "id {id} before the fork");
+    }
+    pass_version_4_8_3(&ctx);
+    for (id, key) in [
+        (100, &b"ALLOW_STRICT_ECDSA_VALIDATION"[..]),
+        (103, b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION"),
+        (104, b"ALLOW_TVM_RESOURCE_OPTIMIZATION"),
+    ] {
+        assert!(create_ok(&ctx, id, 1), "id {id}");
+        assert!(!create_ok(&ctx, id, 0), "id {id} value 0");
+        assert!(!create_ok(&ctx, id, 2), "id {id} value 2");
+        ctx.dp.put_long(key, 1);
+        assert!(!create_ok(&ctx, id, 1), "id {id} already active");
+    }
+}
+
+#[test]
+fn close_exchange_advances_one_level_at_a_time_and_locks_exchange_parameters() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_version_4_8_3(&ctx);
+    assert!(create_ok(&ctx, 12, 5));
+    assert!(create_ok(&ctx, 101, 1));
+    assert!(!create_ok(&ctx, 101, 0));
+    assert!(!create_ok(&ctx, 101, 2));
+    ctx.dp.put_long(b"CLOSE_EXCHANGE", 1);
+    assert!(!create_ok(&ctx, 101, 1));
+    assert!(create_ok(&ctx, 101, 2));
+    assert!(!create_ok(&ctx, 101, 0));
+    // EXCHANGE_CREATE_FEE (12) and ALLOW_HARDEN_EXCHANGE_CALCULATION (98) lock.
+    assert!(!create_ok(&ctx, 12, 5));
+    let harden = ctx.dp.get_long(b"ALLOW_HARDEN_EXCHANGE_CALCULATION").unwrap_or(0);
+    assert!(!create_ok(&ctx, 98, 1 - harden));
+    ctx.dp.put_long(b"CLOSE_EXCHANGE", 2);
+    assert!(!create_ok(&ctx, 101, 2));
+    assert!(!create_ok(&ctx, 101, 3));
+    assert!(!create_ok(&ctx, 101, 1));
+}

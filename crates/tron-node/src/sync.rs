@@ -1285,6 +1285,9 @@ pub struct SyncDriver {
     /// the total buffered across all peers (outbound dialers + the inbound
     /// server) is capped below `peers × MAX_FRAME_BYTES`.
     inbound_budget: Option<tron_net::InboundByteBudget>,
+    /// IPv4 address named in our Hello endpoints (`p2p.advertise_host`).
+    /// Defaults to [`tron_net::DEFAULT_ADVERTISE_HOST`].
+    advertise_host: String,
     /// Per-block undo log for KhaosDb Phase B reorg-with-rollback.
     /// Optional because lightweight tests / read-only nodes don't need
     /// the rollback infrastructure. When `None`, `accept_block` uses
@@ -1540,6 +1543,7 @@ impl SyncDriver {
             last_progress_log: None,
             at_tip: false,
             inbound_budget: None,
+            advertise_host: tron_net::DEFAULT_ADVERTISE_HOST.to_string(),
             undo_store: None,
             checkpoint: None,
             produced_blocks_tx: None,
@@ -2511,6 +2515,17 @@ impl SyncDriver {
         self
     }
 
+    /// Set the IPv4 address named in our Hello endpoints
+    /// (`p2p.advertise_host`). An address java-tron's `NetUtil.validIpV4`
+    /// would refuse (`0.0.0.0`, a hostname) is ignored and the default
+    /// kept — the peer would drop our Hello with `BAD_MESSAGE`.
+    pub fn with_advertise_host(mut self, host: &str) -> Self {
+        if tron_net::is_valid_advertise_ipv4(host) {
+            self.advertise_host = host.to_string();
+        }
+        self
+    }
+
     /// Attach a cross-store checkpoint. Only takes effect on the
     /// BlockSession path (i.e., when an undo store is attached and
     /// no snapshot stack is attached) — the snapshot-stack path
@@ -3070,17 +3085,25 @@ impl SyncDriver {
         // network_id=11111 for mainnet, version=2 for libp2p v0.2.
         // The `from.node_id` is a placeholder 64-byte uncompressed
         // pubkey; mainnet peers don't authenticate full nodes here.
+        //
+        // ONE endpoint for both Hellos. From 4.8.3 java-tron's
+        // `HandshakeService.processHelloMessage` compares the application
+        // Hello's `from` node id with the one the libp2p Hello registered
+        // on the channel and disconnects with `UNEXPECTED_IDENTITY` when
+        // they differ; it also runs `NetUtil.validNode` on this endpoint
+        // (address per `PATTERN_IPv4`, 64-byte id, port 1..65535).
+        let from = Endpoint {
+            address: self.advertise_host.as_bytes().to_vec(),
+            address_ipv6: Vec::new(),
+            // Advertise the standard mainnet P2P port (18888) even
+            // though we don't listen — java-tron's `NetUtil.validNode`
+            // rejects port 0 with `BAD_PROTOCOL` regardless of
+            // whether the peer can actually dial us back.
+            port: self.config.advertise_port,
+            node_id: attempt_node_id,
+        };
         let libp2p_inputs = Libp2pHelloInputs {
-            from: Endpoint {
-                address: b"127.0.0.1".to_vec(),
-                address_ipv6: Vec::new(),
-                // Advertise the standard mainnet P2P port (18888) even
-                // though we don't listen — java-tron's `NetUtil.validNode`
-                // rejects port 0 with `BAD_PROTOCOL` regardless of
-                // whether the peer can actually dial us back.
-                port: self.config.advertise_port,
-                node_id: attempt_node_id.clone(),
-            },
+            from: from.clone(),
             network_id: self.network_id,
             version: 2,
             timestamp_ms: now,
@@ -3100,13 +3123,13 @@ impl SyncDriver {
         // after serving an inventory.
         let solid = self.solid_block_id().unwrap_or(head);
         let lowest = self.lowest_block_num();
+        // The head this connection announces. A java peer holds every
+        // later `BlockChainInventory` of ours against it
+        // (`ChainInventoryMsgHandler.check`); see
+        // `chain_inventory_ends_below_announced_head`.
+        let hello_head_num = head.num() as i64;
         let hello = HelloInputs {
-            from: Endpoint {
-                address: b"127.0.0.1".to_vec(),
-                address_ipv6: Vec::new(),
-                port: self.config.advertise_port,
-                node_id: attempt_node_id.clone(),
-            },
+            from,
             version: self.network_id,
             timestamp_ms: now,
             genesis,
@@ -3384,6 +3407,11 @@ impl SyncDriver {
         // keep the connection "alive" every ~10s, so the 60s read-idle valve
         // never fires on a healthy-looking socket.
         let mut awaiting_inventory: Option<Instant> = None;
+        // Highest block number we have claimed to hold on THIS connection:
+        // the Hello head, raised by the blocks we announce afterwards. A
+        // terminal `BlockChainInventory` (remain 0) must not end below it —
+        // see `chain_inventory_ends_below_announced_head`.
+        let mut announced_head_num: i64 = hello_head_num;
         // When caught up to this peer (empty ChainInventory), defer the next
         // SyncBlockChain re-poll until this instant. Re-polling at the tip every
         // few seconds keeps the peer's `needSyncFromUs` set, which makes it drop
@@ -3451,6 +3479,11 @@ impl SyncDriver {
         //   A leader that's BEHIND the live tip yet hasn't advanced its head for
         //   `STALL_RESET_AFTER` is wedged — recover instead of idling forever.
         let mut was_leader = false;
+        // Read-before-drain bookkeeping for a leader on the pool path: when
+        // its last `drain_pool` finished, and whether a `Block` frame has
+        // since skipped its inline drain (see `leader_drains_inline`).
+        let mut last_leader_drain_at = Instant::now();
+        let mut leader_drain_deferred = false;
         let mut last_head_num: i64 = self.head_number();
         let mut last_head_advance = Instant::now();
         // Companion to the no-advance reset below: catch a leader that IS
@@ -3674,12 +3707,19 @@ impl SyncDriver {
             // runtime. Each notice carries pre-encoded bytes ready to
             // stuff into a `MessageType::Block` frame.
             if let Some(rx) = produced_rx.as_mut() {
-                if let Err(reason) =
-                    drain_produced_blocks(&mut conn, rx, self.config.peer_is_fast_forward).await
+                match drain_produced_blocks(&mut conn, rx, self.config.peer_is_fast_forward).await
                 {
-                    return PeerOutcome::PeerFailure(format!(
-                        "broadcast produced block: {reason}"
-                    ));
+                    // A block we announce raises the head this connection
+                    // has claimed, like the Hello did — less one, the
+                    // slack java allows an announcement ("tolerate one
+                    // block awaiting application").
+                    Ok(Some(num)) => announced_head_num = announced_head_num.max(num - 1),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        return PeerOutcome::PeerFailure(format!(
+                            "broadcast produced block: {reason}"
+                        ));
+                    }
                 }
             }
 
@@ -3840,6 +3880,8 @@ impl SyncDriver {
                             &mut prev_id,
                             &mut last_block_ts,
                         );
+                        last_leader_drain_at = Instant::now();
+                        leader_drain_deferred = false;
                         // `front`/`front_state` name the block the queue is
                         // waiting on and where the pool has it; a `front`
                         // above `head + 1` means the head-of-line block is
@@ -4224,8 +4266,14 @@ impl SyncDriver {
                 }
                 // Leader drain tick (pool path): apply blocks delivered by
                 // other workers even when this leader isn't itself receiving
-                // frames. Cheap no-op when nothing is ready.
-                _ = tokio::time::sleep(Duration::from_millis(150)),
+                // frames. Cheap no-op when nothing is ready. It is also what
+                // runs a drain the `Block` arm deferred in favour of reading
+                // (`leader_drains_inline`); the sleep shortens then, so steady
+                // traffic cannot hold that drain off indefinitely.
+                _ = tokio::time::sleep(leader_drain_tick(
+                        leader_drain_deferred,
+                        last_leader_drain_at.elapsed(),
+                    )),
                     if multi_peer
                         && am_leader
                         && (!expected.is_empty() || !self.ready_orphans.is_empty()) =>
@@ -4238,6 +4286,8 @@ impl SyncDriver {
                             &mut prev_id,
                             &mut last_block_ts,
                         );
+                        last_leader_drain_at = Instant::now();
+                        leader_drain_deferred = false;
                         // Applying pooled blocks IS liveness: a leader can spend
                         // long stretches applying blocks fetched by OTHER workers
                         // while receiving no frames on its own connection.
@@ -4323,13 +4373,25 @@ impl SyncDriver {
             // Per-frame-type rate limit. Registered types
             // (SYNC_BLOCK_CHAIN, FETCH_INV_DATA, P2P_DISCONNECT) gate
             // through a token bucket; on bucket-empty the frame is
-            // dropped silently (matches java-tron's
-            // `P2pEventHandlerImpl` policy). Unregistered types
-            // pass through unlimited.
+            // dropped. Unregistered types pass through unlimited.
             if !p2p_rate_limiter.try_acquire(frame.ty.as_byte()) {
                 debug!(ty = ?frame.ty, "P2P rate limit: dropping frame");
                 if let Some(m) = &self.metrics {
                     m.inc_p2p_rate_limited();
+                }
+                // A dropped SYNC_BLOCK_CHAIN must not leave the peer
+                // waiting: java-tron's `SyncBlockChainMsgHandler.check`
+                // answers an over-limit request with a disconnect, never
+                // with silence, and the requester has no retry — it sits
+                // on `syncChainRequested` until `PeerStatusCheck` gives up
+                // (TIME_OUT after 10 s from 4.8.3, after the 30 s
+                // block-update timeout before). Close now instead.
+                if rate_limited_frame_closes_connection(frame.ty) {
+                    return PeerOutcome::PeerFailure(
+                        "peer's SyncBlockChain exceeded the rate limit; \
+                         disconnecting (java BAD_PROTOCOL)"
+                            .to_string(),
+                    );
                 }
                 continue;
             }
@@ -4922,7 +4984,17 @@ impl SyncDriver {
                             }
                         }
                         if am_leader {
-                            if let Some(pool) = self.fetch_pool.clone() {
+                            // Read before draining while the peer still owes
+                            // us blocks: its remaining frames are already
+                            // written, and a drain here would keep us off the
+                            // socket for up to `MAX_DRAIN_TIME` per frame.
+                            // The drain tick picks the deferred work up.
+                            if !leader_drains_inline(
+                                blocks_in_flight,
+                                last_leader_drain_at.elapsed(),
+                            ) {
+                                leader_drain_deferred = true;
+                            } else if let Some(pool) = self.fetch_pool.clone() {
                                 self.drain_pool(
                                     &pool,
                                     &mut expected,
@@ -4930,6 +5002,8 @@ impl SyncDriver {
                                     &mut prev_id,
                                     &mut last_block_ts,
                                 );
+                                last_leader_drain_at = Instant::now();
+                                leader_drain_deferred = false;
                             }
                         }
                         continue;
@@ -5218,8 +5292,12 @@ impl SyncDriver {
                     {
                         Ok(i) => i,
                         Err(e) => {
-                            debug!(peer, error = %e, "decode inbound SyncBlockChain");
-                            continue;
+                            // No reply is possible, and the peer waits for
+                            // one (see the rate-limit note above). java
+                            // raises BAD_MESSAGE and disconnects.
+                            return PeerOutcome::PeerFailure(format!(
+                                "undecodable SyncBlockChain from peer: {e}"
+                            ));
                         }
                     };
                     let (ids, remain) = self.serve_sync_block_chain(&inv.ids);
@@ -5241,6 +5319,22 @@ impl SyncDriver {
                              disconnecting (java INCOMPATIBLE_CHAIN)"
                                 .to_string(),
                         );
+                    }
+                    // "That is all I have" below the head we claimed is a
+                    // reply java-tron 4.8.3 refuses (SYNC_FAIL); close
+                    // instead. Covers an index gap, a head lowered by a
+                    // reorg, and the spoofed-head modes (tip-test /
+                    // follow-tip / explore), whose index cannot back the
+                    // head they announce.
+                    if chain_inventory_ends_below_announced_head(
+                        &ids,
+                        remain,
+                        announced_head_num,
+                    ) {
+                        return PeerOutcome::PeerFailure(format!(
+                            "cannot serve peer's sync up to the head announced on this \
+                             connection ({announced_head_num}); disconnecting (java SYNC_FAIL)"
+                        ));
                     }
                     let reply =
                         tron_net::sync::chain_inventory_from_ids(&ids, remain);
@@ -7689,13 +7783,52 @@ pub fn serve_sync_block_chain_ids(
     // serve past the gap in any case, so the truncated answer reports 0 — "this
     // is all I have". The peer treats us as caught up and re-locates from its
     // new tip, which is the same outcome java produces when its head sits at
-    // the last block it can actually serve.
+    // the last block it can actually serve. Whether that answer may go out
+    // on a given connection is the caller's call: see
+    // `chain_inventory_ends_below_announced_head`.
     let walk_complete = ids.last().map(|l| l.num() as i64) == Some(end);
     let remain = match ids.last() {
         Some(last) if walk_complete && ids.len() > 1 => (our_head - last.num() as i64).max(0),
         _ => 0,
     };
     (ids, remain)
+}
+
+/// `true` when `(ids, remain)` — an answer from
+/// [`serve_sync_block_chain_ids`] — must not be sent on a connection where we
+/// have claimed to hold blocks up to `announced_head`: it is terminal
+/// (`remain == 0`, "this is all I have") yet ends below that head.
+///
+/// From 4.8.3 java `ChainInventoryMsgHandler.check` rejects such a reply with
+/// `SYNC_FAILED` ("lastNum N (remainNum=0) is below hello head H"; likewise
+/// when it ends more than one block below a block we advertised in the 15 s
+/// before the request). `announced_head` is therefore the Hello head, raised
+/// to one below every block announced since. There is no truthful alternative to send:
+/// a non-zero remain needs a full batch (2000 ids, else `BAD_MESSAGE` →
+/// `BAD_PROTOCOL` and a one-hour ban), and we cannot serve past the point
+/// the walk stopped. java's comment on the rule names the remedy — "allow a
+/// fresh HELLO on reconnect" — so the caller closes the connection.
+///
+/// A healthy node never hits this: its walk reaches the current head, which
+/// only grows. It fires for an index gap, for a head a reorg lowered below
+/// what was announced, and for the spoofed-head modes (tip-test /
+/// follow-tip / explore), which announce a head their index cannot back.
+/// Peers before 4.8.3 accepted the reply and took us for caught up while we
+/// claimed otherwise; they lose nothing by reconnecting instead.
+pub fn chain_inventory_ends_below_announced_head(
+    ids: &[BlockId],
+    remain: i64,
+    announced_head: i64,
+) -> bool {
+    remain == 0 && ids.last().is_some_and(|last| (last.num() as i64) < announced_head)
+}
+
+/// Whether dropping a rate-limited inbound frame of type `ty` must also close
+/// the connection. `SyncBlockChain` is a request whose sender waits for the
+/// reply and does not retry, so it is never dropped silently; every other
+/// limited type keeps the plain drop.
+fn rate_limited_frame_closes_connection(ty: MessageType) -> bool {
+    ty == MessageType::SyncBlockChain
 }
 
 /// Serve an inbound `FetchInvData` request by looking up each
@@ -7926,18 +8059,24 @@ where
 ///     non-fast-forward peers.
 ///
 /// Treats `Lagged` as a warning; `Closed` as a no-op.
+///
+/// Returns the highest block number announced by this call (`None` when
+/// nothing was sent), so the caller can track the head it has claimed on
+/// the connection.
 async fn drain_produced_blocks<S>(
     conn: &mut PeerConnection<S>,
     rx: &mut broadcast::Receiver<crate::sr_runtime::ProducedBlockNotice>,
     is_fast_forward: bool,
-) -> Result<(), String>
+) -> Result<Option<i64>, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     use prost::Message as _;
+    let mut announced: Option<i64> = None;
     loop {
         match rx.try_recv() {
             Ok(notice) => {
+                let block_num = notice.block_num;
                 if is_fast_forward {
                     if let Err(e) = conn
                         .send_frame(Frame {
@@ -7973,8 +8112,9 @@ where
                         "advertised produced block to peer"
                     );
                 }
+                announced = Some(announced.map_or(block_num, |a| a.max(block_num)));
             }
-            Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(broadcast::error::TryRecvError::Empty) => return Ok(announced),
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 warn!(
                     dropped = n,
@@ -7982,7 +8122,7 @@ where
                 );
                 continue;
             }
-            Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+            Err(broadcast::error::TryRecvError::Closed) => return Ok(announced),
         }
     }
 }
@@ -8225,6 +8365,50 @@ fn fetch_chunk_size(in_flight: usize, per_peer_cap: usize, wire_cap: usize) -> u
     per_peer_cap.saturating_sub(in_flight).min(wire_cap)
 }
 
+/// Cadence of the leader's drain tick on a quiet socket (pool path).
+const LEADER_DRAIN_TICK: Duration = Duration::from_millis(150);
+
+/// How long after a drain the leader keeps reading its own socket before it
+/// drains again while the peer still owes it blocks. Frames already in the
+/// socket buffer are read in well under this; keeping it short bounds what
+/// the deferral can cost catch-up throughput (at most this much apply idle
+/// per drain cycle while frames keep streaming).
+const LEADER_READ_PRIORITY_WINDOW: Duration = Duration::from_millis(200);
+
+/// Whether a leader that just read a `Block` frame applies from the pool right
+/// away (`true`) or goes back to the socket first (`false`).
+///
+/// A drain blocks this task — and with it the socket read — for up to
+/// `MAX_DRAIN_TIME`. Draining after every frame therefore reads a batch at
+/// one frame per drain, while the peer wrote the whole batch at once: from
+/// 4.8.3 java-tron closes a connection whose write is not flushed within
+/// 10 s (`WriteBufferHandler`, a Netty `WriteTimeoutHandler`) and bans the
+/// address for 60 s. So while the peer still owes us blocks
+/// (`blocks_in_flight > 0`) the frames already on the wire are read first —
+/// depositing one into the pool is cheap — and the drain is left to the tick
+/// (see [`leader_drain_tick`]) or to the first frame that arrives once
+/// [`LEADER_READ_PRIORITY_WINDOW`] has passed since the last drain finished.
+/// The reader is then never away for more than one drain.
+///
+/// With nothing in flight the answer is always `true`: at the tip a block is
+/// applied the moment it arrives, as before.
+fn leader_drains_inline(blocks_in_flight: usize, since_last_drain: Duration) -> bool {
+    blocks_in_flight == 0 || since_last_drain >= LEADER_READ_PRIORITY_WINDOW
+}
+
+/// Sleep of the leader's drain tick. Normally [`LEADER_DRAIN_TICK`]; once a
+/// drain has been deferred by [`leader_drains_inline`] it is cut to whatever
+/// is left of [`LEADER_READ_PRIORITY_WINDOW`], so a socket that never stays
+/// quiet for a whole tick (steady non-block traffic) cannot postpone the
+/// deferred drain past that window.
+fn leader_drain_tick(drain_deferred: bool, since_last_drain: Duration) -> Duration {
+    if drain_deferred {
+        LEADER_DRAIN_TICK.min(LEADER_READ_PRIORITY_WINDOW.saturating_sub(since_last_drain))
+    } else {
+        LEADER_DRAIN_TICK
+    }
+}
+
 /// Pick the next rotation cursor after leaving a peer: a random candidate
 /// different from `cursor` whose peer isn't archive-demoted, falling back to
 /// a linear scan. Returns `cursor` unchanged only when no other eligible
@@ -8310,6 +8494,73 @@ impl XorShift64 {
         for i in (1..slice.len()).rev() {
             let j = self.next_usize_below(i + 1);
             slice.swap(i, j);
+        }
+    }
+}
+
+#[cfg(test)]
+mod leader_read_priority_tests {
+    use super::{
+        leader_drain_tick, leader_drains_inline, SyncDriver, LEADER_DRAIN_TICK,
+        LEADER_READ_PRIORITY_WINDOW,
+    };
+    use std::time::Duration;
+
+    #[allow(non_snake_case)]
+    fn MS(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    /// Nothing in flight (the tip, or the last block of a batch): the block
+    /// is applied on arrival whatever the clock says.
+    #[test]
+    fn nothing_in_flight_always_drains_inline() {
+        assert!(leader_drains_inline(0, Duration::ZERO));
+        assert!(leader_drains_inline(0, MS(10)));
+        assert!(leader_drains_inline(0, Duration::from_secs(60)));
+    }
+
+    /// Blocks still owed: read first, until the window since the last drain
+    /// has passed.
+    #[test]
+    fn blocks_in_flight_defer_the_drain_until_the_window_passes() {
+        for in_flight in [1usize, 31, 63, 100] {
+            assert!(!leader_drains_inline(in_flight, Duration::ZERO));
+            assert!(!leader_drains_inline(in_flight, LEADER_READ_PRIORITY_WINDOW - MS(1)));
+            assert!(leader_drains_inline(in_flight, LEADER_READ_PRIORITY_WINDOW));
+            assert!(leader_drains_inline(in_flight, Duration::from_secs(5)));
+        }
+    }
+
+    #[test]
+    fn tick_keeps_its_cadence_unless_a_drain_is_owed() {
+        for since in [Duration::ZERO, MS(900), Duration::from_secs(30)] {
+            assert_eq!(leader_drain_tick(false, since), LEADER_DRAIN_TICK);
+        }
+        // Owed, early in the window: the ordinary tick.
+        assert_eq!(leader_drain_tick(true, MS(10)), LEADER_DRAIN_TICK);
+        // Owed, window nearly over: only the remainder.
+        assert_eq!(
+            leader_drain_tick(true, LEADER_READ_PRIORITY_WINDOW - MS(50)),
+            MS(50)
+        );
+        // Owed and overdue: fire at once.
+        assert_eq!(leader_drain_tick(true, LEADER_READ_PRIORITY_WINDOW), Duration::ZERO);
+        assert_eq!(leader_drain_tick(true, Duration::from_secs(9)), Duration::ZERO);
+    }
+
+    /// The point of the change, as arithmetic: the longest the leader stays
+    /// off its socket is one drain plus the read window, which must fit
+    /// java-tron's 10 s write timeout with room for one slow block — and a
+    /// deferred drain is never owed for longer than the window.
+    #[test]
+    fn reader_blackout_stays_inside_the_java_write_timeout() {
+        const JAVA_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+        assert!(SyncDriver::MAX_DRAIN_TIME + LEADER_READ_PRIORITY_WINDOW <= JAVA_WRITE_TIMEOUT / 2);
+        // Whatever the elapsed time, a deferred drain is due within the window.
+        for ms in (0..=2_000).step_by(50) {
+            let since = MS(ms);
+            assert!(since + leader_drain_tick(true, since) <= LEADER_READ_PRIORITY_WINDOW.max(since));
         }
     }
 }
@@ -8875,9 +9126,10 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_produced_blocks(&mut us, &mut rx, false)
+        let announced = drain_produced_blocks(&mut us, &mut rx, false)
             .await
             .expect("drain ok");
+        assert_eq!(announced, Some(42), "reports the height it announced");
 
         // Non-FF peer must get an Inventory(BLOCK) advertisement, NOT a
         // Block frame.
@@ -8912,9 +9164,15 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_produced_blocks(&mut us, &mut rx, true)
+        let announced = drain_produced_blocks(&mut us, &mut rx, true)
             .await
             .expect("drain ok");
+        assert_eq!(announced, Some(42), "a pushed block is an announcement too");
+        assert_eq!(
+            drain_produced_blocks(&mut us, &mut rx, true).await.expect("drain ok"),
+            None,
+            "nothing queued, nothing announced"
+        );
 
         // FF peer gets the full Block frame with the pre-encoded
         // bytes verbatim.
@@ -9276,6 +9534,83 @@ mod solidify_tests {
         let head = driver.resume_head().expect("spoofed head id present");
         assert_eq!(head.num(), tip_num as u64, "resume_head carries the learned tip number");
         assert_eq!(head.as_bytes(), &tip_hash, "resume_head carries the learned tip hash");
+    }
+
+    /// A spoofed-head node (tip-test / follow-tip / explore) announces a head
+    /// its index cannot back. The only thing it could tell a peer that syncs
+    /// from it is "genesis is all I have", which contradicts that head and
+    /// which java-tron 4.8.3 answers with SYNC_FAIL — so the answer is
+    /// recognised as unsendable against the head the Hello carries.
+    #[test]
+    fn spoofed_head_cannot_answer_a_sync_request_it_would_contradict() {
+        let state = mem_state();
+        let mut genesis_raw = [0x11u8; 32];
+        genesis_raw[..8].fill(0);
+        let genesis = BlockId::from_raw(genesis_raw);
+        BlockIndexStore::new(state.block_index.clone().unwrap())
+            .put(&genesis)
+            .unwrap();
+        let tip_num: i64 = 83_400_111;
+        let mut tip_hash = [0u8; 32];
+        tip_hash[..8].copy_from_slice(&(tip_num as u64).to_be_bytes());
+        tip_hash[31] = 0xcd;
+        {
+            let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+            dp.save_latest_block_header_number(tip_num);
+            dp.save_latest_block_header_hash(&tip_hash);
+        }
+        let driver = driver_with(state, mem());
+        let hello_head = driver.resume_head().expect("spoofed head").num() as i64;
+        assert_eq!(hello_head, tip_num);
+
+        // A fresh peer's locator is its genesis — the one block we share.
+        let locator = vec![tron_proto::block_inventory::BlockId {
+            hash: genesis.as_bytes().to_vec(),
+            number: 0,
+        }];
+        let (ids, remain) = driver.serve_sync_block_chain(&locator);
+        assert_eq!(ids, vec![genesis]);
+        assert_eq!(remain, 0);
+        assert!(chain_inventory_ends_below_announced_head(&ids, remain, hello_head));
+    }
+
+    #[test]
+    fn terminal_reply_rule_compares_the_last_id_with_the_announced_head() {
+        let id = |num: u64| {
+            let mut raw = [0xabu8; 32];
+            raw[..8].copy_from_slice(&num.to_be_bytes());
+            BlockId::from_raw(raw)
+        };
+        let ids = vec![id(18), id(19), id(20)];
+        // Terminal and short of the announced head: must not be sent.
+        assert!(chain_inventory_ends_below_announced_head(&ids, 0, 21));
+        // Terminal at or above it: fine (our head grew since the Hello).
+        assert!(!chain_inventory_ends_below_announced_head(&ids, 0, 20));
+        assert!(!chain_inventory_ends_below_announced_head(&ids, 0, 7));
+        // Not terminal: the peer is told more follows, whatever the head.
+        assert!(!chain_inventory_ends_below_announced_head(&ids, 5, 25));
+        // The empty answer is the caller's separate no-common-block case.
+        assert!(!chain_inventory_ends_below_announced_head(&[], 0, 25));
+    }
+
+    /// Only the request a peer waits on turns a rate-limit drop into a
+    /// disconnect; the other limited types keep java's plain drop.
+    #[test]
+    fn only_a_rate_limited_sync_request_closes_the_connection() {
+        assert!(rate_limited_frame_closes_connection(MessageType::SyncBlockChain));
+        assert!(!rate_limited_frame_closes_connection(MessageType::FetchInvData));
+        assert!(!rate_limited_frame_closes_connection(MessageType::P2pDisconnect));
+    }
+
+    #[test]
+    fn advertise_host_defaults_to_loopback_and_refuses_unusable_addresses() {
+        let driver = driver_with(mem_state(), mem());
+        assert_eq!(driver.advertise_host, "127.0.0.1");
+        let driver = driver.with_advertise_host("203.0.113.7");
+        assert_eq!(driver.advertise_host, "203.0.113.7");
+        // Never the unspecified address, whatever the caller passes.
+        let driver = driver.with_advertise_host("0.0.0.0");
+        assert_eq!(driver.advertise_host, "203.0.113.7");
     }
 
     fn witness(i: usize) -> [u8; 21] {

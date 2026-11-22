@@ -1038,6 +1038,23 @@ pub fn return_create<CTX: ContextTr>(
     interpreter_result: &mut InterpreterResult,
     address: Address,
 ) {
+    // TRON fork: java `Program.createContractImpl` runs its London 0xEF check
+    // on `createResult.getHReturn()` whatever the constructor's outcome, so a
+    // constructor that REVERTs with data starting 0xEF is given an
+    // `invalidCodeException` on top of its revert flag. The exception makes
+    // the creating frame take the early `return`: no `refundEnergyAfterVM`
+    // (the whole forwarded budget is forfeited) and no `returnDataBuffer`.
+    // `ALLOW_TVM_RESOURCE_OPTIMIZATION` (#104) exempts reverts
+    // (`!createResult.isRevert() || !allowTvmResourceOptimization()`), leaving
+    // the ordinary revert handled below. Only the literal REVERT opcode sets
+    // java's revert flag. The proposal is read only for the rare result that
+    // can be affected by it.
+    let tron_revert_with_ef_is_invalid_code = interpreter_result.result
+        == InstructionResult::Revert
+        && interpreter_result.output.first() == Some(&0xEF)
+        && context.tron_enabled()
+        && !context.tron_allow_tvm_resource_optimization();
+
     let (_, _, cfg, journal, _, local) = context.all_mut();
 
     let max_code_size = cfg.max_code_size();
@@ -1050,6 +1067,12 @@ pub fn return_create<CTX: ContextTr>(
     // If return is not ok revert and return.
     if !interpreter_result.result.is_ok() {
         journal.checkpoint_revert(checkpoint);
+        if tron_revert_with_ef_is_invalid_code
+            && !is_eip3541_disabled
+            && spec_id.is_enabled_in(LONDON)
+        {
+            interpreter_result.result = InstructionResult::CreateContractStartingWithEF;
+        }
         return;
     }
 

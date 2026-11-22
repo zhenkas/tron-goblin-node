@@ -131,8 +131,14 @@ fn validate_proposal_value(
                 return Err(only_one("REMOVE_THE_POWER_OF_THE_GR"));
             }
         }
-        EnergyFee | ExchangeCreateFee => {
+        EnergyFee => {
             // java: no value check (break immediately).
+        }
+        ExchangeCreateFee => {
+            // java 4.8.3 (TIP-937): locked once exchange creation is closed.
+            if flag(b"CLOSE_EXCHANGE") >= 1 {
+                return Err(bad());
+            }
         }
         MaxCpuTimeOfOneTx => {
             if flag(b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX") == 1 {
@@ -553,6 +559,10 @@ fn validate_proposal_value(
             }
         }
         AllowHardenExchangeCalculation => {
+            // java 4.8.3 (TIP-937): locked once the close level reaches 1.
+            if flag(b"CLOSE_EXCHANGE") >= 1 {
+                return Err(bad());
+            }
             if value != 0 && value != 1 {
                 return Err(bad());
             }
@@ -575,6 +585,54 @@ fn validate_proposal_value(
             }
             if value != 1 {
                 return Err(only_one("ALLOW_OPTIMIZE_TVM_STORAGE_KEY"));
+            }
+        }
+        // java 4.8.3: the four parameters below need VERSION_4_8_3 to pass.
+        AllowStrictEcdsaValidation => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_3) {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_STRICT_ECDSA_VALIDATION") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_STRICT_ECDSA_VALIDATION"));
+            }
+        }
+        // TIP-937: irreversible, one level at a time (0 -> 1 -> 2).
+        CloseExchange => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_3) {
+                return Err(bad());
+            }
+            // java narrows the stored long to int before comparing.
+            let current = flag(b"CLOSE_EXCHANGE") as i32 as i64;
+            if value == current {
+                return Err(bad());
+            }
+            if value != current + 1 || value < 1 || value > 2 {
+                return Err(bad());
+            }
+        }
+        AllowTvmVotePowerOptimization => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_3) {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_TVM_VOTE_POWER_OPTIMIZATION") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_TVM_VOTE_POWER_OPTIMIZATION"));
+            }
+        }
+        AllowTvmResourceOptimization => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_3) {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_TVM_RESOURCE_OPTIMIZATION") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_TVM_RESOURCE_OPTIMIZATION"));
             }
         }
         // java 4.8.2.3: storage optimization without legacy-read protection.
@@ -679,6 +737,10 @@ enum ProposalType {
     AllowHardenExchangeCalculation,
     AllowOptimizeTvmStorage,
     AllowOptimizeTvmStorageKey,
+    AllowStrictEcdsaValidation,
+    CloseExchange,
+    AllowTvmVotePowerOptimization,
+    AllowTvmResourceOptimization,
 }
 
 impl ProposalType {
@@ -768,7 +830,11 @@ impl ProposalType {
             97 => AllowHardenResourceCalculation,
             98 => AllowHardenExchangeCalculation,
             99 => AllowOptimizeTvmStorage,
+            100 => AllowStrictEcdsaValidation,
+            101 => CloseExchange,
             102 => AllowOptimizeTvmStorageKey,
+            103 => AllowTvmVotePowerOptimization,
+            104 => AllowTvmResourceOptimization,
             _ => return None,
         })
     }

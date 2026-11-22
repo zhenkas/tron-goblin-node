@@ -20,6 +20,27 @@ pub const NILE_P2P_VERSION: i32 = 201_910_292;
 /// Shasta testnet `node.p2p.version`.
 pub const SHASTA_P2P_VERSION: i32 = 1;
 
+/// IPv4 address we put in our own endpoints (libp2p Hello, application Hello,
+/// discovery home node) when the operator has not configured one. A node
+/// that does not know its external address must still name a syntactically
+/// valid one: java-tron's `NetUtil.validNode` drops the whole message
+/// otherwise. Loopback is valid there and promises nothing about
+/// reachability.
+pub const DEFAULT_ADVERTISE_HOST: &str = "127.0.0.1";
+
+/// `true` iff `host` is an IPv4 literal java-tron accepts in an endpoint.
+///
+/// Mirrors `NetUtil.validIpV4` (`PATTERN_IPv4`): four decimal octets without
+/// leading zeros, the first in `1..=255`. `0.0.0.0` therefore fails — a
+/// peer that receives it in a libp2p Hello or a discovery packet answers
+/// `BAD_MESSAGE` and drops the message (libp2p `Message.parse` /
+/// `KadMessage.valid`), and from 4.8.3 the application `HelloMessage`
+/// applies the same rule to its `from` endpoint.
+pub fn is_valid_advertise_ipv4(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.octets()[0] != 0)
+}
+
 /// Inputs for assembling a HelloMessage. Each `*_block_id` argument is the
 /// 32-byte [`tron_types::BlockId`] (first 8 bytes = number). The wire
 /// format carries `(hash, number)` as separate fields — see
@@ -75,5 +96,39 @@ pub fn build_hello(inputs: HelloInputs<'_>) -> HelloMessage {
         node_type: inputs.node_type,
         lowest_block_num: inputs.lowest_block_num,
         code_version: inputs.code_version.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cases taken from java-tron's `NetUtil.PATTERN_IPv4`.
+    #[test]
+    fn advertise_ipv4_follows_the_java_pattern() {
+        for ok in ["127.0.0.1", "1.0.0.0", "10.0.0.5", "203.0.113.7", "255.255.255.255"] {
+            assert!(is_valid_advertise_ipv4(ok), "{ok} must be accepted");
+        }
+        for bad in [
+            "0.0.0.0",      // unspecified
+            "0.1.2.3",      // first octet must be 1..=255
+            "01.2.3.4",     // no leading zeros
+            "1.2.3.04",
+            "256.1.1.1",
+            "1.2.3",
+            "1.2.3.4.5",
+            " 1.2.3.4",
+            "1.2.3.4:18888",
+            "::1",
+            "localhost",
+            "",
+        ] {
+            assert!(!is_valid_advertise_ipv4(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn default_advertise_host_is_itself_valid() {
+        assert!(is_valid_advertise_ipv4(DEFAULT_ADVERTISE_HOST));
     }
 }
