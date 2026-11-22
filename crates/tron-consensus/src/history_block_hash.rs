@@ -126,7 +126,9 @@ pub fn write_parent_hash(
     let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
     let slot = slot_for_block(block_num);
     let legacy_key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
-    if dyn_props.allow_optimize_tvm_storage() {
+    // java `allowTvmStorageOptimization()`: either storage-optimization
+    // proposal (#99 or #102) selects the 48-byte keys; mainnet runs on #102.
+    if dyn_props.allow_tvm_storage_optimization() {
         // java `Storage.commitOptimized` for a slot written without a prior
         // read: the value lands under the 48-byte key and the legacy row goes.
         storage.put_raw(&StorageRowStore::new_row_key(&addr_hash, &slot), &value)?;
@@ -135,6 +137,34 @@ pub fn write_parent_hash(
         storage.put(&legacy_key, &value)?;
     }
     Ok(true)
+}
+
+/// Move history rows that a build testing only proposal #99 wrote under the
+/// legacy 32-byte key to the 48-byte key java uses once either
+/// storage-optimization proposal is active. A legacy row is always the newer
+/// value for its slot: such a build never touched the 48-byte row, and a read
+/// prefers the 48-byte row, so a stale one would shadow the fresh hash.
+/// Returns the number of rows moved; idempotent.
+pub fn migrate_legacy_history_rows(
+    storage: &StorageRowStore,
+    dyn_props: &DynamicPropertiesStore,
+) -> Result<usize, StoreError> {
+    if !dyn_props.is_block_hash_history_installed() || !dyn_props.allow_tvm_storage_optimization() {
+        return Ok(0);
+    }
+    let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
+    let mut moved = 0;
+    for index in 0..HISTORY_SERVE_WINDOW {
+        let mut slot = [0u8; 32];
+        slot[24..].copy_from_slice(&index.to_be_bytes());
+        let legacy_key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
+        if let Some(value) = storage.get(&legacy_key)? {
+            storage.put_raw(&StorageRowStore::new_row_key(&addr_hash, &slot), &value)?;
+            storage.delete(&legacy_key)?;
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 #[cfg(test)]
@@ -262,6 +292,43 @@ mod tests {
             storage.read_slot(&addr_hash, &slot, false, true).unwrap().unwrap(),
             hash
         );
+    }
+
+    #[test]
+    fn write_uses_the_optimized_key_under_the_storage_key_proposal() {
+        // Mainnet activated #102 (ALLOW_OPTIMIZE_TVM_STORAGE_KEY), not #99.
+        let (_, _, _, dp, storage) = stores();
+        dp.save_block_hash_history_installed(1);
+        dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
+        let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
+        let slot = slot_for_block(5);
+        let hash = [0xabu8; 32];
+        assert!(write_parent_hash(&storage, &dp, 5, &hash).unwrap());
+        let legacy = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
+        assert!(storage.get(&legacy).unwrap().is_none());
+        assert_eq!(
+            storage.get_raw(&StorageRowStore::new_row_key(&addr_hash, &slot)).unwrap().unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn migration_moves_legacy_rows_over_stale_optimized_ones() {
+        let (_, _, _, dp, storage) = stores();
+        dp.save_block_hash_history_installed(1);
+        let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
+        let slot = slot_for_block(7);
+        let legacy = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
+        let optimized = StorageRowStore::new_row_key(&addr_hash, &slot);
+        storage.put_raw(&optimized, &[0x01u8; 32]).unwrap(); // stale, from a snapshot
+        storage.put(&legacy, &[0x02u8; 32]).unwrap(); // fresh, written by the old build
+        // Inactive proposal: nothing moves.
+        assert_eq!(migrate_legacy_history_rows(&storage, &dp).unwrap(), 0);
+        dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
+        assert_eq!(migrate_legacy_history_rows(&storage, &dp).unwrap(), 1);
+        assert!(storage.get(&legacy).unwrap().is_none());
+        assert_eq!(storage.get_raw(&optimized).unwrap().unwrap(), vec![0x02u8; 32]);
+        assert_eq!(migrate_legacy_history_rows(&storage, &dp).unwrap(), 0);
     }
 
     #[test]

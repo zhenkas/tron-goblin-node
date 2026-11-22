@@ -248,6 +248,21 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 )));
             }
         }
+        // Block-hash history rows written under the legacy key by a build
+        // that tested the wrong storage-optimization proposal.
+        match tron_consensus::history_block_hash::migrate_legacy_history_rows(
+            &tron_chainbase::StorageRowStore::new(stores.storage_row.clone()),
+            &tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone()),
+        ) {
+            Ok(0) => {}
+            Ok(rows) => info!(rows, "moved block-hash history rows to their optimized storage keys"),
+            Err(e) => {
+                error!(error = ?e, "block-hash history key migration failed");
+                return Err(RunError::Sync(format!(
+                    "block-hash history key migration failed: {e}"
+                )));
+            }
+        }
     }
 
     // Data directories synced before the fork statistics existed get them
