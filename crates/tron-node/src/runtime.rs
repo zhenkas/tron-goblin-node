@@ -2752,6 +2752,7 @@ fn store_id_backends(
         (Id::ExchangeV2, stores.exchange_v2.clone()),
         (Id::MarketOrders, stores.market_orders.clone()),
         (Id::MarketAccount, stores.market_account.clone()),
+        (Id::AccountAsset, stores.account_asset.clone()),
         (Id::Nullifiers, stores.nullifiers.clone()),
         (Id::MerkleTrees, stores.merkle_trees.clone()),
         (Id::Code, stores.code.clone()),

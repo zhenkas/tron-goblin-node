@@ -900,10 +900,9 @@ pub fn archive_router() -> Router<RpcState> {
 /// (decay, optimized-asset merge) and the constant-call VM, whose
 /// block env derives from the archived dyn-props (which hold block
 /// `H`'s head number/timestamp exactly, because the executor writes
-/// them every block). `account_asset` is deliberately left live: the
-/// executor never writes it (TRC10 balances go inline to
-/// `Account.asset_v2`), so its live contents ARE its at-height
-/// contents.
+/// them every block). `account_asset` is swapped too: the block commit
+/// moves TRC10 balances out of the account row into that store, so the
+/// optimized-asset merge must read the rows as of the same height.
 pub(crate) fn state_at_height(s: &RpcState, arch: &ArchiveApiState, h: i64) -> RpcState {
     use tron_chainbase as cb;
     use UndoStoreId as Id;
@@ -913,6 +912,11 @@ pub(crate) fn state_at_height(s: &RpcState, arch: &ArchiveApiState, h: i64) -> R
     }
     if let Some(b) = arch.at(Id::DynProps, h) {
         at.dyn_props = Arc::new(cb::DynamicPropertiesStore::new(b));
+    }
+    if at.account_assets.is_some() {
+        if let Some(b) = arch.at(Id::AccountAsset, h) {
+            at.account_assets = Some(Arc::new(cb::AccountAssetStore::new(b)));
+        }
     }
     if let Some(b) = arch.at(Id::Witnesses, h) {
         at.witnesses = Some(Arc::new(cb::WitnessStore::new(b)));
@@ -1285,6 +1289,7 @@ fn store_name(store: UndoStoreId) -> &'static str {
         Id::ExchangeV2 => "exchangev2",
         Id::MarketOrders => "marketorders",
         Id::MarketAccount => "marketaccount",
+        Id::AccountAsset => "accountasset",
         Id::Nullifiers => "nullifiers",
         Id::MerkleTrees => "merkletrees",
         Id::Code => "code",
@@ -1325,6 +1330,7 @@ fn store_from_name(s: &str) -> Result<UndoStoreId, String> {
         "exchangev2" => Id::ExchangeV2,
         "marketorders" => Id::MarketOrders,
         "marketaccount" => Id::MarketAccount,
+        "accountasset" => Id::AccountAsset,
         "nullifiers" => Id::Nullifiers,
         "merkletrees" => Id::MerkleTrees,
         "code" => Id::Code,
@@ -1844,7 +1850,7 @@ mod commitment_tests {
 
     #[test]
     fn store_name_parsing_round_trips_names_and_discriminants() {
-        for n in 0u8..=24 {
+        for n in 0u8..=25 {
             let id = UndoStoreId::from_u8(n).unwrap();
             // Name round-trips through the parser.
             assert_eq!(store_from_name(store_name(id)).unwrap(), id);
@@ -1855,7 +1861,7 @@ mod commitment_tests {
         assert_eq!(store_from_name("ACCOUNTS").unwrap(), UndoStoreId::Accounts);
         assert_eq!(store_from_name("StorageRow").unwrap(), UndoStoreId::StorageRow);
         // Out-of-range discriminant and unknown name are errors.
-        assert!(store_from_name("25").is_err());
+        assert!(store_from_name("26").is_err());
         assert!(store_from_name("nope").is_err());
     }
 

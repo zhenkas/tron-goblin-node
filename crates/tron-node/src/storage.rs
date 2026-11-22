@@ -655,11 +655,12 @@ impl OpenedStores {
             id_index,
             asset_v1,
             asset_v2,
-            // Read-only for us: the executor writes TRC10 balances inline to
-            // `Account.asset_v2`, never to this store. java-tron's snapshot
-            // splits optimized accounts' balances out to here, so the RPC
-            // merges it back on getAccount. Opened raw (no snapshot layer) —
-            // block-apply never mutates it.
+            // TRC10 balances of asset-optimized accounts, as in java-tron:
+            // execution keeps them inline in `Account.asset_v2` and the block
+            // commit splits them out to rows here (undo-logged, in the same
+            // checkpoint manifest as the account row). Readers merge them
+            // back (`import_all_asset`, RPC getAccount). Opened raw (no
+            // snapshot layer) — written only by the undo/checkpoint commit.
             account_asset: open("account-asset")?,
             contracts,
             abi,
@@ -800,6 +801,7 @@ impl OpenedStores {
             block_index: Some(self.block_index.clone()),
             witness_schedule: Some(self.witness_schedule.clone()),
             reward_vi: Some(self.reward_vi.clone()),
+            account_asset: Some(self.account_asset.clone()),
         }
     }
 

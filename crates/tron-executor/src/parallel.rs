@@ -204,6 +204,7 @@ fn versioned_state(
         // Read-only pass-through: never written by any tx, so it needs no
         // MVCC versioning (reads go straight to base).
         reward_vi: base.reward_vi.clone(),
+        account_asset: None,
     }
 }
 

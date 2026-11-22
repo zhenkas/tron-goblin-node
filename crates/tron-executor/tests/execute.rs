@@ -187,6 +187,7 @@ impl StateBundle {
             block_index: None,
             witness_schedule: None,
             reward_vi: None,
+        account_asset: None,
     }
     }
 }

@@ -69,6 +69,7 @@ fn fresh_state() -> StateBackends {
         block_index: Some(mem()),
         witness_schedule: Some(mem()),
         reward_vi: None,
+        account_asset: None,
     }
 }
 

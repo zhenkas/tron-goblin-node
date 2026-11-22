@@ -457,6 +457,12 @@ pub struct StateBackends {
     /// (`ALLOW_OLD_REWARD_OPT`). Not session-wrapped, not undo-logged,
     /// not checkpointed — there is nothing to roll back.
     pub reward_vi: Option<Arc<dyn KvBackend>>,
+    /// `account-asset` store: per-account TRC-10 balance rows. Block
+    /// execution only READS it (through `tron_chainbase::import_all_asset`);
+    /// rows are written at block commit, when account writes are converted
+    /// to java-tron's stored form (see [`split_drained_accounts`]). `None`
+    /// keeps TRC-10 balances inline in the account row (unit tests, tools).
+    pub account_asset: Option<Arc<dyn KvBackend>>,
 }
 
 // =============================================================================
@@ -664,6 +670,7 @@ impl TxSession {
             block_index: upo(&self.block_index),
             witness_schedule: None,
             reward_vi: self.reward_vi.clone(),
+            account_asset: None,
         }
     }
 }
@@ -1481,6 +1488,12 @@ struct BlockSession {
     witness_schedule: Option<Arc<SessionBackend>>,
     /// READ-ONLY pass-through — see `StateBackends::reward_vi`.
     reward_vi: Option<Arc<dyn tron_chainbase::KvBackend>>,
+    /// `account-asset` rows as of just before this block (pass-through,
+    /// never written during execution) — see `StateBackends::account_asset`.
+    account_asset: Option<Arc<dyn tron_chainbase::KvBackend>>,
+    /// What the account session was wrapped over; the non-checkpoint
+    /// commit writes the stored-form account rows straight to it.
+    accounts_parent: Arc<dyn tron_chainbase::KvBackend>,
 }
 
 impl BlockSession {
@@ -1530,6 +1543,8 @@ impl BlockSession {
                 .as_ref()
                 .map(|b| Arc::new(SessionBackend::new(b.clone()))),
             reward_vi: state.reward_vi.clone(),
+            account_asset: state.account_asset.clone(),
+            accounts_parent: state.accounts.clone(),
         }
     }
 
@@ -1573,6 +1588,7 @@ impl BlockSession {
                 .clone()
                 .map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
             reward_vi: self.reward_vi.clone(),
+            account_asset: self.account_asset.clone(),
         }
     }
 
@@ -1608,7 +1624,23 @@ impl BlockSession {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }
         };
-        push(Id::Accounts, self.accounts.commit_with_undo_and_ops()?);
+        // Accounts go to disk in java-tron's stored form; their TRC-10
+        // balances become `account-asset` rows (same conversion as the
+        // checkpoint path — see `split_drained_accounts`).
+        let split_rows = asset_split_rows(&self.dyn_props, &self.account_asset);
+        let (mut account_ops, account_undo) = self.accounts.drain_pending_with_undo()?;
+        let asset = match &split_rows {
+            Some(rows) => Some(split_drained_accounts(&mut account_ops, &account_undo, rows.as_ref())?),
+            None => None,
+        };
+        self.accounts_parent.write_batch(&account_ops)?;
+        push(Id::Accounts, (account_ops, account_undo));
+        if let (Some((ops, undo)), Some(rows)) = (asset, &split_rows) {
+            if !ops.is_empty() {
+                rows.write_batch(&ops)?;
+                push(Id::AccountAsset, (ops, undo));
+            }
+        }
         push(Id::Witnesses, self.witnesses.commit_with_undo_and_ops()?);
         push(Id::Votes, self.votes.commit_with_undo_and_ops()?);
         push(Id::Delegation, self.delegation.commit_with_undo_and_ops()?);
@@ -1694,6 +1726,112 @@ pub(crate) struct DrainedBlock {
     )>,
     pub(crate) record: tron_chainbase::BlockUndoRecord,
     pub(crate) deltas: Option<Vec<CapturedDelta>>,
+    /// The account writes exactly as execution left them (TRC-10 balances
+    /// still inline), when they differ from the stored-form batch in
+    /// `stores`. The pipelined applier parks THESE in its read overlay: an
+    /// inline balance always wins over an `account-asset` row, so the next
+    /// block reads correct balances while this block's rows are still on
+    /// their way to disk.
+    pub(crate) accounts_as_executed: Option<Vec<tron_chainbase::WriteOp>>,
+}
+
+/// The `account-asset` row view to split account writes against, when the
+/// conversion applies: the store is attached and `ALLOW_ASSET_OPTIMIZATION`
+/// is on (java-tron `SnapshotRoot.needOptAsset`).
+fn asset_split_rows(
+    dyn_props: &Arc<tron_chainbase::SessionBackend>,
+    account_asset: &Option<Arc<dyn tron_chainbase::KvBackend>>,
+) -> Option<Arc<dyn tron_chainbase::KvBackend>> {
+    let rows = account_asset.as_ref()?;
+    let dp = tron_chainbase::DynamicPropertiesStore::new(
+        dyn_props.clone() as Arc<dyn tron_chainbase::KvBackend>
+    );
+    (dp.get_long(b"ALLOW_ASSET_OPTIMIZATION") == Some(1)).then(|| rows.clone())
+}
+
+/// Convert one block's drained account writes to java-tron's stored form
+/// (`SnapshotRoot.processAccount`): each written account loses its inline
+/// TRC-10 maps and gains `asset_optimized`, and the balances become
+/// `account-asset` row writes. `ops` and `undo` are parallel (same key
+/// order); `rows` is the `account-asset` view as of just before the block.
+///
+/// Returns the row writes with their pre-images, parallel and key-sorted,
+/// ready to be recorded as [`UndoStoreId::AccountAsset`] — so a rollback or
+/// a replica restores the rows together with the account.
+///
+/// [`UndoStoreId::AccountAsset`]: tron_chainbase::UndoStoreId::AccountAsset
+pub(crate) fn split_drained_accounts(
+    ops: &mut [tron_chainbase::WriteOp],
+    undo: &[(Vec<u8>, Option<Vec<u8>>)],
+    rows: &dyn tron_chainbase::KvBackend,
+) -> Result<
+    (Vec<tron_chainbase::WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>),
+    tron_chainbase::KvError,
+> {
+    use tron_chainbase::WriteOp;
+    let store_err = |e: tron_chainbase::StoreError| {
+        tron_chainbase::KvError::Backend(format!("account-asset split: {e}"))
+    };
+    let mut asset_ops: std::collections::BTreeMap<Vec<u8>, WriteOp> =
+        std::collections::BTreeMap::new();
+    for (op, (_, before)) in ops.iter_mut().zip(undo.iter()) {
+        let produced = match op {
+            WriteOp::Put(key, value) if !value.is_empty() => {
+                match tron_chainbase::split_account_assets(key, value, before.is_some(), rows)
+                    .map_err(store_err)?
+                {
+                    Some(split) => {
+                        *value = split.account;
+                        split.asset_ops
+                    }
+                    None => Vec::new(),
+                }
+            }
+            WriteOp::Put(key, _) | WriteOp::Delete(key) => {
+                tron_chainbase::deleted_account_asset_ops(key, rows).map_err(store_err)?
+            }
+        };
+        for row in produced {
+            let key = match &row {
+                WriteOp::Put(k, _) | WriteOp::Delete(k) => k.clone(),
+            };
+            asset_ops.insert(key, row);
+        }
+    }
+    let asset_ops: Vec<WriteOp> = asset_ops.into_values().collect();
+    let keys: Vec<&[u8]> = asset_ops
+        .iter()
+        .map(|op| match op {
+            WriteOp::Put(k, _) | WriteOp::Delete(k) => k.as_slice(),
+        })
+        .collect();
+    let before = keys
+        .iter()
+        .map(|key| rows.get(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(keys);
+    // An account is written back with every balance it was loaded with, and
+    // a block usually moves one of them. Rows that already hold the value
+    // are not written again: on mainnet they were 85% of this store's
+    // writes (and of its undo entries and replica deltas).
+    let mut kept_ops = Vec::with_capacity(asset_ops.len());
+    let mut asset_undo = Vec::with_capacity(asset_ops.len());
+    for (op, before) in asset_ops.into_iter().zip(before) {
+        let unchanged = match (&op, &before) {
+            (WriteOp::Put(_, value), Some(stored)) => value == stored,
+            (WriteOp::Delete(_), None) => true,
+            _ => false,
+        };
+        if unchanged {
+            continue;
+        }
+        let key = match &op {
+            WriteOp::Put(k, _) | WriteOp::Delete(k) => k.clone(),
+        };
+        asset_undo.push((key, before));
+        kept_ops.push(op);
+    }
+    Ok((kept_ops, asset_undo))
 }
 
 /// Drain every per-store session of `session`, capturing pre-images
@@ -1707,18 +1845,53 @@ pub(crate) fn drain_block_session(
     targets: &StateBackends,
     capture_deltas: bool,
 ) -> Result<DrainedBlock, tron_chainbase::KvError> {
+    drain_block_session_over(session, targets, capture_deltas, None)
+}
+
+/// [`drain_block_session`] for a session whose account parent may still
+/// show the PREVIOUS block's accounts as executed (the pipelined applier's
+/// read overlay). `committed_accounts` holds that block's account rows in
+/// the form they are being written to disk, so the pre-images recorded for
+/// undo are what the base store will actually contain.
+pub(crate) fn drain_block_session_over(
+    session: BlockSession,
+    targets: &StateBackends,
+    capture_deltas: bool,
+    committed_accounts: Option<&tron_chainbase::PendingOverlay>,
+) -> Result<DrainedBlock, tron_chainbase::KvError> {
     use tron_chainbase::{KvBackend, UndoStoreId as Id, WriteOp};
 
     let mut record = tron_chainbase::BlockUndoRecord::new();
     let mut deltas: Option<Vec<CapturedDelta>> = capture_deltas.then(Vec::new);
     let mut stores: Vec<(Id, Arc<dyn KvBackend>, Vec<WriteOp>)> = Vec::new();
+    // Read before the dyn-props session is drained below.
+    let split_rows = match &targets.account_asset {
+        Some(_) => asset_split_rows(&session.dyn_props, &session.account_asset),
+        None => None,
+    };
+    let mut accounts_as_executed: Option<Vec<WriteOp>> = None;
+    let mut account_assets: Option<(Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = None;
     let mut take = |id: Id,
                     session: Arc<tron_chainbase::SessionBackend>,
                     base: Arc<dyn KvBackend>|
      -> Result<(), tron_chainbase::KvError> {
-        let (ops, undo) = session.drain_pending_with_undo()?;
+        let (mut ops, mut undo) = session.drain_pending_with_undo()?;
         if ops.is_empty() {
             return Ok(());
+        }
+        if id == Id::Accounts {
+            if let Some(committed) = committed_accounts {
+                for (key, before) in undo.iter_mut() {
+                    if let Some(stored) = committed.pending_get(key) {
+                        *before = stored;
+                    }
+                }
+            }
+            if let Some(rows) = &split_rows {
+                let as_executed = ops.clone();
+                account_assets = Some(split_drained_accounts(&mut ops, &undo, rows.as_ref())?);
+                accounts_as_executed = Some(as_executed);
+            }
         }
         // Capture before `undo` is consumed for the record — ops and
         // undo are parallel (same drain loop, same key order).
@@ -1779,10 +1952,33 @@ pub(crate) fn drain_block_session(
     if let (Some(s), Some(b)) = (session.witness_schedule, targets.witness_schedule.clone()) {
         take(Id::WitnessSchedule, s, b)?;
     }
+    drop(take);
+    if let (Some((ops, undo)), Some(base)) = (account_assets, targets.account_asset.clone()) {
+        if !ops.is_empty() {
+            if let Some(deltas) = deltas.as_mut() {
+                for (op, (_, before)) in ops.iter().zip(undo.iter()) {
+                    let (key, after) = match op {
+                        WriteOp::Put(k, v) => (k.clone(), Some(v.clone())),
+                        WriteOp::Delete(k) => (k.clone(), None),
+                    };
+                    deltas.push(CapturedDelta {
+                        store: Id::AccountAsset,
+                        key,
+                        before: before.clone(),
+                        after,
+                    });
+                }
+            }
+            for (key, before) in undo {
+                record.push(tron_chainbase::UndoEntry { store: Id::AccountAsset, key, before });
+            }
+            stores.push((Id::AccountAsset, base, ops));
+        }
+    }
     if let Some(d) = deltas.as_mut() {
         d.sort_by(|a, b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
     }
-    Ok(DrainedBlock { stores, record, deltas })
+    Ok(DrainedBlock { stores, record, deltas, accounts_as_executed })
 }
 
 /// Flush a drained block's per-store batches under one cross-store
@@ -1965,6 +2161,10 @@ fn sync_all_state_wals(state: &StateBackends) -> Result<(), tron_chainbase::KvEr
     if let Some(b) = &state.witness_schedule {
         sync(b)?;
     }
+    // Balance rows are written in the same manifests as their account rows.
+    if let Some(b) = &state.account_asset {
+        sync(b)?;
+    }
     Ok(())
 }
 
@@ -2009,6 +2209,9 @@ pub fn replay_pending_checkpoints(
     by_name.insert(Id::ExchangeV2.db_name(), state.exchange_v2.clone());
     by_name.insert(Id::MarketOrders.db_name(), state.market_orders.clone());
     by_name.insert(Id::MarketAccount.db_name(), state.market_account.clone());
+    if let Some(b) = state.account_asset.clone() {
+        by_name.insert(Id::AccountAsset.db_name(), b);
+    }
     by_name.insert(Id::Nullifiers.db_name(), state.nullifiers.clone());
     if let Some(b) = state.delegated_resource_account_index.clone() {
         by_name.insert(Id::DelegatedResourceAccountIndex.db_name(), b);
@@ -2100,6 +2303,10 @@ pub fn rollback_block(
             Id::ExchangeV2 => &state.exchange_v2,
             Id::MarketOrders => &state.market_orders,
             Id::MarketAccount => &state.market_account,
+            Id::AccountAsset => state
+                .account_asset
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("account_asset"))?,
             Id::Nullifiers => &state.nullifiers,
             Id::MerkleTrees => state
                 .merkle_trees
@@ -2904,7 +3111,7 @@ fn execute_block_logic(
         let change_delegation = dp.allow_change_delegation();
         // 5c-i. Block-production reward to the producer.
         let block_pay = dp.witness_pay_per_block();
-        if change_delegation && block_pay > 0 {
+        if change_delegation {
             let _ = tron_tvm::reward::pay_block_reward(
                 &accts, &dlg, &dp, &producer, block_pay,
             );
@@ -2914,8 +3121,7 @@ fn execute_block_logic(
         // We use the WitnessStore::all() scan because the standby set
         // is independent of the active witness rotation (which is
         // capped at 27).
-        let standby_pay = dp.witness_127_pay_per_block();
-        if change_delegation && standby_pay > 0 {
+        if change_delegation {
             let ws = WitnessStore::new(state.witnesses.clone());
             if let Ok(by_vote) = ws.all() {
                 let ranked = top_standby_witnesses(

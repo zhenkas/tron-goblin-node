@@ -391,6 +391,8 @@ fn adjust_zen_balance(
     let mut acct = accounts
         .get(&a)?
         .ok_or(ActuatorError::Execute("Zen account missing"))?;
+    // Optimized accounts keep TRC10 balances in account-asset rows.
+    tron_chainbase::import_all_asset(&mut acct);
     let current = *acct.asset_v2.get(zen_token_id).unwrap_or(&0);
     let new_balance = current
         .checked_add(amount)
@@ -553,9 +555,10 @@ fn zen_balance(
     let mut buf = [0u8; 21];
     buf.copy_from_slice(addr);
     let a = Address::from_raw(buf);
-    Ok(accounts
-        .get(&a)?
-        .map(|acct| acct.asset_v2.get(zen_token_id).copied().unwrap_or(0)))
+    Ok(accounts.get(&a)?.map(|mut acct| {
+        tron_chainbase::import_all_asset(&mut acct);
+        acct.asset_v2.get(zen_token_id).copied().unwrap_or(0)
+    }))
 }
 
 fn check_proofs(

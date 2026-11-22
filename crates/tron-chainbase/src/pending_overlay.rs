@@ -111,6 +111,20 @@ impl PendingOverlay {
         self.populated.store(false, Ordering::Relaxed);
     }
 
+    /// The pending entry for `key`, if this overlay shadows it:
+    /// `Some(Some(v))` pending put, `Some(None)` pending delete, `None`
+    /// when the key is not in the overlay at all.
+    pub fn pending_get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        if !self.populated.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.shards[Self::shard_for(key)]
+            .read()
+            .expect("PendingOverlay lock poisoned")
+            .get(key)
+            .cloned()
+    }
+
     /// Number of distinct keys currently shadowed.
     pub fn pending_len(&self) -> usize {
         self.shards
@@ -167,6 +181,30 @@ impl KvBackend for PendingOverlay {
                     }
                     None => {
                         merged.remove(k);
+                    }
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    /// Native prefix scan of the parent with the pending entries merged
+    /// in. The trait default goes through `scan_all`, which is a full
+    /// store read — unusable on the large per-account row stores.
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.parent.scan_prefix(prefix)?.into_iter().collect();
+        if self.populated.load(Ordering::Relaxed) {
+            for shard in &self.shards {
+                let g = shard.read().expect("PendingOverlay lock poisoned");
+                for (k, v) in g.iter().filter(|(k, _)| k.starts_with(prefix)) {
+                    match v {
+                        Some(v) => {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        None => {
+                            merged.remove(k);
+                        }
                     }
                 }
             }

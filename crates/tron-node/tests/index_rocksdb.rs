@@ -176,6 +176,7 @@ fn engine_backfills_and_resumes_over_rocksdb() {
             block_index: Some(block_index_be.clone()),
             witness_schedule: Some(mem()),
             reward_vi: None,
+        account_asset: None,
     };
         AccountStore::new(state.accounts.clone())
             .put(

@@ -53,7 +53,8 @@ pub use rocksdb_backend::{
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;
 pub use stores::{
-    account_asset_rows_for_trace, dynamic_properties_keys, import_all_asset,
+    account_asset_rows_for_trace, deleted_account_asset_ops, dynamic_properties_keys, import_all_asset,
+    split_account_assets, AccountAssetSplit,
     set_account_asset_backend, witness_schedule_keys,
     AbiStore, AccountAssetStore,
     AccountIdIndexStore, AccountIndexStore, AccountStore, AccountTraceStore, AssetIssueStore,

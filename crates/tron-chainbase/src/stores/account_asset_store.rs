@@ -69,6 +69,93 @@ pub fn account_asset_rows_for_trace(owner: &Address) -> Vec<(String, i64)> {
         .unwrap_or_default()
 }
 
+/// Result of [`split_account_assets`]: the account row as java-tron stores
+/// it, plus the `account-asset` row writes that carry its TRC-10 balances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAssetSplit {
+    /// Account bytes with `asset` / `asset_v2` cleared and
+    /// `asset_optimized = true`.
+    pub account: Vec<u8>,
+    /// Row writes for the `account-asset` store, sorted by key.
+    pub asset_ops: Vec<crate::backend::WriteOp>,
+}
+
+/// java-tron's `SnapshotRoot.processAccount` for one account write: the
+/// on-disk form of an account under `ALLOW_ASSET_OPTIMIZATION`.
+///
+/// * not yet optimized -> every existing `account-asset` row of the address
+///   is deleted and the flag is set (`getDeletedAssets` + `setAssetOptimized`);
+/// * each inline `asset_v2` entry becomes a row write, a zero balance a row
+///   delete (`AccountAssetStore.getAssets`);
+/// * `asset` and `asset_v2` are cleared (`AccountCapsule.clearAsset`).
+///
+/// `rows` is the `account-asset` view as of just before this write; it is
+/// only scanned for accounts that are not optimized yet. `existed` tells
+/// whether the account row existed before the write: a brand-new account
+/// has no rows to delete (rows are removed together with their account), so
+/// the scan is skipped for it.
+///
+/// Returns `None` when the stored form equals `raw` (already optimized, no
+/// inline balances) so the caller keeps the original bytes untouched.
+pub fn split_account_assets(
+    key: &[u8],
+    raw: &[u8],
+    existed: bool,
+    rows: &dyn KvBackend,
+) -> Result<Option<AccountAssetSplit>, StoreError> {
+    use crate::backend::WriteOp;
+    use prost::Message;
+
+    let mut account = Account::decode(raw)?;
+    if account.asset_optimized && account.asset.is_empty() && account.asset_v2.is_empty() {
+        return Ok(None);
+    }
+    let mut ops: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    if !account.asset_optimized {
+        if existed {
+            for (k, _) in rows.scan_prefix(key)? {
+                ops.insert(k, None);
+            }
+        }
+        account.asset_optimized = true;
+    }
+    // java keys the rows by `account.getAddress()`; that is the store key
+    // for every well-formed account.
+    let owner: &[u8] = if account.address.is_empty() { key } else { &account.address };
+    for (id, balance) in &account.asset_v2 {
+        let mut k = Vec::with_capacity(owner.len() + id.len());
+        k.extend_from_slice(owner);
+        k.extend_from_slice(id.as_bytes());
+        ops.insert(k, (*balance != 0).then(|| balance.to_be_bytes().to_vec()));
+    }
+    account.asset.clear();
+    account.asset_v2.clear();
+    Ok(Some(AccountAssetSplit {
+        account: account.encode_to_vec(),
+        asset_ops: ops
+            .into_iter()
+            .map(|(k, v)| match v {
+                Some(v) => WriteOp::Put(k, v),
+                None => WriteOp::Delete(k),
+            })
+            .collect(),
+    }))
+}
+
+/// Row deletes for an account that is being removed (java-tron
+/// `AccountAssetStore.getDeletedAssets`).
+pub fn deleted_account_asset_ops(
+    key: &[u8],
+    rows: &dyn KvBackend,
+) -> Result<Vec<crate::backend::WriteOp>, StoreError> {
+    Ok(rows
+        .scan_prefix(key)?
+        .into_iter()
+        .map(|(k, _)| crate::backend::WriteOp::Delete(k))
+        .collect())
+}
+
 pub struct AccountAssetStore {
     backend: Arc<dyn KvBackend>,
 }
@@ -186,6 +273,79 @@ mod tests {
         a[0] = 0x41;
         a[1..].fill(byte);
         Address::from_raw(a)
+    }
+
+    fn optimized(v2: &[(&str, i64)], flag: bool) -> Account {
+        Account {
+            address: addr(0xaa).as_bytes().to_vec(),
+            balance: 7,
+            asset_optimized: flag,
+            asset: v2.iter().map(|(k, v)| (format!("name{k}"), *v)).collect(),
+            asset_v2: v2.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn split_moves_balances_to_rows_and_clears_both_maps() {
+        use crate::backend::WriteOp;
+        use prost::Message;
+        let rows: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let store = AccountAssetStore::new(rows.clone());
+        let alice = addr(0xaa);
+        // Stale rows of a not-yet-optimized account are dropped first.
+        store.put(&alice, b"1000009", 55).unwrap();
+        let raw = optimized(&[("1000001", 100), ("1000002", 0)], false).encode_to_vec();
+        let split = split_account_assets(alice.as_bytes(), &raw, true, rows.as_ref())
+            .unwrap()
+            .expect("needs splitting");
+        let stored = Account::decode(split.account.as_slice()).unwrap();
+        assert!(stored.asset_optimized);
+        assert!(stored.asset.is_empty() && stored.asset_v2.is_empty());
+        assert_eq!(stored.balance, 7);
+        assert_eq!(
+            split.asset_ops,
+            vec![
+                WriteOp::Put(AccountAssetStore::key_for(&alice, b"1000001"), 100i64.to_be_bytes().to_vec()),
+                WriteOp::Delete(AccountAssetStore::key_for(&alice, b"1000002")),
+                WriteOp::Delete(AccountAssetStore::key_for(&alice, b"1000009")),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_of_optimized_account_touches_only_inline_rows() {
+        use crate::backend::WriteOp;
+        use prost::Message;
+        let rows: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let store = AccountAssetStore::new(rows.clone());
+        let alice = addr(0xaa);
+        store.put(&alice, b"1000009", 55).unwrap();
+        let raw = optimized(&[("1000001", 3)], true).encode_to_vec();
+        let split = split_account_assets(alice.as_bytes(), &raw, true, rows.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            split.asset_ops,
+            vec![WriteOp::Put(AccountAssetStore::key_for(&alice, b"1000001"), 3i64.to_be_bytes().to_vec())]
+        );
+        // Already in stored form: nothing to do, bytes stay as they are.
+        assert!(split_account_assets(alice.as_bytes(), &split.account, true, rows.as_ref())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn new_account_is_flagged_without_scanning_rows() {
+        use prost::Message;
+        let rows: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let alice = addr(0xaa);
+        let raw = optimized(&[], false).encode_to_vec();
+        let split = split_account_assets(alice.as_bytes(), &raw, false, rows.as_ref())
+            .unwrap()
+            .unwrap();
+        assert!(split.asset_ops.is_empty());
+        assert!(Account::decode(split.account.as_slice()).unwrap().asset_optimized);
     }
 
     #[test]

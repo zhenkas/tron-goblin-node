@@ -197,12 +197,9 @@ pub fn execute_transfer_asset(
     // debit sees the real balance and the credit adds to (not overwrites) any
     // existing store balance for the receiver (java's importAllAsset). New
     // (non-optimized) accounts are a no-op. We then write the balances back
-    // inline; the RPC read-merge (store ∪ inline, inline wins) keeps reads
-    // correct. NOTE: this does NOT re-split back to the account-asset store on
-    // commit the way java's SnapshotRoot does — functionally correct
-    // (balances right, RPC consistent) but the on-disk layout drifts from
-    // java's (optimized accounts accumulate inline asset_v2). Pending: a
-    // store-write-back to restore byte-exact storage parity.
+    // inline; the block commit splits them out to account-asset rows again
+    // (java's SnapshotRoot.processAccount — see the executor's
+    // `split_drained_accounts`), so the stored account matches java's.
     tron_chainbase::import_all_asset(&mut owner_account);
     tron_chainbase::import_all_asset(&mut to_account);
 

@@ -46,7 +46,8 @@ mod zk_proof_store;
 
 pub use abi_store::AbiStore;
 pub use account_asset_store::{
-    account_asset_rows_for_trace, import_all_asset, set_account_asset_backend, AccountAssetStore,
+    account_asset_rows_for_trace, deleted_account_asset_ops, import_all_asset,
+    set_account_asset_backend, split_account_assets, AccountAssetSplit, AccountAssetStore,
 };
 pub use account_id_index_store::AccountIdIndexStore;
 pub use account_index_store::AccountIndexStore;

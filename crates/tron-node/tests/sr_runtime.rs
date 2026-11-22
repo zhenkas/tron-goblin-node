@@ -64,6 +64,7 @@ fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>, Arc<dyn KvBackend>) {
         block_index: Some(mem()),
         witness_schedule: Some(witness_schedule_be.clone()),
         reward_vi: None,
+        account_asset: None,
     };
     (state, blocks_be, witness_schedule_be)
 }

@@ -8680,6 +8680,7 @@ mod solidify_tests {
             block_index: Some(mem()),
             witness_schedule: Some(mem()),
             reward_vi: None,
+            account_asset: None,
         }
     }
 
@@ -9478,6 +9479,7 @@ mod pipelined_apply_tests {
             block_index: Some(mem()),
             witness_schedule: Some(mem()),
             reward_vi: None,
+            account_asset: None,
         }
     }
 

@@ -75,6 +75,9 @@ pub enum StoreId {
     WitnessSchedule = 22,
     DelegatedResourceAccountIndex = 23,
     MarketAccount = 24,
+    /// Per-account TRC-10 balance rows split out of `Account` when asset
+    /// optimization is active (java-tron `AccountAssetStore`).
+    AccountAsset = 25,
 }
 
 impl StoreId {
@@ -109,6 +112,7 @@ impl StoreId {
             22 => Self::WitnessSchedule,
             23 => Self::DelegatedResourceAccountIndex,
             24 => Self::MarketAccount,
+            25 => Self::AccountAsset,
             _ => return None,
         })
     }
@@ -144,6 +148,7 @@ impl StoreId {
             Self::WitnessSchedule => "witness_schedule",
             Self::DelegatedResourceAccountIndex => "DelegatedResourceAccountIndex",
             Self::MarketAccount => "market_account",
+            Self::AccountAsset => "account-asset",
         }
     }
 }

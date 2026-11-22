@@ -60,7 +60,7 @@ use tron_proto::Block;
 use tron_types::{BlockId, TxWireInfo};
 
 use crate::{
-    apply_timing, commit_drained, drain_block_session, execute_block_logic, BlockExecError,
+    apply_timing, commit_drained, drain_block_session_over, execute_block_logic, BlockExecError,
     BlockExecutionReport, BlockSession, ExecConfig, StateBackends,
 };
 
@@ -159,6 +159,12 @@ pub struct ApplyPipeline {
     /// block execution (and the driver's between-block reads) sees.
     view: StateBackends,
     overlays: Vec<(UndoStoreId, Arc<PendingOverlay>)>,
+    /// The in-flight block's account rows in the form they are being
+    /// written to disk. `view.accounts` shows the same accounts as executed
+    /// (TRC-10 balances inline, so they win over `account-asset` rows that
+    /// have not landed yet); undo pre-images for the next block must be the
+    /// stored form, and come from here.
+    accounts_committed: Arc<PendingOverlay>,
     undo_store: BlockUndoStore,
     checkpoint: CheckPointV2,
     /// Spawned on the first `apply` — drivers that never lead never
@@ -223,11 +229,15 @@ impl ApplyPipeline {
             // Read-only pass-through — never in a block's write-set, so it
             // needs no pending overlay.
             reward_vi: base.reward_vi.clone(),
+            // The pending block's balance rows must be visible to the next
+            // block's split (row pre-images, stale-row scans).
+            account_asset: opt(&mut overlays, Id::AccountAsset, &base.account_asset),
         };
         Self {
             base: base.clone(),
             view,
             overlays,
+            accounts_committed: Arc::new(PendingOverlay::new(base.accounts.clone())),
             undo_store,
             checkpoint,
             committer: None,
@@ -285,7 +295,12 @@ impl ApplyPipeline {
         // 2) Drain on the applier thread: pre-images read through the
         //    overlay (the true pre-state for this block), batch targets
         //    are the real base stores.
-        let drained = drain_block_session(session, &self.base, config.capture_state_deltas)?;
+        let drained = drain_block_session_over(
+            session,
+            &self.base,
+            config.capture_state_deltas,
+            Some(&self.accounts_committed),
+        )?;
         report.state_deltas = drained.deltas;
 
         // 3) Join the previous block's commit before retiring its
@@ -297,7 +312,18 @@ impl ApplyPipeline {
         //    block's execution (and the driver's reads) see them while
         //    the committer works.
         for (id, ov) in &self.overlays {
-            match drained.stores.iter().find(|(sid, _, _)| sid == id) {
+            let committed = drained.stores.iter().find(|(sid, _, _)| sid == id);
+            if *id == UndoStoreId::Accounts {
+                match committed {
+                    Some((_, _, ops)) => self.accounts_committed.replace_with(ops),
+                    None => self.accounts_committed.clear(),
+                }
+                if let Some(as_executed) = &drained.accounts_as_executed {
+                    ov.replace_with(as_executed);
+                    continue;
+                }
+            }
+            match committed {
                 Some((_, _, ops)) => ov.replace_with(ops),
                 None => ov.clear(),
             }
@@ -348,10 +374,15 @@ impl ApplyPipeline {
     /// way so the view never wedges on a dead block.
     pub fn flush(&mut self) -> Result<(), BlockExecError> {
         let res = self.join_in_flight();
+        self.clear_overlays();
+        res
+    }
+
+    fn clear_overlays(&self) {
         for (_, ov) in &self.overlays {
             ov.clear();
         }
-        res
+        self.accounts_committed.clear();
     }
 
     fn join_in_flight(&mut self) -> Result<(), BlockExecError> {
@@ -368,15 +399,11 @@ impl ApplyPipeline {
             Ok(Err(msg)) => {
                 // The pending block is broken on disk (manifest replay
                 // repairs on restart); don't keep serving its writes.
-                for (_, ov) in &self.overlays {
-                    ov.clear();
-                }
+                self.clear_overlays();
                 Err(commit_err(&msg))
             }
             Err(_) => {
-                for (_, ov) in &self.overlays {
-                    ov.clear();
-                }
+                self.clear_overlays();
                 Err(commit_err("committer thread died"))
             }
         }

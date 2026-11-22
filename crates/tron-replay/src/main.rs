@@ -364,6 +364,7 @@ fn cmd_execute(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         block_index: Some(m()),
         witness_schedule: Some(m()),
         reward_vi: None,
+        account_asset: None,
     };
 
     let mut blocks_ok = 0usize;
