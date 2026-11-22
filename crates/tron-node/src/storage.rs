@@ -619,8 +619,10 @@ impl OpenedStores {
             }
         }
         let proposals = wrap("proposal")?;
-        let name_index = wrap("accountid-index")?;
-        let id_index = wrap("account-index")?;
+        // java-tron: AccountIndexStore (names) is "account-index",
+        // AccountIdIndexStore (ids) is "accountid-index".
+        let name_index = wrap("account-index")?;
+        let id_index = wrap("accountid-index")?;
         let asset_v1 = wrap("asset-issue")?;
         let asset_v2 = wrap("asset-issue-v2")?;
         let contracts = wrap("contract")?;
@@ -715,8 +717,8 @@ impl OpenedStores {
             "DelegatedResourceAccountIndex" => &self.delegated_resource_account_index,
             "properties" => &self.dyn_props,
             "proposal" => &self.proposals,
-            "accountid-index" => &self.name_index,
-            "account-index" => &self.id_index,
+            "account-index" => &self.name_index,
+            "accountid-index" => &self.id_index,
             "asset-issue" => &self.asset_v1,
             "asset-issue-v2" => &self.asset_v2,
             "contract" => &self.contracts,
