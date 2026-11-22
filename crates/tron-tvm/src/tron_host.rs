@@ -762,6 +762,16 @@ impl TronDatabaseExt for TronDatabase {
                 // Re-read: the settle may have grown the allowance.
                 if let Ok(Some(acc)) = self.accounts.get(&owner_t) {
                     owner_account = acc;
+                } else if owner_created_locally {
+                    // Created this tx, so only java's in-flight Repository
+                    // holds it; java settles it all the same.
+                    let _ = crate::reward::settle_reward_tvm(
+                        &owner_t,
+                        &mut owner_account,
+                        &delegation,
+                        &dyn_props,
+                        self.reward_vi.as_deref(),
+                    );
                 }
             }
             if !owner_account.votes.is_empty() {
@@ -1633,8 +1643,25 @@ impl TronDatabaseExt for TronDatabase {
             crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
         }
-        let Ok(Some(mut account)) = self.accounts.get(&owner) else {
-            return 0;
+        let mut account = match self.accounts.get(&owner) {
+            Ok(Some(account)) => account,
+            // A contract created this tx: java's in-flight Repository holds
+            // it and settles it (see `reward::settle_reward`).
+            Ok(None) if self.pending_created_contracts.contains_key(&caller) => {
+                let mut account = tron_proto::Account {
+                    address: owner.as_bytes().to_vec(),
+                    r#type: tron_proto::AccountType::Contract as i32,
+                    account_name: b"CreatedByContract".to_vec(),
+                    create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
+                    ..Default::default()
+                };
+                if let Some(delegation) = self.delegation.clone() {
+                    crate::reward::settle_reward_tvm(&owner, &mut account, &delegation, &dyn_props, self.reward_vi.as_deref())
+                        .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
+                }
+                account
+            }
+            _ => return 0,
         };
         let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
         // java: `if (allowance <= 0) return 0;` AFTER the settle, leaving

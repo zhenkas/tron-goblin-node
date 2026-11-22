@@ -640,11 +640,31 @@ pub fn withdraw_reward(
     dyn_props: &DynamicPropertiesStore,
     reward_vi: Option<&RewardViStore>,
 ) -> Result<i64, StoreError> {
-    use tron_proto::Account;
-
     let Some(mut account) = accounts.get(address)? else {
         return Ok(0);
     };
+    let paid = settle_reward(address, &mut account, delegation, dyn_props, reward_vi)?;
+    if paid > 0 {
+        accounts.put(address, &account)?;
+    }
+    Ok(paid)
+}
+
+/// The body of [`withdraw_reward`] against a caller-held account: the reward
+/// is added to `account.allowance` and the delegation rows are written, but
+/// the account itself is not stored. The TVM uses this directly for a
+/// contract created earlier in the same transaction, which java's in-flight
+/// `Repository` already holds while the committed account store does not —
+/// java still settles it, leaving `begin_cycle = current + 1` behind even
+/// when the contract self-destructs before the transaction ends.
+pub fn settle_reward(
+    address: &Address,
+    account: &mut tron_proto::Account,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    use tron_proto::Account;
 
     let mut begin_cycle = delegation.get_begin_cycle(address);
     let mut end_cycle = delegation.get_end_cycle(address);
@@ -693,10 +713,7 @@ pub fn withdraw_reward(
         // bail path; the empty-votes voter is "skipped" by a cycle so
         // they aren't constantly considered in the next iteration.
         delegation.set_begin_cycle(address, end_cycle + 1);
-        if paid > 0 {
-            account.allowance = account.allowance.saturating_add(paid);
-            accounts.put(address, &account)?;
-        }
+        account.allowance = account.allowance.saturating_add(paid);
         return Ok(paid);
     }
 
@@ -713,10 +730,7 @@ pub fn withdraw_reward(
     }
 
     // ── 3. Apply allowance + record this cycle's snapshot ──────────────
-    if paid > 0 {
-        account.allowance = account.allowance.saturating_add(paid);
-        accounts.put(address, &account)?;
-    }
+    account.allowance = account.allowance.saturating_add(paid);
     delegation.set_begin_cycle(address, end_cycle);
     delegation.set_end_cycle(address, end_cycle + 1);
     // Persist the current votes snapshot so the *next* withdraw can
@@ -766,6 +780,22 @@ pub fn withdraw_reward_tvm(
         return Ok(0);
     }
     withdraw_reward(address, accounts, delegation, dyn_props, reward_vi)
+}
+
+/// [`withdraw_reward_tvm`] for a contract created in the current transaction
+/// and therefore absent from the committed account store; see
+/// [`settle_reward`].
+pub fn settle_reward_tvm(
+    address: &Address,
+    account: &mut tron_proto::Account,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_TVM_VOTE_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    settle_reward(address, account, delegation, dyn_props, reward_vi)
 }
 
 /// Read the Vi-accumulator value for `(cycle, witness)` and decode it
