@@ -143,8 +143,39 @@ fn detected_mem_total_bytes() -> usize {
 /// per-DB `increase_parallelism` would spawn `cpus × ~30` threads; a single
 /// shared Env bounds the pool across all stores. Scaled with cores and clamped
 /// to `4..=16` — the floor preserves the old fixed default on small VMs.
+///
+/// Fixed, not scaled with the machine: the node is bound by disk, not CPU, so
+/// the thread count (and with it the memory the threads pin) must be the same
+/// on a 4-core and a 32-core host.
 fn background_threads() -> i32 {
-    (detected_cores() as i32).clamp(4, 16)
+    BACKGROUND_COMPACTION_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`background_threads`].
+static BACKGROUND_COMPACTION_THREADS: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(4);
+/// See [`flush_threads`].
+static BACKGROUND_FLUSH_THREADS: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(2);
+/// See [`write_buffer_manager_bytes`].
+static WRITE_BUFFER_MANAGER_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(2 * 1024 * 1024 * 1024);
+
+/// Override the shared background-thread counts and the shared write-buffer
+/// budget (the node sets them from `[limits]`). Non-positive values are
+/// ignored. No effect once a store has been opened: the shared Env and
+/// write-buffer manager are built on first use.
+pub fn set_rocksdb_limits(compaction_threads: i32, flush_threads: i32, write_buffer_bytes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if compaction_threads > 0 {
+        BACKGROUND_COMPACTION_THREADS.store(compaction_threads, Relaxed);
+    }
+    if flush_threads > 0 {
+        BACKGROUND_FLUSH_THREADS.store(flush_threads, Relaxed);
+    }
+    if write_buffer_bytes > 0 {
+        WRITE_BUFFER_MANAGER_BYTES.store(write_buffer_bytes, Relaxed);
+    }
 }
 
 /// High-priority FLUSH threads for the shared [`Env`], scaled with cores and
@@ -154,8 +185,12 @@ fn background_threads() -> i32 {
 /// before its first flush drained, and RocksDB STOPPED that store's writes
 /// (`max_write_buffer_number`) — stalling block apply and making the node fall
 /// behind the tip every few minutes.
+///
+/// Fixed at two, independent of the core count (see [`background_threads`]).
+/// The stall described above is covered by `max_write_buffer_number = 4` and
+/// the shared write-buffer budget rather than by more flush threads.
 fn flush_threads() -> i32 {
-    ((detected_cores() / 4) as i32).clamp(2, 8)
+    BACKGROUND_FLUSH_THREADS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// In-flight memtables allowed per store before writes stall. Raised from the
@@ -182,9 +217,11 @@ const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 /// 1 GiB on a 125 GiB host triggered flush cascades every few minutes). It's a
 /// CAP, not an allocation — RAM actually used stays bounded by write rate ×
 /// flush latency, which is small now that flushes keep up.
+///
+/// The budget is now a fixed 2 GiB: the node's memory use must not follow the
+/// size of the machine it happens to run on.
 fn write_buffer_manager_bytes() -> usize {
-    const ONE_GIB: usize = 1024 * 1024 * 1024;
-    (detected_mem_total_bytes() / 16).clamp(ONE_GIB, 16 * ONE_GIB)
+    WRITE_BUFFER_MANAGER_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The shared block cache. Created once, referenced by every tuned open path so

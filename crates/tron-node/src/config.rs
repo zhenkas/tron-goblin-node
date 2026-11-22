@@ -147,6 +147,178 @@ pub struct NodeConfig {
     /// — both local resource limits, not consensus parameters.
     #[serde(default)]
     pub mempool: MempoolSettings,
+
+    /// Thread and memory limits of the process (`[limits]`).
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// `[limits]` — thread pools and memory budgets of the process.
+///
+/// Every value is a plain number that never follows the machine's core count
+/// or memory size: the node is bound by disk, so it must behave the same on a
+/// 4-core and a 32-core host. This section is the only source — environment
+/// variables such as `MALLOC_ARENA_MAX`, `TOKIO_WORKER_THREADS` or
+/// `RAYON_NUM_THREADS` are not consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Arenas of the system allocator, which RocksDB allocates from (Rust
+    /// code uses mimalloc). glibc's own limit is eight per core of the
+    /// machine and ignores CPU quotas; on a 32-core host that spread the
+    /// store's memory over hundreds of 64 MiB heaps.
+    #[serde(default = "default_malloc_arena_max")]
+    pub malloc_arena_max: u32,
+    /// Tokio worker threads.
+    #[serde(default = "default_tokio_worker_threads")]
+    pub tokio_worker_threads: usize,
+    /// Upper bound of tokio's blocking pool (store reads for RPC, index and
+    /// pruning work). Several blocking tasks live for the whole run, so keep
+    /// room above them.
+    #[serde(default = "default_tokio_max_blocking_threads")]
+    pub tokio_max_blocking_threads: usize,
+    /// Threads for parallel transaction execution and signature checks.
+    #[serde(default = "default_exec_threads")]
+    pub exec_threads: usize,
+    /// RocksDB background compaction threads, shared by all stores.
+    #[serde(default = "default_rocksdb_compaction_threads")]
+    pub rocksdb_compaction_threads: u32,
+    /// RocksDB background flush threads, shared by all stores.
+    #[serde(default = "default_rocksdb_flush_threads")]
+    pub rocksdb_flush_threads: u32,
+    /// Total memtable memory across all stores, in MiB. Writes are held back
+    /// when it is reached.
+    #[serde(default = "default_rocksdb_write_buffer_budget_mb")]
+    pub rocksdb_write_buffer_budget_mb: usize,
+    /// Threads decoding blocks for the built-in index.
+    #[serde(default = "default_index_decode_threads")]
+    pub index_decode_threads: usize,
+}
+
+fn default_malloc_arena_max() -> u32 {
+    2
+}
+fn default_tokio_worker_threads() -> usize {
+    4
+}
+fn default_tokio_max_blocking_threads() -> usize {
+    64
+}
+fn default_exec_threads() -> usize {
+    4
+}
+fn default_rocksdb_compaction_threads() -> u32 {
+    4
+}
+fn default_rocksdb_flush_threads() -> u32 {
+    2
+}
+fn default_rocksdb_write_buffer_budget_mb() -> usize {
+    2048
+}
+fn default_index_decode_threads() -> usize {
+    2
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            malloc_arena_max: default_malloc_arena_max(),
+            tokio_worker_threads: default_tokio_worker_threads(),
+            tokio_max_blocking_threads: default_tokio_max_blocking_threads(),
+            exec_threads: default_exec_threads(),
+            rocksdb_compaction_threads: default_rocksdb_compaction_threads(),
+            rocksdb_flush_threads: default_rocksdb_flush_threads(),
+            rocksdb_write_buffer_budget_mb: default_rocksdb_write_buffer_budget_mb(),
+            index_decode_threads: default_index_decode_threads(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// Reject values the process cannot run with, naming the key.
+    pub fn validate(&self) -> Result<(), String> {
+        fn range(key: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(format!("limits.{key} must be {min}..{max}, got {value}"))
+            }
+        }
+        range("malloc_arena_max", self.malloc_arena_max as u64, 1, 64)?;
+        range("tokio_worker_threads", self.tokio_worker_threads as u64, 1, 64)?;
+        range(
+            "tokio_max_blocking_threads",
+            self.tokio_max_blocking_threads as u64,
+            16,
+            512,
+        )?;
+        range("exec_threads", self.exec_threads as u64, 1, 64)?;
+        range(
+            "rocksdb_compaction_threads",
+            self.rocksdb_compaction_threads as u64,
+            1,
+            64,
+        )?;
+        range("rocksdb_flush_threads", self.rocksdb_flush_threads as u64, 1, 16)?;
+        range(
+            "rocksdb_write_buffer_budget_mb",
+            self.rocksdb_write_buffer_budget_mb as u64,
+            256,
+            65_536,
+        )?;
+        range("index_decode_threads", self.index_decode_threads as u64, 1, 16)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_fixed_numbers() {
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+        let l = config.limits;
+        assert_eq!(
+            (l.malloc_arena_max, l.tokio_worker_threads, l.tokio_max_blocking_threads),
+            (2, 4, 64)
+        );
+        assert_eq!(
+            (l.exec_threads, l.rocksdb_compaction_threads, l.rocksdb_flush_threads),
+            (4, 4, 2)
+        );
+        assert_eq!((l.rocksdb_write_buffer_budget_mb, l.index_decode_threads), (2048, 2));
+        l.validate().unwrap();
+    }
+
+    #[test]
+    fn section_overrides_single_values() {
+        let config: NodeConfig =
+            toml::from_str("[limits]\nexec_threads = 8\nmalloc_arena_max = 1\n").unwrap();
+        assert_eq!(config.limits.exec_threads, 8);
+        assert_eq!(config.limits.malloc_arena_max, 1);
+        assert_eq!(config.limits.tokio_worker_threads, 4);
+        config.limits.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_key_and_bad_values_are_rejected() {
+        assert!(toml::from_str::<NodeConfig>("[limits]\nexec_thread = 8\n").is_err());
+        let mut l = LimitsConfig::default();
+        l.exec_threads = 0;
+        assert_eq!(
+            l.validate().unwrap_err(),
+            "limits.exec_threads must be 1..64, got 0"
+        );
+        let mut l = LimitsConfig::default();
+        l.tokio_max_blocking_threads = 8;
+        assert!(l.validate().unwrap_err().contains("tokio_max_blocking_threads"));
+        let mut l = LimitsConfig::default();
+        l.rocksdb_write_buffer_budget_mb = 100;
+        assert!(l.validate().unwrap_err().contains("rocksdb_write_buffer_budget_mb"));
+    }
 }
 
 /// `[mempool]` — transaction pending-pool sizing. Local resource limits
@@ -1324,6 +1496,7 @@ impl Default for NodeConfig {
             index: IndexConfig::default(),
             sim: SimConfig::default(),
             mempool: MempoolSettings::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }

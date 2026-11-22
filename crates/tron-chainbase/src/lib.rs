@@ -51,7 +51,7 @@ pub use permissions::{
     set_default_witness_permission,
 };
 pub use rocksdb_backend::{
-    rocksdb_tuning, set_block_cache_bytes, RocksDbBackend, RocksDbError, RocksdbTuning,
+    rocksdb_tuning, set_block_cache_bytes, set_rocksdb_limits, RocksDbBackend, RocksDbError, RocksdbTuning,
 };
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;

@@ -684,3 +684,26 @@ max_call_frames = 100000
 # across machines (timeout on a slow host, success on a fast one), so it is off
 # by default to preserve byte-exact replay.
 call_timeout_ms = 0
+
+# --- [limits] --------------------------------------------------------------
+# Thread pools and memory budgets of the process. Plain numbers that never
+# follow the machine's core count or memory size: the node is bound by disk,
+# so it behaves the same on a 4-core and a 32-core host. This section is the
+# only source; MALLOC_ARENA_MAX, TOKIO_WORKER_THREADS and RAYON_NUM_THREADS
+# in the environment are not consulted. Values below are the defaults.
+[limits]
+# Arenas of the system allocator (RocksDB allocates from it). glibc's own
+# limit is eight per core of the machine and ignores CPU quotas.
+malloc_arena_max = 2
+tokio_worker_threads = 4
+# Blocking pool for store reads (RPC, index, pruning). Minimum 16.
+tokio_max_blocking_threads = 64
+# Parallel transaction execution and signature checks.
+exec_threads = 4
+# RocksDB background threads, shared by all stores.
+rocksdb_compaction_threads = 4
+rocksdb_flush_threads = 2
+# Total memtable memory across all stores; writes are held back at the limit.
+rocksdb_write_buffer_budget_mb = 2048
+# Block decoding for the built-in index.
+index_decode_threads = 2

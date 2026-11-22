@@ -19,6 +19,43 @@ use tracing::{debug, error, info, warn};
 use crate::config::NodeConfig;
 use crate::storage::OpenedStores;
 
+/// Apply the process-wide limits from `[limits]`: the system allocator's arena
+/// limit, the parallel-execution pool, RocksDB's shared background threads and
+/// write-buffer budget, and the index decode pool. Call first thing in `main`,
+/// before any thread is started and before any store is opened. The tokio
+/// runtime is built by the caller from the same section
+/// ([`build_tokio_runtime`]).
+pub fn apply_process_limits(limits: &crate::config::LimitsConfig) -> Result<(), String> {
+    limits.validate()?;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `mallopt` only stores an allocator tunable; it is called before
+    // other threads exist.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, limits.malloc_arena_max as libc::c_int);
+    }
+    tron_executor::parallel::init_global_pool(limits.exec_threads);
+    tron_chainbase::set_rocksdb_limits(
+        limits.rocksdb_compaction_threads as i32,
+        limits.rocksdb_flush_threads as i32,
+        limits
+            .rocksdb_write_buffer_budget_mb
+            .saturating_mul(1024 * 1024),
+    );
+    tron_index::engine::set_decode_threads(limits.index_decode_threads);
+    Ok(())
+}
+
+/// Build the node's tokio runtime with the thread counts from `[limits]`.
+pub fn build_tokio_runtime(
+    limits: &crate::config::LimitsConfig,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(limits.tokio_worker_threads)
+        .max_blocking_threads(limits.tokio_max_blocking_threads)
+        .enable_all()
+        .build()
+}
+
 /// Cooperative shutdown handle. Cloneable; each clone observes the
 /// same signal.
 ///
@@ -437,10 +474,16 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
             cycle,
         );
         info!(
-            "⚙ runtime: {} cores · {:.1} GiB RAM · tokio {} workers",
+            "⚙ runtime: {} cores · {:.1} GiB RAM · tokio {} workers (≤{} blocking) · exec {} threads",
             t.cores,
             gib(t.mem_total_bytes),
-            t.cores,
+            config.limits.tokio_worker_threads,
+            config.limits.tokio_max_blocking_threads,
+            tron_executor::parallel::current_threads(),
+        );
+        info!(
+            "🧮 limits: malloc arenas {} · index decode {} threads",
+            config.limits.malloc_arena_max, config.limits.index_decode_threads,
         );
         info!(
             "💾 rocksdb: WBM {:.1} GiB · HyperClockCache {} MiB · {}c+{}f threads · bloom {}b/key · schema v{}",

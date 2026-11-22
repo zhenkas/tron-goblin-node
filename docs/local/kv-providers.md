@@ -118,7 +118,7 @@ WAL-sync measurement. This isolates adapter overhead; it is **not** the
 first-pass, cold-cache, large-mainnet-database test and cannot predict its speed.
 Keep generated databases and raw measurements outside Git.
 
-Observed on the Tron WSL host in the initial adapter run (seven-round medians):
+Observed on a development host in the initial adapter run (seven-round medians):
 
 | Path | Point read | Batch read, per key (256 keys) |
 | --- | ---: | ---: |

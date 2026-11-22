@@ -5,9 +5,26 @@ fn main() {
     std::process::exit(2);
 }
 #[cfg(feature = "private-network")]
-#[tokio::main(worker_threads = 2)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let result = execute().await;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `[limits]` must be applied before any thread exists, so the config of
+    // `init` / `start` is read here once for that section alone; `describe`
+    // takes a manifest and runs on the defaults.
+    let args: Vec<_> = std::env::args().collect();
+    let limits = if args.len() == 3 && args[1] != "describe" {
+        match tron_node::NodeConfig::from_file(std::path::Path::new(&args[2])) {
+            Ok(config) => config.limits,
+            Err(error) => {
+                let error: Box<dyn std::error::Error> = error.into();
+                tron_node::critical_notifications::terminal_failure(&error);
+                return Err(error);
+            }
+        }
+    } else {
+        tron_node::config::LimitsConfig::default()
+    };
+    tron_node::runtime::apply_process_limits(&limits)?;
+    let runtime = tron_node::runtime::build_tokio_runtime(&limits)?;
+    let result = runtime.block_on(execute());
     if let Err(error) = &result {
         tron_node::critical_notifications::terminal_failure(error);
     }

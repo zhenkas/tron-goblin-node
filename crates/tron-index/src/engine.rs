@@ -208,18 +208,26 @@ pub struct IndexEngine {
     inner: Mutex<EngineInner>,
 }
 
+static DECODE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+
+/// Set the size of the window-decode pool. No effect once the pool exists
+/// (it is built on first use), so call it at start.
+pub fn set_decode_threads(threads: usize) {
+    if threads > 0 {
+        DECODE_THREADS.store(threads, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Dedicated small rayon pool for window decode. Deliberately NOT the
 /// global pool: Block-STM parallel execution lives there, and backfill
 /// decode must never steal apply-path threads (sync throughput is the
-/// node's king metric). Bounded at 2–8 threads.
+/// node's king metric). Two threads unless [`set_decode_threads`] says
+/// otherwise; never derived from the core count.
 fn decode_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
         rayon::ThreadPoolBuilder::new()
-            .num_threads((n / 4).clamp(2, 8))
+            .num_threads(DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed).max(1))
             .thread_name(|i| format!("idx-decode-{i}"))
             .build()
             .expect("index decode pool")

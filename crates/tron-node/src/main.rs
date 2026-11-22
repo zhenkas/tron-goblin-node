@@ -1163,10 +1163,13 @@ fn run_start(args: &[String]) -> ExitCode {
         }
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    // Thread pools are sized by fixed limits, not by the core count: the node
+    // is bound by disk, and every extra thread costs memory.
+    if let Err(e) = tron_node::runtime::apply_process_limits(&config.limits) {
+        eprintln!("config error: {e}");
+        return ExitCode::from(2);
+    }
+    let rt = match tron_node::runtime::build_tokio_runtime(&config.limits) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("tokio runtime: {e}");

@@ -3619,11 +3619,11 @@ impl SyncDriver {
                 ));
             }
             if last_ping_sent_at.elapsed() >= KEEPALIVE_INTERVAL {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let ping = tron_proto::libp2p::KeepAliveMessage { timestamp: now_ms };
+                // Backdated on purpose: java rejects only a timestamp from
+                // the future (see `tron_net::keepalive`).
+                let ping = tron_proto::libp2p::KeepAliveMessage {
+                    timestamp: tron_net::keepalive::keepalive_timestamp_ms(),
+                };
                 if let Err(e) = conn
                     .send_frame(Frame {
                         ty: MessageType::Libp2pKeepAlivePing,
@@ -5089,12 +5089,12 @@ impl SyncDriver {
                     // `PongMessage.valid()` requires `ts > 0` AND
                     // `ts <= now + NETWORK_TIME_DIFF` — an empty
                     // payload parses as ts=0 and fails with BAD_MESSAGE
-                    // (libp2p disconnect reason 11).
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    let pong = tron_proto::libp2p::KeepAliveMessage { timestamp: now_ms };
+                    // (libp2p disconnect reason 11). The same happens to
+                    // a timestamp more than a second ahead of the peer's
+                    // clock, so it is backdated (`tron_net::keepalive`).
+                    let pong = tron_proto::libp2p::KeepAliveMessage {
+                        timestamp: tron_net::keepalive::keepalive_timestamp_ms(),
+                    };
                     // Fatal on failure — same partial-frame rationale as the
                     // P2pPong reply above.
                     if let Err(e) = conn

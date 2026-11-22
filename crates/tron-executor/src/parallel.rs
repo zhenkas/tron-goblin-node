@@ -41,6 +41,25 @@ use tron_types::TxWireInfo;
 use crate::resource::increase_default;
 use crate::{execute_one_tx_versioned, ExecConfig, StateBackends, TxResult};
 
+/// Build the global rayon pool (parallel execution and signature checks) with
+/// an explicit thread count, so it follows neither the core count nor
+/// `RAYON_NUM_THREADS`. Call once, before the first parallel operation;
+/// returns the thread count in effect (the existing pool's when one was
+/// already built).
+pub fn init_global_pool(threads: usize) -> usize {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .thread_name(|i| format!("exec-{i}"))
+        .build_global();
+    rayon::current_num_threads()
+}
+
+/// Threads of the global rayon pool as it is (builds the default pool when
+/// none exists yet).
+pub fn current_threads() -> usize {
+    rayon::current_num_threads()
+}
+
 // Stable store ids for the conflict-key space — one per StateBackends field.
 const SID_ACCOUNTS: StoreId = 0;
 const SID_WITNESSES: StoreId = 1;

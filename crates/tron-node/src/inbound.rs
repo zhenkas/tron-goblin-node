@@ -404,7 +404,9 @@ where
             return Ok(());
         }
         if last_ping.elapsed() >= KEEPALIVE_INTERVAL {
-            let ping = tron_proto::libp2p::KeepAliveMessage { timestamp: now_ms() };
+            let ping = tron_proto::libp2p::KeepAliveMessage {
+                timestamp: tron_net::keepalive::keepalive_timestamp_ms(),
+            };
             conn.send_frame(Frame {
                 ty: MessageType::Libp2pKeepAlivePing,
                 payload: Bytes::from(ping.encode_to_vec()),
@@ -437,7 +439,9 @@ where
 
         match frame.ty {
             MessageType::Libp2pKeepAlivePing => {
-                let pong = tron_proto::libp2p::KeepAliveMessage { timestamp: now_ms() };
+                let pong = tron_proto::libp2p::KeepAliveMessage {
+                    timestamp: tron_net::keepalive::keepalive_timestamp_ms(),
+                };
                 conn.send_frame(Frame {
                     ty: MessageType::Libp2pKeepAlivePong,
                     payload: Bytes::from(pong.encode_to_vec()),

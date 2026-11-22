@@ -129,3 +129,7 @@ secrets.*
 # any other ephemeral artefacts that shouldn't be committed.
 # ---------------------------------------------------------------------------
 /working/
+
+# Python bytecode caches (they embed absolute local paths)
+__pycache__/
+*.pyc

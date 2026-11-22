@@ -43,6 +43,7 @@ pub mod dns;
 pub mod envelope;
 pub mod hello;
 pub mod kad;
+pub mod keepalive;
 pub mod message_type;
 pub mod peer;
 pub mod sync;
