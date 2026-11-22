@@ -1652,7 +1652,6 @@ impl TronDatabaseExt for TronDatabase {
                     address: owner.as_bytes().to_vec(),
                     r#type: tron_proto::AccountType::Contract as i32,
                     account_name: b"CreatedByContract".to_vec(),
-                    create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
                     ..Default::default()
                 };
                 if let Some(delegation) = self.delegation.clone() {
@@ -1719,7 +1718,6 @@ impl TronDatabaseExt for TronDatabase {
                     address: owner.as_bytes().to_vec(),
                     r#type: tron_proto::AccountType::Contract as i32,
                     account_name: b"CreatedByContract".to_vec(),
-                    create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
                     ..Default::default()
                 }
             }

@@ -1567,7 +1567,6 @@ fn execute_create_inner(
     // ADDRESS (java-tron's `saveCode(address, ...)`), so `basic_ref` resolves
     // it during constructor execution.
     let init_code = &smart_contract.bytecode;
-    let init_hash = tron_crypto::hash::keccak256(init_code);
     if let Err(e) = stores.code.put(tron_contract_addr.as_bytes(), init_code) {
         return (
             VmOutcome::PreflightError(format!("write init code: {e:?}")),
@@ -1589,15 +1588,11 @@ fn execute_create_inner(
             // Pre-crediting call_value here too double-credits the contract, so
             // SELFBALANCE reads 2× the endowment inside the constructor.
             balance: 0,
-            code: init_code.clone(),
-            code_hash: init_hash.to_vec(),
-            // java stamps create_time on contract creation (= head-block
-            // timestamp). The commit path sees this pre-installed account as
-            // existing, so create_time must be set here or it stays 0.
-            create_time: stores
-                .dynamic_properties
-                .latest_block_header_timestamp()
-                .unwrap_or(0),
+            // Nothing else: java's `createAccount(addr, name, Contract)` builds
+            // the account from type, name and address only — no create_time,
+            // and neither the code nor its hash live on the account row (code
+            // store / `SmartContract.code_hash`). Type and name are set when
+            // the deploy is finalized below.
             ..Default::default()
         },
     ) {
@@ -2029,8 +2024,6 @@ fn execute_create_inner(
                 // `AccountType.Contract` (consensus-relevant: TransferActuator
                 // rejects plain TRX transfers to Contract-type accounts).
                 if let Ok(Some(mut acct)) = stores.accounts.get(&tron_contract_addr) {
-                    acct.code = stored_code;
-                    acct.code_hash = runtime_hash.clone();
                     acct.r#type = tron_proto::AccountType::Contract as i32;
                     if acct.account_name.is_empty() {
                         acct.account_name = smart_contract.name.clone();

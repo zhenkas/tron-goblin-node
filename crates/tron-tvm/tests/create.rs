@@ -185,17 +185,17 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
         .get(&contract_addr)
         .unwrap()
         .expect("contract account missing after deploy");
-    assert_eq!(
-        acct.code, runtime,
-        "deployed runtime bytecode mismatch (expected the 5-byte PUSH1 0 PUSH1 0 RETURN)"
-    );
-    let expected_runtime_hash = tron_crypto::hash::keccak256(&runtime);
-    assert_eq!(acct.code_hash, expected_runtime_hash.as_slice());
+    // The account row carries neither the code nor its hash (java keeps the
+    // code in the code store and the hash on the contract row).
+    assert!(acct.code.is_empty() && acct.code_hash.is_empty());
 
     // CodeStore must contain the runtime code keyed by ADDRESS (java-tron's
     // `saveCode(address, ...)` layout), not by code_hash.
     let stored_code = stores.code.get(contract_addr.as_bytes()).unwrap().unwrap();
-    assert_eq!(stored_code, runtime);
+    assert_eq!(
+        stored_code, runtime,
+        "deployed runtime bytecode mismatch (expected the 5-byte PUSH1 0 PUSH1 0 RETURN)"
+    );
 }
 
 #[test]
@@ -286,15 +286,8 @@ fn execute_create_contract_row_carries_keccak_code_hash() {
     );
 }
 
-#[test]
-fn execute_create_stamps_create_time_from_head_block_timestamp() {
-    // java stamps a created contract's create_time with the head-block
-    // timestamp (getLatestBlockHeaderTimestamp), not 0 and not the executing
-    // block's env timestamp.
-    let stores = fresh_stores();
-    let head_ts = 1_700_000_222_000i64;
-    stores.dynamic_properties.save_latest_block_header_timestamp(head_ts);
-
+/// Deploy a contract returning the 1-byte runtime [0x00]; `abi` as sent.
+fn deploy_trivial(stores: &VmStores, abi: Option<Abi>) -> ([u8; 21], [u8; 21]) {
     let mut owner_bytes = [0u8; 21];
     owner_bytes[0] = 0x41;
     owner_bytes[1..].fill(0xb0);
@@ -323,7 +316,7 @@ fn execute_create_stamps_create_time_from_head_block_timestamp() {
         new_contract: Some(SmartContract {
             origin_address: owner_bytes.to_vec(),
             contract_address: vec![],
-            abi: Some(Abi::default()),
+            abi,
             bytecode: init_code,
             call_value: 0,
             consume_user_resource_percent: 100,
@@ -336,14 +329,11 @@ fn execute_create_stamps_create_time_from_head_block_timestamp() {
         call_token_value: 0,
         token_id: 0,
     };
-    let tx_id = [0xee; 32];
-    // The env timestamp (9_999_999) differs from the head-block ts to prove
-    // create_time reads dyn_props, not VmBlockEnv.
     let outcome = execute_create(
-        &stores,
+        stores,
         VmBlockEnv { block_number: 2, block_timestamp_ms: 9_999_999, ..Default::default()},
         &create,
-        &tx_id,
+        &[0xee; 32],
         500_000,
     );
     let addr = match outcome {
@@ -352,12 +342,46 @@ fn execute_create_stamps_create_time_from_head_block_timestamp() {
     };
     let mut a = [0u8; 21];
     a.copy_from_slice(&addr);
+    (owner_bytes, a)
+}
+
+#[test]
+fn execute_create_account_row_is_type_name_address_only() {
+    // java `VMActuator.create`: `createAccount(contractAddress,
+    // newSmartContract.getName(), Contract)` — the account is built from
+    // type, name and address. It gets no create_time (unlike a normal account
+    // the VM creates), and the code and its hash are not on the account row:
+    // the code store and the `SmartContract` row hold them.
+    let stores = fresh_stores_with_contracts();
+    stores.dynamic_properties.save_latest_block_header_timestamp(1_700_000_222_000);
+    let (_owner, a) = deploy_trivial(&stores, Some(Abi::default()));
     let acct = stores
         .accounts
         .get(&Address::from_raw(a))
         .unwrap()
         .expect("contract account");
-    assert_eq!(acct.create_time, head_ts, "create_time must be the head-block timestamp");
+    assert_eq!(
+        acct,
+        Account {
+            address: a.to_vec(),
+            r#type: tron_proto::AccountType::Contract as i32,
+            account_name: b"T".to_vec(),
+            ..Default::default()
+        }
+    );
+    assert_eq!(stores.code.get(&a).unwrap(), Some(vec![0x00]));
+}
+
+#[test]
+fn execute_create_without_abi_still_writes_an_abi_row() {
+    // java `RepositoryImpl.commitContractCache`: `if (!abiStore.has(key))
+    // abiStore.put(key, new AbiCapsule(contractCapsule))` — no ABI in the
+    // deploy means an EMPTY row, not a missing one.
+    let stores = fresh_stores_with_contracts();
+    let (_owner, a) = deploy_trivial(&stores, None);
+    let abi = stores.abi.as_ref().unwrap();
+    assert!(abi.contains(&Address::from_raw(a)).unwrap());
+    assert_eq!(abi.get(&Address::from_raw(a)).unwrap(), Some(Abi::default()));
 }
 
 #[test]
@@ -663,8 +687,10 @@ fn top_level_create_writes_contract_row_and_marks_account() {
     assert!(row.abi.is_none(), "ContractStore must strip ABI");
 }
 
-#[test]
-fn nested_create2_writes_contract_row_and_marks_account() {
+/// A factory that CREATE2s one child (runtime = a single 0x00 byte) with
+/// salt 0. `prefund` puts an account at the child's address beforehand.
+/// Returns the stores, the factory, the child address and the root tx id.
+fn run_create2_factory(prefund: Option<Account>) -> (VmStores, [u8; 21], [u8; 21], [u8; 32]) {
     use tron_proto::TriggerSmartContract;
     use tron_tvm::execute::execute_trigger_with_trace_tx_id;
 
@@ -738,6 +764,12 @@ fn nested_create2_writes_contract_row_and_marks_account() {
         .put(factory_addr.as_bytes(), &factory_runtime)
         .unwrap();
 
+    let child = tron_create2(&factory, [0u8; 32], &child_init);
+    if let Some(mut account) = prefund {
+        account.address = child.to_vec();
+        stores.accounts.put(&Address::from_raw(child), &account).unwrap();
+    }
+
     let trigger = TriggerSmartContract {
         owner_address: caller.to_vec(),
         contract_address: factory.to_vec(),
@@ -759,9 +791,14 @@ fn nested_create2_writes_contract_row_and_marks_account() {
         tx_id,
     );
     assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+    (stores, factory, child, tx_id)
+}
+
+#[test]
+fn nested_create2_writes_contract_row_and_marks_account() {
+    let (stores, factory, child, tx_id) = run_create2_factory(None);
 
     // The CREATE2 child must exist at the java-tron-derived address.
-    let child = tron_create2(&factory, [0u8; 32], &child_init);
     let child_addr = Address::from_raw(child);
     let child_acct = stores
         .accounts
@@ -789,13 +826,69 @@ fn nested_create2_writes_contract_row_and_marks_account() {
     // ALLOW_TVM_CONSTANTINOPLE ON) sets the row's
     // `code_hash = Hash.sha3(code)` = keccak256(runtime_code). The child init
     // `PUSH1 1 PUSH1 0 RETURN` returns mem[0..1] = a single 0x00 byte.
-    let child_runtime = child_acct.code.clone();
+    let child_runtime = stores.code.get(child_addr.as_bytes()).unwrap().expect("child code");
     assert_eq!(child_runtime, vec![0x00], "child runtime code");
     let expected_hash = tron_crypto::hash::keccak256(&child_runtime);
     assert_eq!(
         row.code_hash,
         expected_hash.as_slice(),
         "nested CREATE2 contract row must carry keccak256(runtime_code)"
+    );
+
+    // The account row is exactly java's `createAccount(addr,
+    // "CreatedByContract", Contract)`: type, name, address. No create_time,
+    // and neither the code nor its hash (code store / contract row hold them).
+    assert_eq!(
+        child_acct,
+        Account {
+            address: child.to_vec(),
+            r#type: tron_proto::AccountType::Contract as i32,
+            account_name: b"CreatedByContract".to_vec(),
+            ..Default::default()
+        }
+    );
+
+    // java `commitContractCache` gives every new contract an ABI row; a
+    // nested deploy has no ABI, so the row is empty — but present.
+    let abi = stores.abi.as_ref().unwrap();
+    assert!(abi.contains(&child_addr).unwrap(), "empty ABI row must exist");
+    assert_eq!(abi.get(&child_addr).unwrap(), Some(Abi::default()));
+}
+
+#[test]
+fn nested_create2_onto_an_existing_account_keeps_it_and_clears_acquired_delegation() {
+    // java `Program.createContractImpl`, account already there and no
+    // contract at the address: `updateAccountType(Contract)` +
+    // `clearDelegatedResource()` — the account keeps everything else,
+    // including its (empty) name and its create_time.
+    let prefunded = Account {
+        create_time: 1_650_000_000_000,
+        net_usage: 7,
+        acquired_delegated_frozen_balance_for_bandwidth: 11,
+        acquired_delegated_frozen_v2_balance_for_bandwidth: 12,
+        account_resource: Some(tron_proto::account::AccountResource {
+            energy_usage: 9,
+            acquired_delegated_frozen_balance_for_energy: 13,
+            acquired_delegated_frozen_v2_balance_for_energy: 14,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (stores, _factory, child, _tx_id) = run_create2_factory(Some(prefunded));
+    let got = stores.accounts.get(&Address::from_raw(child)).unwrap().expect("child account");
+    assert_eq!(
+        got,
+        Account {
+            address: child.to_vec(),
+            r#type: tron_proto::AccountType::Contract as i32,
+            create_time: 1_650_000_000_000,
+            net_usage: 7,
+            account_resource: Some(tron_proto::account::AccountResource {
+                energy_usage: 9,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     );
 }
 
@@ -1118,7 +1211,7 @@ fn token_funded_create_deploys_and_moves_trc10_when_flag_on() {
         "new contract address must be credited the TRC-10 endowment"
     );
     assert_eq!(contract_acct.r#type, tron_proto::AccountType::Contract as i32);
-    assert_eq!(contract_acct.code, vec![0x00]);
+    assert_eq!(stores.code.get(&a).unwrap(), Some(vec![0x00]));
 }
 
 /// java VMActuator.create() flag-off path: when `allowTvmTransferTrc10` is OFF,

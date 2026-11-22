@@ -191,7 +191,7 @@ fn commit_preserves_tron_only_fields_on_existing_account() {
 }
 
 #[test]
-fn commit_writes_code_and_code_hash_on_contract_deployment() {
+fn commit_writes_code_to_the_code_store_not_the_account_row() {
     let mut db = fresh_db();
     let evm_addr = EvmAddress::from([0xcc; 20]);
     let tron_addr = evm_to_tron_address(&evm_addr);
@@ -209,10 +209,11 @@ fn commit_writes_code_and_code_hash_on_contract_deployment() {
 
     // CodeStore got the bytecode keyed by ADDRESS (java-tron layout).
     assert_eq!(db.code.get(tron_addr.as_bytes()).unwrap().unwrap(), runtime_code);
-    // Account got both the inline code and the hash.
+    // The account row itself carries neither (java: code store + the
+    // `SmartContract` row's code_hash).
     let acct = db.accounts.get(&tron_addr).unwrap().unwrap();
-    assert_eq!(acct.code, runtime_code);
-    assert_eq!(acct.code_hash, hash.as_slice());
+    assert!(acct.code.is_empty());
+    assert!(acct.code_hash.is_empty());
 }
 
 #[test]

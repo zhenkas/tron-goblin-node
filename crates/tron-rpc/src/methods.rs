@@ -382,9 +382,11 @@ pub fn eth_get_transaction_count(_p: &Value, _s: &RpcState) -> Result<Value, Rpc
 }
 
 /// `eth_getCode(addr, [block])` — returns the deployed bytecode for a
-/// contract address. The 21-byte TRON address is mapped to its
-/// `code_hash` via `AccountStore`, then the bytes are fetched from
-/// `CodeStore`. Returns `"0x"` for EOAs and missing contracts.
+/// contract address. Code is keyed by the 21-byte TRON ADDRESS in
+/// `CodeStore` (java-tron `saveCode(address, ...)`); the account row does
+/// not carry the code or its hash. Rows this node wrote under the legacy
+/// hash key are still found through `Account.code_hash`. Returns `"0x"`
+/// for EOAs and missing contracts.
 pub fn eth_get_code(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let addr_str = p
         .get(0)
@@ -394,6 +396,9 @@ pub fn eth_get_code(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(code_store) = &s.code else {
         return Ok(Value::String("0x".to_string()));
     };
+    if let Some(bytecode) = code_store.get(addr.as_bytes())? {
+        return Ok(Value::String(hex_bytes(&bytecode)));
+    }
     let Ok(Some(account)) = s.accounts.get(&addr) else {
         return Ok(Value::String("0x".to_string()));
     };

@@ -658,7 +658,13 @@ impl DatabaseCommit for TronDatabase {
             // as getLatestBlockHeaderTimestamp returns until the head advances
             // after the tx loop), matching the standalone TransferActuator.
             // Only on creation — never overwrite an existing account's value.
-            if is_new_account {
+            //
+            // A contract account is the exception: java builds it with
+            // `createAccount(addr, name, Contract)` — type, name and address
+            // only, no create_time (`AccountCapsule(address, accountName,
+            // accountType)`).
+            let created_contract = self.pending_created_contracts.get(&address).copied();
+            if is_new_account && created_contract.is_none() {
                 tron_account.create_time = self
                     .dyn_props
                     .as_ref()
@@ -672,12 +678,27 @@ impl DatabaseCommit for TronDatabase {
             // → `deposit.createAccount(addr, "CreatedByContract", Contract)`.
             // type=Contract is consensus-relevant (TransferActuator rejects
             // plain TRX transfers to Contract-type accounts).
-            let created_contract = self.pending_created_contracts.get(&address).copied();
             if created_contract.is_some() {
-                tron_account.r#type = tron_proto::AccountType::Contract as i32;
-                if tron_account.account_name.is_empty() {
+                // A row that is already the in-flight contract account (staked
+                // or settled in its own constructor — see `tron_host`) is the
+                // account java created fresh for this deploy.
+                let in_flight_contract = tron_account.r#type
+                    == tron_proto::AccountType::Contract as i32
+                    && tron_account.account_name == b"CreatedByContract";
+                if is_new_account {
                     tron_account.account_name = b"CreatedByContract".to_vec();
+                } else if !in_flight_contract {
+                    // Deploy onto an address that already had an account (e.g.
+                    // a pre-funded CREATE2 address): java keeps the account,
+                    // name included, and only does
+                    // `updateAccountType(Contract)` + `clearDelegatedResource()`.
+                    tron_account.acquired_delegated_frozen_balance_for_bandwidth = 0;
+                    tron_account.acquired_delegated_frozen_v2_balance_for_bandwidth = 0;
+                    let resource = tron_account.account_resource.get_or_insert_with(Default::default);
+                    resource.acquired_delegated_frozen_balance_for_energy = 0;
+                    resource.acquired_delegated_frozen_v2_balance_for_energy = 0;
                 }
+                tron_account.r#type = tron_proto::AccountType::Contract as i32;
             }
 
             // Balance round-trip: revm balance is U256 in sun. We saturate
@@ -697,6 +718,7 @@ impl DatabaseCommit for TronDatabase {
             // it (java `saveCode` sets `code_hash = Hash.sha3(code)` under
             // ALLOW_TVM_CONSTANTINOPLE, ON on mainnet).
             let mut deployed_code_hash: Option<Vec<u8>> = None;
+            let mut has_new_code = false;
             if let Some(code) = &account.info.code {
                 let raw = code.original_byte_slice();
                 if !raw.is_empty() {
@@ -709,8 +731,10 @@ impl DatabaseCommit for TronDatabase {
                     self.code
                         .put(tron_addr.as_bytes(), raw)
                         .expect("db error in DatabaseCommit::commit writing code");
-                    tron_account.code_hash = account.info.code_hash.to_vec();
-                    tron_account.code = raw.to_vec();
+                    // The account row itself carries neither the code nor its
+                    // hash: java keeps code in the code store and the hash on
+                    // the `SmartContract` row (`RepositoryImpl.saveCode`).
+                    has_new_code = true;
                 }
             }
 
@@ -766,7 +790,7 @@ impl DatabaseCommit for TronDatabase {
                         &txid[..16.min(txid.len())],
                         is_new_account,
                         tron_account.balance,
-                        tron_account.code.is_empty(),
+                        !has_new_code,
                         tron_account.asset_v2,
                         tron_account.asset_optimized,
                         account
@@ -780,7 +804,7 @@ impl DatabaseCommit for TronDatabase {
             if is_new_account
                 && created_contract.is_none()
                 && tron_account.balance == 0
-                && tron_account.code.is_empty()
+                && !has_new_code
                 && {
                     let mut probe = tron_account.clone();
                     tron_chainbase::import_all_asset(&mut probe);
@@ -801,7 +825,7 @@ impl DatabaseCommit for TronDatabase {
             // brought into existence by transferring value to it. Deployed
             // contracts (in `pending_created_contracts`, or anything that now
             // carries code) get no default permission, matching java.
-            if is_new_account && created_contract.is_none() && tron_account.code.is_empty() {
+            if is_new_account && created_contract.is_none() && !has_new_code {
                 if let Some(dyn_props) = &self.dyn_props {
                     tron_chainbase::apply_default_account_permissions(&mut tron_account, dyn_props);
                 }
