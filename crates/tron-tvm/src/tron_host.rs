@@ -889,12 +889,29 @@ impl TronDatabaseExt for TronDatabase {
             if suicide_trace.is_some() {
                 eprintln!("SUICIDETRACE owner_post_import asset_v2={:?}", owner_account.asset_v2);
             }
+            // The inheritor may be asset-optimized too: its existing balance of
+            // a swept token then lives in the store, and crediting a missing
+            // inline entry from zero would replace that balance instead of
+            // adding to it (mainnet block 87,672,512: 222,222 + 222,222 of
+            // token 1005074 ended as 222,222).
+            tron_chainbase::import_all_asset(&mut inheritor_account);
+            let keep_zeroed = owner_account.asset_optimized;
+            let mut swept = Vec::new();
             for (token, amount) in std::mem::take(&mut owner_account.asset_v2) {
+                if keep_zeroed {
+                    swept.push(token.clone());
+                }
                 if amount == 0 {
                     continue;
                 }
                 let slot = inheritor_account.asset_v2.entry(token).or_insert(0);
                 *slot = slot.saturating_add(amount);
+            }
+            // An asset-optimized owner that survives (no account deletion) still
+            // has its old rows in the store; keep explicit zero entries inline so
+            // they override those rows instead of resurfacing as a balance.
+            for token in swept {
+                owner_account.asset_v2.insert(token, 0);
             }
             if suicide_trace.is_some() {
                 eprintln!(
