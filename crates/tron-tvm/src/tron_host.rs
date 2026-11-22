@@ -1659,8 +1659,27 @@ impl TronDatabaseExt for TronDatabase {
         if !stake_v2_resource_valid(&dyn_props, resource_type) {
             return 0;
         }
-        let Ok(Some(mut account)) = self.accounts.get(&owner) else {
-            return 0;
+        let mut account = match self.accounts.get(&owner) {
+            Ok(Some(account)) => account,
+            // A contract deployed earlier in THIS tx (nested CREATE/CREATE2) has
+            // no committed row until `DatabaseCommit::commit`, but java's frame
+            // `Repository` already holds the account `createContractImpl` made
+            // (`createAccount(addr, "CreatedByContract", Contract)`), so a
+            // constructor may stake its own endowment. Start from that same
+            // account; the staking journal deletes the row again if the frame
+            // reverts, and commit preserves it otherwise. (Mainnet block
+            // 88,065,505: an energy-rental factory froze in the child's
+            // constructor; rejecting it flipped SUCCESS to REVERT.)
+            Ok(None) if self.pending_created_contracts.contains_key(&caller) => {
+                tron_proto::Account {
+                    address: owner.as_bytes().to_vec(),
+                    r#type: tron_proto::AccountType::Contract as i32,
+                    account_name: b"CreatedByContract".to_vec(),
+                    create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
+                    ..Default::default()
+                }
+            }
+            _ => return 0,
         };
         // java `FreezeBalanceV2Processor.validate` (line 41) gates on the frame
         // `Repository` balance — which includes TRX received earlier in this

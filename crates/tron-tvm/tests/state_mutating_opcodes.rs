@@ -3377,3 +3377,78 @@ fn successful_freezebalancev2_bumps_internal_tx_nonce_once() {
         "success and rejection must consume the same single nonce"
     );
 }
+
+/// Regression (mainnet block 88,065,505): a contract deployed by a nested
+/// CREATE may stake its own endowment from its constructor. The child has no
+/// committed account row until the tx commits, but java's frame repository
+/// already holds the `CreatedByContract` account, so FREEZEBALANCEV2 succeeds.
+#[test]
+fn freeze_v2_in_constructor_of_contract_created_in_same_tx() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa1);
+    let factory_addr = tron_addr(0xc1);
+    let endowment = 27_000_000u64;
+
+    // CHILD init code: FREEZEBALANCEV2(endowment, ENERGY); revert unless it
+    // reports success; otherwise deploy empty runtime code.
+    let mut init = vec![0x63]; // PUSH4 endowment (keeps the init code within one word)
+    init.extend(&(endowment as u32).to_be_bytes());
+    init.extend(push1(1)); // resource = ENERGY
+    init.push(0xda); // FREEZEBALANCEV2
+    let ok = (init.len() + 3 + 5) as u8;
+    init.extend(push1(ok));
+    init.push(0x57); // JUMPI
+    init.extend([0x60, 0x00, 0x60, 0x00, 0xfd]); // REVERT(0,0)
+    assert_eq!(init.len(), ok as usize);
+    init.extend([0x5b, 0x60, 0x00, 0x60, 0x00, 0xf3]); // JUMPDEST; RETURN(0,0)
+    assert!(init.len() <= 32);
+
+    // FACTORY: memory[0..32] = right-aligned init code; child = CREATE(endowment,
+    // 32 - len, len); slot0 = child; revert when the create failed.
+    let mut factory = Vec::new();
+    factory.push(0x60 + init.len() as u8 - 1); // PUSHn
+    factory.extend(&init);
+    factory.extend(push1(0));
+    factory.push(0x52); // MSTORE
+    factory.extend(push1(init.len() as u8));
+    factory.extend(push1(32 - init.len() as u8));
+    factory.extend(push_u64(endowment));
+    factory.push(0xf0); // CREATE
+    factory.push(0x80); // DUP1
+    factory.extend(push1(0));
+    factory.push(0x55); // SSTORE slot0 = child
+    let done = (factory.len() + 3 + 5) as u8;
+    factory.extend(push1(done));
+    factory.push(0x57); // JUMPI on non-zero child
+    factory.extend([0x60, 0x00, 0x60, 0x00, 0xfd]);
+    assert_eq!(factory.len(), done as usize);
+    factory.extend([0x5b, 0x00]); // JUMPDEST; STOP
+    install_contract(&stores, factory_addr, factory, endowment as i64);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
+        &trigger(caller_user, factory_addr),
+        2_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "constructor freeze of a same-tx contract must succeed, got: {outcome:?}"
+    );
+
+    let word = slot0(&stores, factory_addr);
+    let mut child = [0x41u8; 21];
+    child[1..].copy_from_slice(&word[12..]);
+    let account = stores
+        .accounts
+        .get(&Address::from_raw(child))
+        .unwrap()
+        .expect("created child account");
+    assert_eq!(account.r#type, tron_proto::AccountType::Contract as i32);
+    assert_eq!(account.account_name, b"CreatedByContract".to_vec());
+    assert_eq!(account.balance, 0);
+    let energy: i64 = account.frozen_v2.iter().filter(|f| f.r#type == 1).map(|f| f.amount).sum();
+    assert_eq!(energy, endowment as i64);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 27);
+}
