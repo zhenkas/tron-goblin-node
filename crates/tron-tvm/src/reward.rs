@@ -108,9 +108,6 @@ pub fn pay_standby_witness(
     standby_set: &[(Address, i64)],
 ) -> Result<(), StoreError> {
     let total_pay = dyn_props.witness_127_pay_per_block();
-    if total_pay <= 0 {
-        return Ok(());
-    }
     let vote_sum: i64 = standby_set.iter().map(|(_, v)| *v).sum();
     if vote_sum < 1 {
         return Ok(());
@@ -121,9 +118,9 @@ pub fn pay_standby_witness(
     let each_vote_pay = total_pay as f64 / vote_sum as f64;
     for (addr, vote_count) in standby_set {
         let pay = (*vote_count as f64 * each_vote_pay) as i64;
-        if pay > 0 {
-            pay_reward_inner(accounts, delegation, dyn_props, addr, pay)?;
-        }
+        // Also when `pay` is 0: java calls `payReward` for every standby
+        // witness, which leaves a (zero) reward row behind.
+        pay_reward_inner(accounts, delegation, dyn_props, addr, pay)?;
     }
     Ok(())
 }
@@ -154,19 +151,17 @@ fn pay_reward_inner(
     witness_address: &Address,
     value: i64,
 ) -> Result<(), StoreError> {
-    if value <= 0 {
-        return Ok(());
-    }
     let cycle = dyn_props.current_cycle_number();
     // Brokerage is a percentage (0..=100). Default value when no row
     // exists is 20 — matches java-tron's `DEFAULT_BROKERAGE`.
     let brokerage = delegation.get_brokerage(cycle, witness_address);
     let brokerage_amount = brokerage_cut(value, brokerage as i64);
     let voter_share = value.saturating_sub(brokerage_amount);
-    // 1. Voter-share pool — adds to cycle's reward bucket.
-    if voter_share > 0 {
-        delegation.add_reward(cycle, witness_address, voter_share);
-    }
+    // 1. Voter-share pool — adds to cycle's reward bucket. Unconditional,
+    //    as in java (`delegationStore.addReward(cycle, witnessAddress,
+    //    value)`): a witness that keeps the whole reward (brokerage 100) or
+    //    earns nothing this block still gets its cycle row, holding 0.
+    delegation.add_reward(cycle, witness_address, voter_share);
     // 2. Brokerage — direct to the witness's account allowance.
     if brokerage_amount > 0 {
         adjust_allowance(accounts, witness_address, brokerage_amount)?;
@@ -730,17 +725,15 @@ pub fn settle_reward(
     }
 
     // ── 3. Apply allowance + record this cycle's snapshot ──────────────
+    // Persist the account so the *next* withdraw can pay out this cycle's
+    // reward against the same vote list. java stores the WHOLE account as
+    // it was read on entry (`setAccountVote(endCycle, address,
+    // accountCapsule)` — the capsule fetched before any `adjustAllowance`),
+    // not just its votes; only the votes are read back later (step 1).
+    let snapshot: Account = account.clone();
     account.allowance = account.allowance.saturating_add(paid);
     delegation.set_begin_cycle(address, end_cycle);
     delegation.set_end_cycle(address, end_cycle + 1);
-    // Persist the current votes snapshot so the *next* withdraw can
-    // pay out this cycle's reward against the same vote list. Only the
-    // votes/address are read from this snapshot later (see step 1).
-    let snapshot = Account {
-        address: address.as_bytes().to_vec(),
-        votes: account.votes.clone(),
-        ..Default::default()
-    };
     delegation.set_account_vote(end_cycle, address, &snapshot)?;
 
     Ok(paid)
