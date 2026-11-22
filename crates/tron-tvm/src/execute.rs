@@ -1997,6 +1997,7 @@ fn execute_create_inner(
                 } else {
                     program_precompile_get_code(init_code)
                 };
+                let stored_code_is_empty = stored_code.is_empty();
                 let runtime_hash = if stored_code.is_empty() {
                     vec![]
                 } else {
@@ -2009,6 +2010,16 @@ fn execute_create_inner(
                         .code
                         .put(tron_contract_addr.as_bytes(), &stored_code)
                         .expect("db error in execute_create writing runtime code");
+                } else {
+                    // A constructor that returns nothing deploys a contract
+                    // with NO code. The init code pre-installed under this key
+                    // for the constructor run must not survive as its code:
+                    // java never writes a code row here, and a later call
+                    // would execute the constructor instead of nothing.
+                    stores
+                        .code
+                        .delete(tron_contract_addr.as_bytes())
+                        .expect("db error in execute_create dropping pre-installed init code");
                 }
                 // Replace init code on the Account with the deployed code, and
                 // mark it a contract account. java-tron VMActuator:
@@ -2051,7 +2062,14 @@ fn execute_create_inner(
                     // `runtime_hash` above is exactly that. No VM impact
                     // (EXTCODEHASH recomputes from the code bytes) — state-byte
                     // + `getcontract` RPC fidelity.
-                    row.code_hash = runtime_hash.clone();
+                    // For an empty runtime java still hashes the (empty) code,
+                    // so the row carries keccak256("") — verified against a
+                    // java-tron mainnet snapshot at block 88,067,120.
+                    row.code_hash = if stored_code_is_empty && proposals.allow_tvm_constantinople {
+                        tron_crypto::hash::keccak256(&[]).to_vec()
+                    } else {
+                        runtime_hash.clone()
+                    };
                     contracts
                         .put(&tron_contract_addr, &row)
                         .expect("db error in execute_create writing contract row");

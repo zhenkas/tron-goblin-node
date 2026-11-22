@@ -531,3 +531,28 @@ fn call_into_self_during_construction_runs_empty_code() {
          again)"
     );
 }
+
+/// A constructor that returns nothing deploys a contract without code: the
+/// init code pre-installed for the constructor run must not remain as its
+/// code, and the contract row carries keccak256("") like java-tron's.
+#[test]
+fn empty_runtime_leaves_no_code_row_and_hashes_empty_code() {
+    let stores = fresh_stores();
+    let owner = tron_addr(0xa7);
+    install_caller(&stores, owner, 1_000_000_000);
+
+    let init = vec![0x60, 0x00, 0x60, 0x00, 0xf3]; // PUSH1 0 PUSH1 0 RETURN
+    let out = deploy(&stores, owner, init, [0x77; 32]);
+    assert!(matches!(out, VmOutcome::Success { .. }), "deploy must succeed; got {out:?}");
+    let deployed = addr_from_return(&out);
+
+    assert_eq!(stores.code.get(&deployed).unwrap(), None, "no code row for an empty runtime");
+    let row = stores
+        .contracts
+        .as_ref()
+        .unwrap()
+        .get(&tron_crypto::address::Address::from_raw(deployed))
+        .unwrap()
+        .expect("contract row");
+    assert_eq!(row.code_hash, tron_crypto::hash::keccak256(&[]).to_vec());
+}
