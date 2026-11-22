@@ -47,6 +47,7 @@ fn entry_encoding_is_pinned() {
                     rejected: true,
                 }],
             }],
+            ..Default::default()
         })),
     };
     assert_eq!(
@@ -61,7 +62,39 @@ fn entry_encoding_is_pinned() {
 fn unwind_encoding_is_pinned() {
     let entry = fh::Entry {
         seq: 9,
-        event: Some(fh::entry::Event::Unwind(fh::Unwind { to_height: 84_210_000 })),
+        event: Some(fh::entry::Event::Unwind(fh::Unwind {
+            to_height: 84_210_000,
+        })),
     };
     assert_eq!(hex::encode(entry.encode_to_vec()), "08091a0508d0e29328");
+}
+
+#[test]
+fn native_balance_extension_is_additive_and_legacy_is_explicitly_incomplete() {
+    let old = fh::BlockApplied {
+        height: 10,
+        ..Default::default()
+    };
+    let bytes = old.encode_to_vec();
+    assert_eq!(hex::encode(&bytes), "080a");
+    let decoded = fh::BlockApplied::decode(bytes.as_slice()).unwrap();
+    assert!(!decoded.trx_balances_complete);
+    let new = fh::BlockApplied {
+        height: 10,
+        trx_balance_changes: vec![fh::TrxBalanceChange {
+            address: vec![0x41, 1],
+            balance_before: 7,
+            balance_after: 9,
+        }],
+        trx_balances_complete: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        hex::encode(new.encode_to_vec()),
+        "080a4a080a024101100718095001"
+    );
+    assert_eq!(
+        fh::BlockApplied::decode(new.encode_to_vec().as_slice()).unwrap(),
+        new
+    );
 }

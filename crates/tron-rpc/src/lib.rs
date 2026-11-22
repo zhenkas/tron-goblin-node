@@ -25,6 +25,7 @@ pub mod pubsub;
 pub mod rate_limit;
 pub mod server;
 pub mod methods;
+mod transaction_json;
 pub mod sim;
 pub mod state;
 

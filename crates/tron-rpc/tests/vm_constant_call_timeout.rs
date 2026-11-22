@@ -34,6 +34,7 @@ fn fresh_state(timeout_ms: i64) -> RpcState {
         code: mem(),
         storage: mem(),
         witnesses: mem(),
+        votes: mem(),
         contract_state: mem(),
         dyn_props: mem(),
         delegated_resources: mem(),

@@ -159,7 +159,7 @@ impl DynamicPropertiesStore {
 
     fn fork_passed_old(&self, version: i32) -> bool {
         if version == ENERGY_LIMIT {
-            return self.latest_block_header_number().unwrap_or(0) >= ENERGY_LIMIT_HARD_FORK_BLOCK;
+            return crate::energy_limit_hard_fork_active(self);
         }
         all_upgraded(self.fork_stats(version).as_deref())
     }

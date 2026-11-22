@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Transaction-execution layer. One actuator per contract type; each pair of (validate, execute) functions reproduces java-tron's actuator semantics."
 
+[features]
+devnet-fast = ["tron-tvm/devnet-fast"]
+
 [dependencies]
 tron-crypto = { path = "../tron-crypto" }
 tron-proto = { path = "../tron-proto" }

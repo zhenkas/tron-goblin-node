@@ -184,6 +184,14 @@ redirected/file capture the prefix keeps the full `YYYY-MM-DD HH:MM:SS.mmm`.
 ";
 
 fn main() -> ExitCode {
+    let result = execute();
+    if result != ExitCode::SUCCESS {
+        tron_node::critical_notifications::terminal_failure("unsuccessful node command");
+    }
+    result
+}
+
+fn execute() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     // Answer the pure queries before init_tracing(), which creates ./logs in
@@ -1105,7 +1113,7 @@ fn run_dump_state(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let stores = match OpenedStores::open(&config.data_dir) {
+    let stores = match OpenedStores::open_configured(&config.data_dir, &config.storage) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tron-node: open storage: {e}");

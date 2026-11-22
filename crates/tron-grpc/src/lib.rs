@@ -36,6 +36,8 @@ pub mod firehose_proto {
     tonic::include_proto!("tronfirehose");
 }
 
+pub mod assist_proto { tonic::include_proto!("tronassist.v1"); }
+
 pub mod firehose;
 
 mod database;

@@ -13,6 +13,15 @@ use tron_chainbase::{
     ProposalStore, StorageRowStore, TransactionHistoryStore, TransactionStore, WitnessStore,
 };
 
+/// A runtime-owned committed-read critical section. The node can serialize a
+/// confirmed read with canonical apply without making RPC depend on its driver.
+pub type CommittedReadGate = Arc<
+    dyn Fn(&mut dyn FnMut() -> Result<serde_json::Value, crate::methods::RpcError>)
+        -> Result<serde_json::Value, crate::methods::RpcError>
+        + Send
+        + Sync,
+>;
+
 /// Handle passed to every RPC method.
 #[derive(Clone)]
 pub struct RpcState {
@@ -119,6 +128,8 @@ pub struct RpcState {
     /// Optional historical-state archive (the `/v1/archive/...`
     /// surface). Attached when `[index] capture_state_deltas` is on.
     pub archive: Option<crate::index_api::ArchiveApiState>,
+    /// Serializes confirmed reads with block writes plus archive capture.
+    pub committed_read_gate: Option<CommittedReadGate>,
     /// Optional verifiable state-commitment reader (the
     /// `/v1/commitment/...` surface). Attached when
     /// `[index.commitment] enabled` is on; absent ⇒ those routes answer
@@ -206,6 +217,7 @@ pub struct EthCallBackends {
     pub code: Arc<dyn KvBackend>,
     pub storage: Arc<dyn KvBackend>,
     pub witnesses: Arc<dyn KvBackend>,
+    pub votes: Arc<dyn KvBackend>,
     pub contract_state: Arc<dyn KvBackend>,
     pub dyn_props: Arc<dyn KvBackend>,
     pub delegated_resources: Arc<dyn KvBackend>,
@@ -246,6 +258,7 @@ impl RpcState {
             eth_call_backends: None,
             index: None,
             archive: None,
+            committed_read_gate: None,
             commitment: None,
             sim: None,
             firehose: None,
@@ -325,6 +338,13 @@ impl RpcState {
     /// `/v1/archive/...` at-height read surface.
     pub fn with_archive(mut self, archive: crate::index_api::ArchiveApiState) -> Self {
         self.archive = Some(archive);
+        self
+    }
+
+    /// Use the same critical section as canonical block application. Embedded
+    /// users without a gate must serialize their writer and confirmed reads.
+    pub fn with_committed_read_gate(mut self, gate: CommittedReadGate) -> Self {
+        self.committed_read_gate = Some(gate);
         self
     }
 

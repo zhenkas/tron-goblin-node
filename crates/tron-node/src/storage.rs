@@ -1,4 +1,4 @@
-//! Per-store RocksDB instance opener.
+//! Configured per-store KV provider opener.
 //!
 //! Each chainbase store lives in its own subdirectory under
 //! `data_dir/db/<store_name>/`. This module opens every one we
@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tron_chainbase::{KvBackend, RocksDbBackend, RocksDbError, SnapshotKvBackend};
+use tron_chainbase::{KvBackend, RocksDbError, SnapshotKvBackend};
 
 /// Every on-disk backend the node needs. `Arc<dyn KvBackend>` so
 /// each store can be shared between the executor and the RPC server
@@ -87,7 +87,7 @@ pub struct OpenedStores {
     pub mempool: Arc<dyn KvBackend>,
     /// Snapshot-stack handles for every state-mutating store. Every
     /// `Arc<dyn KvBackend>` above is actually an `Arc<SnapshotKvBackend>`
-    /// whose root is the RocksDB instance; this field exposes the
+    /// whose root is the selected KV engine; this field exposes the
     /// snapshot handles so the runtime can drive `advance`/`merge`/
     /// `revoke` across all of them in lockstep. Append-only stores
     /// (blocks, block_index, transactions, tx_history, mempool, and
@@ -149,9 +149,7 @@ pub enum SnapshotReorgError {
         "snapshot drift: reorg expected to revoke block {expected} but top layer is for block {actual}"
     )]
     Drift { expected: i64, actual: i64 },
-    #[error(
-        "reorg target block {0} is past the snapshot horizon (already merged into root)"
-    )]
+    #[error("reorg target block {0} is past the snapshot horizon (already merged into root)")]
     PastHorizon(i64),
 }
 
@@ -382,9 +380,8 @@ impl SnapshotStack {
                 let _ = flush_bottom_locked(&g.backends, cp);
             } else {
                 for (_, b) in &g.backends {
-                    b.merge().expect(
-                        "db error in SnapshotStack::reorg_apply: merge bottom layer",
-                    );
+                    b.merge()
+                        .expect("db error in SnapshotStack::reorg_apply: merge bottom layer");
                 }
             }
             g.block_nums.remove(0);
@@ -399,9 +396,8 @@ impl SnapshotStack {
         let mut g = self.inner.lock().expect("snapshot stack lock poisoned");
         while !g.block_nums.is_empty() {
             for (_, b) in &g.backends {
-                b.merge().expect(
-                    "db error in SnapshotStack::merge_all: shutdown flush layer",
-                );
+                b.merge()
+                    .expect("db error in SnapshotStack::merge_all: shutdown flush layer");
             }
             g.block_nums.remove(0);
         }
@@ -478,9 +474,7 @@ pub enum ReorgFailure<E, R = ()> {
         "snapshot drift: reorg expected to revoke block {expected} but top layer is for block {actual}"
     )]
     Drift { expected: i64, actual: i64 },
-    #[error(
-        "reorg target block {0} is past the snapshot horizon (already merged into root)"
-    )]
+    #[error("reorg target block {0} is past the snapshot horizon (already merged into root)")]
     PastHorizon(i64),
     #[error("new-fork apply failed at block {failed_block}: {source}")]
     ApplyFailed {
@@ -573,17 +567,72 @@ impl OpenedStores {
         Self::open_inner(data_dir, Some((write_buffer_mb, max_open_files)))
     }
 
-    fn open_inner(
+    fn open_inner(data_dir: &Path, tuning: Option<(usize, i32)>) -> Result<Self, StorageError> {
+        let provider = tron_chainbase::KvProvider {
+            rocks_tuning: tuning,
+            ..Default::default()
+        };
+        Self::open_with_provider(data_dir, &provider)
+    }
+
+    pub fn open_configured(
         data_dir: &Path,
-        tuning: Option<(usize, i32)>,
+        config: &crate::config::StorageConfig,
     ) -> Result<Self, StorageError> {
+        Self::open_with_provider(data_dir, &config.provider()?)
+    }
+
+    pub fn open_with_provider(
+        data_dir: &Path,
+        provider: &tron_chainbase::KvProvider,
+    ) -> Result<Self, StorageError> {
+        provider.validate()?;
         let db_root = resolve_db_root(data_dir);
         std::fs::create_dir_all(&db_root).map_err(|e| StorageError::Io {
             path: db_root.clone(),
             source: e,
         })?;
 
-        let open = |name: &str| open_store(&db_root, name, tuning);
+        // Preflight all existing store directories before any schema stamp.
+        for entry in std::fs::read_dir(&db_root).map_err(|e| StorageError::Io {
+            path: db_root.clone(),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| StorageError::Io {
+                path: db_root.clone(),
+                source: e,
+            })?;
+            if entry.path().is_dir() {
+                provider.check_path(&entry.path())?;
+            }
+        }
+        // A converted execution-only dataset is useful for benchmarks, but
+        // cannot serve as a full node. Refuse it before creating absent stores
+        // or stamping schema metadata. Fresh data dirs have no persisted head.
+        let properties_path = db_root.join("properties");
+        if properties_path.join("CURRENT").exists() || properties_path.join("MANIFEST").exists() {
+            let properties = provider.open(&properties_path, "properties")?;
+            let dp = tron_chainbase::DynamicPropertiesStore::new(properties);
+            if dp.latest_block_header_number().unwrap_or(0) > 0 {
+                for name in ["block", "block-index"] {
+                    let path = db_root.join(name);
+                    let marker = match provider.engine {
+                        tron_chainbase::KvEngine::Rocksdb => "CURRENT",
+                        tron_chainbase::KvEngine::Tidesdb => "MANIFEST",
+                    };
+                    if !path.join(marker).is_file() {
+                        return Err(StorageError::Incomplete(format!(
+                            "persisted execution state is missing {name}; an execution-only conversion is not a complete node database"
+                        )));
+                    }
+                }
+            }
+        }
+        let open = |name: &str| {
+            provider
+                .open(&db_root.join(name), name)
+                .map_err(StorageError::Kv)
+        };
 
         // State-mutating stores get wrapped in `SnapshotKvBackend` so
         // every block-apply runs under a tentative-write layer that
@@ -746,6 +795,8 @@ impl OpenedStores {
             "pbft-sign-data" => &self.pbft_sign_data,
             "common-database" => &self.common_database,
             "common" => &self.common,
+            "block-undo" => &self.block_undo,
+            "mempool" => &self.mempool,
             _ => return None,
         };
         Some(be.clone())
@@ -754,6 +805,58 @@ impl OpenedStores {
     /// java `ChainBaseManager`: the node runs a LITE dataset when the
     /// lowest block in `block-index` is above 1 — the history below it
     /// was pruned (`admin db lite` / java's LiteFullNodeTool split).
+    /// Export all open ledger stores; peer/mempool state belongs to this process.
+    pub fn export_checkpoints(&self, destination: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+        for name in [
+            "account",
+            "account-asset",
+            "witness",
+            "votes",
+            "delegation",
+            "DelegatedResource",
+            "DelegatedResourceAccountIndex",
+            "properties",
+            "proposal",
+            "accountid-index",
+            "account-index",
+            "asset-issue",
+            "asset-issue-v2",
+            "contract",
+            "abi",
+            "exchange",
+            "exchange-v2",
+            "market_order",
+            "market_account",
+            "market_pair_to_price",
+            "market_pair_price_to_order",
+            "nullifier",
+            "IncrementalMerkleTree",
+            "code",
+            "storage-row",
+            "contract-state",
+            "block-index",
+            "block",
+            "trans",
+            "transactionHistoryStore",
+            "transactionRetStore",
+            "balance-trace",
+            "witness_schedule",
+            "reward-vi",
+            "pbft-sign-data",
+            "common-database",
+            "block-undo",
+        ] {
+            let backend = self
+                .backend_for_store_name(name)
+                .ok_or("checkpoint store missing")?;
+            backend
+                .checkpoint_to(&destination.join(name))
+                .map_err(|e| format!("{name}: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub fn is_lite_node(&self) -> bool {
         match self.block_index.scan_from(&[], 1) {
             Ok(rows) => match rows.first() {
@@ -847,6 +950,7 @@ impl OpenedStores {
             code: self.code.clone(),
             storage: self.storage_row.clone(),
             witnesses: self.witnesses.clone(),
+            votes: self.votes.clone(),
             contract_state: self.contract_state.clone(),
             dyn_props: self.dyn_props.clone(),
             delegated_resources: self.delegated_resources.clone(),
@@ -862,35 +966,6 @@ impl OpenedStores {
     }
 }
 
-fn open_store(
-    root: &Path,
-    name: &str,
-    tuning: Option<(usize, i32)>,
-) -> Result<Arc<dyn KvBackend>, StorageError> {
-    let path = root.join(name);
-    // java-tron writes a few stores (today just `market_pair_price_to_order`)
-    // with a custom RocksDB comparator whose name is recorded in the MANIFEST;
-    // a default-comparator open is refused. `comparator_for_store` is the
-    // single registry every open path consults so they can't drift.
-    let result = match tron_chainbase::comparator_for_store(name) {
-        Some((cmp_name, cmp_fn)) => {
-            RocksDbBackend::open_with_comparator(&path, tuning, cmp_name, cmp_fn)
-        }
-        None => match tuning {
-            Some((write_buffer_mb, max_open_files)) => {
-                RocksDbBackend::open_tuned(&path, write_buffer_mb, max_open_files)
-            }
-            None => RocksDbBackend::open(&path),
-        },
-    };
-    result
-        .map(|b| Arc::new(b) as Arc<dyn KvBackend>)
-        .map_err(|e| StorageError::Open {
-            path,
-            source: e,
-        })
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("create dir {path:?}: {source}")]
@@ -899,15 +974,16 @@ pub enum StorageError {
         source: std::io::Error,
     },
     #[error("open RocksDB {path:?}: {source:?}")]
-    Open {
-        path: PathBuf,
-        source: RocksDbError,
-    },
+    Open { path: PathBuf, source: RocksDbError },
+    #[error("incomplete node database: {0}")]
+    Incomplete(String),
     #[error("store error: {0}")]
     Store(#[from] tron_chainbase::StoreError),
     #[error("kv backend error: {0}")]
     Kv(#[from] tron_chainbase::KvError),
-    #[error("incompatible chainbase schema version: on-disk {found}, this binary expects {expected}")]
+    #[error(
+        "incompatible chainbase schema version: on-disk {found}, this binary expects {expected}"
+    )]
     SchemaVersion { found: i64, expected: i64 },
 }
 

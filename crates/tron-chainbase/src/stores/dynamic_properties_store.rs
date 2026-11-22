@@ -344,6 +344,38 @@ impl DynamicPropertiesStore {
         self.put_long(keys::GENESIS_BLOCK_TIMESTAMP, t);
     }
 
+    /// java `DynamicPropertiesStore.applyBlock(fillBlock)`: record one
+    /// production slot in the 128-slot ring `BLOCK_FILLED_SLOTS` (ASCII
+    /// digits, one per slot) and advance `BLOCK_FILLED_SLOTS_INDEX`
+    /// (4-byte big-endian). `missed` empty slots precede the filled one,
+    /// exactly as `StatisticManager.applyBlock` walks them. A store without
+    /// the two rows (java writes them at genesis) is left alone.
+    pub fn apply_block_filled_slots(&self, missed: u64) {
+        let (Some(mut slots), Some(index)) =
+            (self.get_bytes(b"BLOCK_FILLED_SLOTS"), self.get_bytes(b"BLOCK_FILLED_SLOTS_INDEX"))
+        else {
+            return;
+        };
+        let Ok(index) = <[u8; 4]>::try_from(index.as_slice()) else {
+            return;
+        };
+        let len = slots.len();
+        if len == 0 {
+            return;
+        }
+        let mut at = (i32::from_be_bytes(index).max(0) as usize) % len;
+        // More than a full ring of misses overwrites every slot once.
+        for _ in 0..missed.min(len as u64) {
+            slots[at] = b'0';
+            at = (at + 1) % len;
+        }
+        at = (at + (missed.saturating_sub(len as u64) % len as u64) as usize) % len;
+        slots[at] = b'1';
+        at = (at + 1) % len;
+        self.put_bytes(b"BLOCK_FILLED_SLOTS", &slots);
+        self.put_bytes(b"BLOCK_FILLED_SLOTS_INDEX", &(at as i32).to_be_bytes());
+    }
+
     /// `state_flag`: `1` iff the LATEST applied block crossed a
     /// maintenance boundary (java's `saveStateFlag`, written by
     /// `MaintenanceManager.applyBlock` on every block). Read by the
@@ -1207,5 +1239,51 @@ mod adaptive_default_tests {
         assert_eq!(d.memo_fee_history(), "0:0");
         d.save_memo_fee_history("0:0,1700000000000:1000000");
         assert_eq!(d.memo_fee_history(), "0:0,1700000000000:1000000");
+    }
+}
+
+#[cfg(test)]
+mod filled_slots_tests {
+    use super::*;
+    use crate::MemBackend;
+    use std::sync::Arc;
+
+    fn dp() -> DynamicPropertiesStore {
+        DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>)
+    }
+
+    /// The ring as java-tron keeps it: one ASCII digit per slot, the index
+    /// as a 4-byte big-endian int, empty slots written before the block's.
+    #[test]
+    fn ring_records_missed_slots_then_the_block_and_wraps() {
+        let dp = dp();
+        dp.put_bytes(b"BLOCK_FILLED_SLOTS", &[b'1'; 128]);
+        dp.put_bytes(b"BLOCK_FILLED_SLOTS_INDEX", &126i32.to_be_bytes());
+
+        dp.apply_block_filled_slots(0);
+        assert_eq!(dp.get_bytes(b"BLOCK_FILLED_SLOTS").unwrap(), vec![b'1'; 128]);
+        assert_eq!(dp.get_bytes(b"BLOCK_FILLED_SLOTS_INDEX").unwrap(), 127i32.to_be_bytes());
+
+        // Two missed slots (127 and, after the wrap, 0), then the block at 1.
+        dp.apply_block_filled_slots(2);
+        let slots = dp.get_bytes(b"BLOCK_FILLED_SLOTS").unwrap();
+        assert_eq!((slots[127], slots[0], slots[1], slots[2]), (b'0', b'0', b'1', b'1'));
+        assert_eq!(dp.get_bytes(b"BLOCK_FILLED_SLOTS_INDEX").unwrap(), 2i32.to_be_bytes());
+
+        // A gap longer than the ring empties it and lands where java's
+        // slot-by-slot walk would.
+        dp.apply_block_filled_slots(128 + 5);
+        let slots = dp.get_bytes(b"BLOCK_FILLED_SLOTS").unwrap();
+        assert_eq!(slots.iter().filter(|s| **s == b'1').count(), 1);
+        assert_eq!(slots[7], b'1');
+        assert_eq!(dp.get_bytes(b"BLOCK_FILLED_SLOTS_INDEX").unwrap(), 8i32.to_be_bytes());
+    }
+
+    #[test]
+    fn store_without_the_ring_is_left_alone() {
+        let dp = dp();
+        dp.apply_block_filled_slots(3);
+        assert!(dp.get_bytes(b"BLOCK_FILLED_SLOTS").is_none());
+        assert!(dp.get_bytes(b"BLOCK_FILLED_SLOTS_INDEX").is_none());
     }
 }

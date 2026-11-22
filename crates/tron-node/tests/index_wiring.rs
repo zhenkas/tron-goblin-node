@@ -509,7 +509,12 @@ fn applied_blocks_archive_historical_state_exactly() {
         ],
     ));
     writer.check_or_init().unwrap();
-    let hook = Arc::new(IndexHook::new(mem()).with_archive(writer.clone()));
+    let fh_dir = tempfile::tempdir().unwrap();
+    let receipts = mem();
+    let firehose = Arc::new(tron_node::firehose::FirehoseWriter::open(
+        fh_dir.path(), u64::MAX, blocks_be.clone(), mem(),
+        receipts.clone(), state.dyn_props.clone()).unwrap());
+    let hook = Arc::new(IndexHook::new(receipts).with_archive(writer.clone()).with_firehose(firehose));
 
     let cfg = SyncConfig {
         peers: vec![],
@@ -610,6 +615,29 @@ fn applied_blocks_archive_historical_state_exactly() {
     // → exactly 800_000 when no other fees apply.
     assert!(alice_1 <= 900_000 && alice_1 >= 800_000, "alice at h1: {alice_1}");
     assert!(alice_2 <= alice_1 - 50_000, "alice at h2: {alice_2}");
+
+    // The same committed execution report feeds Firehose native balances.
+    // Compare sender fees, a newly created recipient and an empty block against
+    // the independent exact-height account view, without reconstructing amounts.
+    let frames = tron_index::FirehoseLogReader::new(fh_dir.path().to_path_buf())
+        .read_from(1, 10).unwrap();
+    assert_eq!(frames.len(), 3);
+    for (i, (_, bytes)) in frames.iter().enumerate() {
+        let entry = tron_grpc::firehose_proto::Entry::decode(bytes.as_slice()).unwrap();
+        let Some(tron_grpc::firehose_proto::entry::Event::Apply(event)) = entry.event else { panic!() };
+        assert!(event.trx_balances_complete);
+        let h = i as i64 + 1;
+        for who in [alice, bob] {
+            let before = balance_at(who, h - 1).unwrap_or(0);
+            let after = balance_at(who, h).unwrap_or(0);
+            let row = event.trx_balance_changes.iter().find(|r| r.address == who);
+            if before == after { assert!(row.is_none()); }
+            else {
+                let row = row.expect("changed account must be present");
+                assert_eq!((row.balance_before, row.balance_after), (before, after));
+            }
+        }
+    }
 
     // The archived dyn-props give each height's own head pointer —
     // what makes constant-calls-at-H see block H's number/timestamp.

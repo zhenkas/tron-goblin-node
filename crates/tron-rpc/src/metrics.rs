@@ -21,6 +21,7 @@ use std::time::Instant;
 /// Cloneable handle to the node's metrics. `Arc<Metrics>` is what
 /// every subsystem holds.
 pub struct Metrics {
+    processing_text: Mutex<String>,
     started_at: Instant,
     // --- Chain head (gauges) ----------------------------------------------
     head_block_number: AtomicI64,
@@ -122,6 +123,7 @@ impl Default for Metrics {
 impl Metrics {
     pub fn new() -> Self {
         Self {
+            processing_text: Mutex::new(String::new()),
             started_at: Instant::now(),
             head_block_number: AtomicI64::new(0),
             solidified_block_number: AtomicI64::new(0),
@@ -190,6 +192,10 @@ impl Metrics {
             sim_selfchecks_total: AtomicU64::new(0),
             sim_selfcheck_mismatches_total: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_processing_metrics(&self, text: String) {
+        *self.processing_text.lock().expect("processing metrics") = text;
     }
 
     pub fn new_arc() -> Arc<Self> {
@@ -271,8 +277,7 @@ impl Metrics {
         self.mempool_accepted.fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_mempool_evicted_expired(&self, n: u64) {
-        self.mempool_evicted_expired
-            .fetch_add(n, Ordering::Relaxed);
+        self.mempool_evicted_expired.fetch_add(n, Ordering::Relaxed);
     }
     pub fn record_mempool_rejected(&self, reason: &str) {
         let mut by = self.mempool_rejected_by_reason.lock().unwrap();
@@ -310,7 +315,8 @@ impl Metrics {
     pub fn record_sim_self_check(&self, mismatched: bool) {
         self.sim_selfchecks_total.fetch_add(1, Ordering::Relaxed);
         if mismatched {
-            self.sim_selfcheck_mismatches_total.fetch_add(1, Ordering::Relaxed);
+            self.sim_selfcheck_mismatches_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -396,19 +402,25 @@ impl Metrics {
         reorg_rows_deleted: u64,
         missing_txinfo_blocks: u64,
     ) {
-        self.index_cursor_block_number.store(cursor, Ordering::Relaxed);
-        self.index_indexed_from_block_number.store(indexed_from, Ordering::Relaxed);
-        self.index_floor_block_number.store(floor, Ordering::Relaxed);
+        self.index_cursor_block_number
+            .store(cursor, Ordering::Relaxed);
+        self.index_indexed_from_block_number
+            .store(indexed_from, Ordering::Relaxed);
+        self.index_floor_block_number
+            .store(floor, Ordering::Relaxed);
         self.index_lag_blocks.store(lag, Ordering::Relaxed);
         self.index_backfill_complete
             .store(backfill_complete as i64, Ordering::Relaxed);
-        self.index_blocks_indexed.store(blocks_indexed, Ordering::Relaxed);
+        self.index_blocks_indexed
+            .store(blocks_indexed, Ordering::Relaxed);
         self.index_rows_native.store(rows_native, Ordering::Relaxed);
         self.index_rows_trc20.store(rows_trc20, Ordering::Relaxed);
         self.index_rows_trc721.store(rows_trc721, Ordering::Relaxed);
-        self.index_rows_internal.store(rows_internal, Ordering::Relaxed);
+        self.index_rows_internal
+            .store(rows_internal, Ordering::Relaxed);
         self.index_rows_logs.store(rows_logs, Ordering::Relaxed);
-        self.index_reorg_unwinds.store(reorg_unwinds, Ordering::Relaxed);
+        self.index_reorg_unwinds
+            .store(reorg_unwinds, Ordering::Relaxed);
         self.index_reorg_rows_deleted
             .store(reorg_rows_deleted, Ordering::Relaxed);
         self.index_missing_txinfo_blocks
@@ -433,7 +445,8 @@ impl Metrics {
         self.archive_head.store(head, Ordering::Relaxed);
         self.archive_blocks_total.store(blocks, Ordering::Relaxed);
         self.archive_entries_total.store(entries, Ordering::Relaxed);
-        self.archive_reorg_unwinds.store(reorg_unwinds, Ordering::Relaxed);
+        self.archive_reorg_unwinds
+            .store(reorg_unwinds, Ordering::Relaxed);
         self.archive_gap_repaired_blocks
             .store(gap_repaired_blocks, Ordering::Relaxed);
         self.archive_coverage_resets
@@ -452,25 +465,24 @@ impl Metrics {
     ) {
         self.commitment_committed_height
             .store(committed_height, Ordering::Relaxed);
-        self.commitment_head_height.store(head_height, Ordering::Relaxed);
-        self.commitment_blocks_folded.store(blocks_folded, Ordering::Relaxed);
+        self.commitment_head_height
+            .store(head_height, Ordering::Relaxed);
+        self.commitment_blocks_folded
+            .store(blocks_folded, Ordering::Relaxed);
         self.commitment_lagged.store(lagged, Ordering::Relaxed);
-        self.commitment_pending_depth.store(pending_depth, Ordering::Relaxed);
+        self.commitment_pending_depth
+            .store(pending_depth, Ordering::Relaxed);
         self.commitment_bootstrapping
             .store(bootstrapping as u64, Ordering::Relaxed);
     }
 
     /// Mirror of the firehose writer's counters (stored, not added).
-    pub fn set_firehose_stats(
-        &self,
-        head_seq: u64,
-        entries: u64,
-        unwinds: u64,
-        gap_repaired: u64,
-    ) {
+    pub fn set_firehose_stats(&self, head_seq: u64, entries: u64, unwinds: u64, gap_repaired: u64) {
         self.firehose_head_seq.store(head_seq, Ordering::Relaxed);
-        self.firehose_entries_total.store(entries, Ordering::Relaxed);
-        self.firehose_unwinds_total.store(unwinds, Ordering::Relaxed);
+        self.firehose_entries_total
+            .store(entries, Ordering::Relaxed);
+        self.firehose_unwinds_total
+            .store(unwinds, Ordering::Relaxed);
         self.firehose_gap_repaired_total
             .store(gap_repaired, Ordering::Relaxed);
     }
@@ -487,11 +499,17 @@ impl Metrics {
         let mut out = String::with_capacity(2048);
 
         // --- Uptime ---
-        let _ = std::fmt::Write::write_str(&mut out, "\
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "\
 # HELP tron_node_uptime_seconds Seconds since the node process started.
 # TYPE tron_node_uptime_seconds counter
-");
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("tron_node_uptime_seconds {uptime}\n"));
+",
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("tron_node_uptime_seconds {uptime}\n"),
+        );
 
         // --- Chain head gauges ---
         emit_gauge(
@@ -586,7 +604,8 @@ impl Metrics {
             &mut out,
             "tron_node_blocks_rejected_solidified_diverged_total",
             "Head-promotion attempts rejected because the fork diverges from latest solidified.",
-            self.blocks_rejected_solidified_diverged.load(Ordering::Relaxed),
+            self.blocks_rejected_solidified_diverged
+                .load(Ordering::Relaxed),
         );
 
         // --- SR (block production) ---
@@ -642,10 +661,13 @@ impl Metrics {
             "Pending transactions removed because their expiration passed.",
             self.mempool_evicted_expired.load(Ordering::Relaxed),
         );
-        let _ = std::fmt::Write::write_str(&mut out, "\
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "\
 # HELP tron_node_mempool_rejected_by_reason_total Mempool submissions rejected, labelled by reason.
 # TYPE tron_node_mempool_rejected_by_reason_total counter
-");
+",
+        );
         let mp_rej = self.mempool_rejected_by_reason.lock().unwrap();
         for (reason, count) in mp_rej.iter() {
             let _ = std::fmt::Write::write_fmt(
@@ -688,10 +710,13 @@ impl Metrics {
         );
 
         // Per-method requests + errors (labelled).
-        let _ = std::fmt::Write::write_str(&mut out, "\
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "\
 # HELP tron_node_rpc_requests_by_method_total JSON-RPC requests served, labelled by method.
 # TYPE tron_node_rpc_requests_by_method_total counter
-");
+",
+        );
         let by = self.rpc_requests_by_method.lock().unwrap();
         for (method, count) in by.iter() {
             let _ = std::fmt::Write::write_fmt(
@@ -705,10 +730,13 @@ impl Metrics {
         }
         drop(by);
 
-        let _ = std::fmt::Write::write_str(&mut out, "\
+        let _ = std::fmt::Write::write_str(
+            &mut out,
+            "\
 # HELP tron_node_rpc_errors_by_method_total JSON-RPC errors served, labelled by method.
 # TYPE tron_node_rpc_errors_by_method_total counter
-");
+",
+        );
         let err = self.rpc_errors_by_method.lock().unwrap();
         for (method, count) in err.iter() {
             let _ = std::fmt::Write::write_fmt(
@@ -966,6 +994,7 @@ impl Metrics {
                 .unwrap_or(0),
         );
 
+        out.push_str(&self.processing_text.lock().expect("processing metrics"));
         out
     }
 }
@@ -1032,8 +1061,15 @@ mod tests {
         assert!(by.len() <= cap + 1, "requests map unbounded: {}", by.len());
         assert!(err.len() <= cap + 1, "errors map unbounded: {}", err.len());
         assert!(by.contains_key("other"), "overflow must fold into 'other'");
-        assert!(*by.get("other").unwrap() >= 50, "other bucket holds overflow");
-        assert_eq!(*by.get("m0").unwrap(), 1, "early method keeps its own entry");
+        assert!(
+            *by.get("other").unwrap() >= 50,
+            "other bucket holds overflow"
+        );
+        assert_eq!(
+            *by.get("m0").unwrap(),
+            1,
+            "early method keeps its own entry"
+        );
     }
 
     #[test]
@@ -1057,7 +1093,10 @@ mod tests {
             .find(|l| l.starts_with("tron_node_consensus_divergences_total "))
             .expect("divergences metric line present");
         let n: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
-        assert!(n >= 1, "divergence count should be >= 1 after record, got {n}");
+        assert!(
+            n >= 1,
+            "divergence count should be >= 1 after record, got {n}"
+        );
     }
 
     #[test]
@@ -1081,12 +1120,10 @@ mod tests {
         assert!(text.contains("tron_node_sync_blocks_applied_total 3"));
         assert!(text.contains("tron_node_sync_peer_failures_total 1"));
         assert!(text.contains("tron_node_rpc_requests_total 3"));
-        assert!(text.contains(
-            "tron_node_rpc_requests_by_method_total{method=\"eth_blockNumber\"} 2"
-        ));
-        assert!(text.contains(
-            "tron_node_rpc_errors_by_method_total{method=\"eth_call\"} 1"
-        ));
+        assert!(
+            text.contains("tron_node_rpc_requests_by_method_total{method=\"eth_blockNumber\"} 2")
+        );
+        assert!(text.contains("tron_node_rpc_errors_by_method_total{method=\"eth_call\"} 1"));
     }
 
     #[test]
@@ -1140,11 +1177,7 @@ mod tests {
         assert!(text.contains("tron_node_active_peers 7"));
         assert!(text.contains("tron_node_mempool_accepted_total 2"));
         assert!(text.contains("tron_node_mempool_evicted_expired_total 3"));
-        assert!(text.contains(
-            "tron_node_mempool_rejected_by_reason_total{reason=\"duplicate\"} 2"
-        ));
-        assert!(text.contains(
-            "tron_node_mempool_rejected_by_reason_total{reason=\"expired\"} 1"
-        ));
+        assert!(text.contains("tron_node_mempool_rejected_by_reason_total{reason=\"duplicate\"} 2"));
+        assert!(text.contains("tron_node_mempool_rejected_by_reason_total{reason=\"expired\"} 1"));
     }
 }

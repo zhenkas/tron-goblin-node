@@ -1776,6 +1776,9 @@ fn encode_account_for_rpc(a: &tron_proto::Account, genesis_ms: i64) -> Value {
     // presentation step (the stored list only carries actually-frozen
     // resources). Emit it the same way so the field matches byte-for-byte.
     m.insert("frozenV2".into(), json!(normalized_frozen_v2_json(a)));
+    if !a.unfrozen_v2.is_empty() {
+        m.insert("unfrozenV2".into(), json!(a.unfrozen_v2.iter().map(unfreeze_v2_json).collect::<Vec<_>>()));
+    }
     if !a.frozen_supply.is_empty() {
         m.insert("frozen_supply".into(), json!(a.frozen_supply.iter().map(frozen_json).collect::<Vec<_>>()));
     }
@@ -1852,6 +1855,20 @@ fn frozen_json(f: &tron_proto::account::Frozen) -> Value {
     }
     if f.expire_time != 0 {
         m.insert("expire_time".into(), json!(f.expire_time));
+    }
+    Value::Object(m)
+}
+
+fn unfreeze_v2_json(f: &tron_proto::account::UnFreezeV2) -> Value {
+    let mut m = serde_json::Map::new();
+    if f.r#type != 0 {
+        m.insert("type".into(), json!(resource_code_name(f.r#type)));
+    }
+    if f.unfreeze_amount != 0 {
+        m.insert("unfreeze_amount".into(), json!(f.unfreeze_amount));
+    }
+    if f.unfreeze_expire_time != 0 {
+        m.insert("unfreeze_expire_time".into(), json!(f.unfreeze_expire_time));
     }
     Value::Object(m)
 }
@@ -2007,7 +2024,7 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
     use std::sync::Arc;
     use tron_chainbase::{
         AccountStore, CodeStore, ContractStateStore, ContractStore, DelegatedResourceStore,
-        DelegationStore, DynamicPropertiesStore, SessionBackend, StorageRowStore, WitnessStore,
+        DelegationStore, DynamicPropertiesStore, SessionBackend, StorageRowStore, VotesStore, WitnessStore,
     };
     let session = |be: &Arc<dyn tron_chainbase::KvBackend>| {
         Arc::new(SessionBackend::new(be.clone())) as Arc<dyn tron_chainbase::KvBackend>
@@ -2030,10 +2047,10 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
             .as_ref()
             .map(|bi| Arc::new(tron_chainbase::BlockIndexStore::new(session(bi)))),
         contracts: Some(Arc::new(ContractStore::new(session(&b.contracts)))),
-        // Read-only call paths (`eth_call`, `debug_traceCall`,
-        // `triggerConstantContract`) don't exercise VOTEWITNESS —
-        // leave `votes` unset so the bridge returns 0 if hit.
-        votes: None,
+        // Simulate native voting against this request's overlay too. The VM may
+        // update votes/accounts/reward markers, but dropping these sessions must
+        // never persist those changes to the selected latest/solid/archive view.
+        votes: Some(Arc::new(VotesStore::new(session(&b.votes)))),
         // Constant calls CAN hit the RewardBalance precompile; the
         // eth-call backends don't carry reward-vi today — acceptable
         // for read-only paths (no consensus impact).
@@ -3110,26 +3127,29 @@ pub fn get_transaction_info_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcE
     }
     let mut tx_id = [0u8; 32];
     tx_id.copy_from_slice(&bytes);
-    // Primary: the tx-id-keyed history store (java-tron's
-    // transactionHistoryStore, populated by snapshots).
+    Ok(transaction_info(&tx_id, s)
+        .map(|info| encode_transaction_info(&info))
+        .unwrap_or(Value::Null))
+}
+
+/// Locate a receipt without assuming the optional tx-id history index exists.
+fn transaction_info(tx_id: &[u8; 32], s: &RpcState) -> Option<tron_proto::TransactionInfo> {
     if let Some(history) = &s.tx_history {
-        if let Ok(Some(info)) = history.get(&tx_id) {
-            return Ok(encode_transaction_info(&info));
+        if let Ok(Some(info)) = history.get(tx_id) {
+            return Some(info);
         }
     }
-    // Fallback: the block-keyed transactionRetStore, written at every
-    // apply when [index] is enabled. The tx's stored block-ref tells
-    // us which block's receipt list to search.
     if let (Some(ret_store), Ok(Some(tron_chainbase::StoredTransaction::BlockRef(num)))) =
-        (&s.transaction_ret, s.transactions.get(&tx_id))
+        (&s.transaction_ret, s.transactions.get(tx_id))
     {
         if let Ok(Some(ret)) = ret_store.get(num) {
-            if let Some(info) = ret.transactioninfo.iter().find(|i| i.id == tx_id) {
-                return Ok(encode_transaction_info(info));
-            }
+            return ret
+                .transactioninfo
+                .into_iter()
+                .find(|info| info.id == tx_id);
         }
     }
-    Ok(Value::Null)
+    None
 }
 
 /// `getTransactionInfoByBlockNum(num)` — all receipts in the block.
@@ -3470,6 +3490,18 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// `VMActuator.validate` (`maxEnergyLimit = min(maxEnergyLimitForConstant,
 /// feeLimit / energyFee)`). An explicit `gas`/`energy_limit` (eth-style)
 /// is honoured but still capped to the constant-call ceiling.
+fn tron_calldata(obj: &serde_json::Map<String, Value>) -> Result<Vec<u8>, RpcError> {
+    fn decode(s: &str) -> Result<Vec<u8>, RpcError> {
+        hex::decode(s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s))
+            .map_err(|e|RpcError::invalid_params(format!("invalid calldata hex: {e}")))
+    }
+    if let Some(sig)=obj.get("function_selector").and_then(Value::as_str) {
+        let mut data=keccak256(sig.trim().as_bytes())[..4].to_vec();
+        if let Some(p)=obj.get("parameter").and_then(Value::as_str) {data.extend(decode(p)?);}
+        Ok(data)
+    } else {decode(obj.get("data").or_else(||obj.get("input")).and_then(Value::as_str).unwrap_or(""))}
+}
+
 fn parse_constant_call_request(
     p: &Value,
     max_energy_for_constant: u64,
@@ -3511,33 +3543,8 @@ fn parse_constant_call_request(
         }
     };
 
-    // Calldata: prefer `function_selector` (+ optional `parameter`),
-    // else fall back to raw `data`/`input` hex. `data`/`parameter` are
-    // decoded leniently (with or without a `0x` prefix) because java-tron's
-    // HTTP API sends bare hex while eth-style callers send `0x...`.
-    fn decode_hex_lenient(s: &str) -> Result<Vec<u8>, RpcError> {
-        let s = s.trim();
-        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-        if s.is_empty() {
-            return Ok(Vec::new());
-        }
-        hex::decode(s).map_err(|e| RpcError::invalid_params(format!("invalid hex: {e}")))
-    }
-    let data = if let Some(sig) = obj.get("function_selector").and_then(|v| v.as_str()) {
-        let selector = keccak256(sig.trim().as_bytes());
-        let mut d = selector[..4].to_vec();
-        if let Some(param) = obj.get("parameter").and_then(|v| v.as_str()) {
-            d.extend_from_slice(&decode_hex_lenient(param)?);
-        }
-        d
-    } else {
-        match obj.get("data").or_else(|| obj.get("input")).and_then(|v| v.as_str()) {
-            Some(sx) => decode_hex_lenient(sx)?,
-            None => Vec::new(),
-        }
-    };
+    let data = tron_calldata(obj)?;
 
-    // `value` may be eth-style hex or java-style `call_value` integer.
     let value = if let Some(s) = obj.get("value").and_then(|v| v.as_str()) {
         parse_hex_quantity(s)? as i64
     } else if let Some(n) = obj.get("call_value").and_then(|v| v.as_i64()) {
@@ -4009,6 +4016,36 @@ pub fn eth_send_raw_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, Rpc
 
 /// `broadcastTransaction(txObject)` — TRON-form transaction submission.
 /// Returns the TRON-style result envelope `{result, txid, code}`.
+/// Convert a signed TronWeb envelope to the FULL Transaction wire message.
+/// raw_data_hex is only Transaction.raw; treating it as Transaction drops signatures.
+fn broadcast_wire(value: &Value) -> Result<Vec<u8>, RpcError> {
+    if let Some(s) = value.as_str() { return parse_hex_bytes(s); }
+    let obj = value.as_object().ok_or_else(|| RpcError::invalid_params("missing transaction"))?;
+    let decode = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s))
+        .map_err(|e| RpcError::invalid_params(format!("bad transaction hex: {e}")));
+    let encoded = decode(obj.get("raw_data_hex").and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing raw_data_hex on transaction object"))?)?;
+    let raw = tron_proto::transaction::Raw::decode(encoded.as_slice())
+        .map_err(|e| RpcError::invalid_params(format!("bad transaction raw_data: {e}")))?;
+    if raw.encode_to_vec() != encoded {
+        return Err(RpcError::invalid_params("non-canonical raw_data wire encoding"));
+    }
+    if let Some(id) = obj.get("txID").and_then(Value::as_str) {
+        if decode(id)? != tron_crypto::hash::sha256(&encoded) {
+            return Err(RpcError::invalid_params("txID does not match raw_data_hex"));
+        }
+    }
+    let signatures = obj.get("signature").and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid_params("missing transaction signatures"))?;
+    if signatures.is_empty() { return Err(RpcError::invalid_params("missing transaction signatures")); }
+    let signatures = signatures.iter().map(|s| {
+        let bytes = decode(s.as_str().ok_or_else(|| RpcError::invalid_params("invalid signature"))?)?;
+        if bytes.len() != 65 { return Err(RpcError::invalid_params("signature must contain 65 bytes")); }
+        Ok(bytes)
+    }).collect::<Result<Vec<_>, RpcError>>()?;
+    Ok(tron_proto::Transaction { raw_data: Some(raw), signature: signatures, ..Default::default() }.encode_to_vec())
+}
+
 pub fn broadcast_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(mempool) = &s.mempool else {
         return Ok(json!({
@@ -4017,22 +4054,7 @@ pub fn broadcast_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, RpcErr
             "message": "broadcastTransaction not supported on this node (no mempool attached)",
         }));
     };
-    // Two accepted forms: a TRON-style transaction object (we
-    // round-trip through protobuf), or a hex-encoded raw payload.
-    let raw = if let Some(s) = p.get(0).and_then(|v| v.as_str()) {
-        parse_hex_bytes(s)?
-    } else if let Some(obj) = p.get(0).and_then(|v| v.as_object()) {
-        // Accept a {raw_data_hex: "..."} envelope as a convenience.
-        let raw_str = obj
-            .get("raw_data_hex")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError::invalid_params(
-                "missing raw_data_hex on transaction object",
-            ))?;
-        parse_hex_bytes(raw_str)?
-    } else {
-        return Err(RpcError::invalid_params("missing transaction"));
-    };
+    let raw = broadcast_wire(p.get(0).ok_or_else(|| RpcError::invalid_params("missing transaction"))?)?;
     match mempool.submit_tron(&raw) {
         crate::mempool::SubmitOutcome::Accepted(tx_id) => Ok(json!({
             "result": true,
@@ -6250,10 +6272,10 @@ pub fn get_approved_list(p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
     })?;
     Ok(json!({
         "approved_list": signers.iter().map(|a| hex_bytes(a.as_bytes())).collect::<Vec<_>>(),
-        "transaction": {
-            "txID": hex_bytes(&tx_id),
-            "signature_count": tx.signature.len(),
-        },
+        "transaction": crate::transaction_json::extension(
+            &tx, &bytes, &tx_id,
+            p.get(0).and_then(|v| v.get("visible")).and_then(Value::as_bool).unwrap_or(false),
+        )?,
         "result": { "code": "SUCCESS" },
     }))
 }
@@ -6264,7 +6286,7 @@ pub fn get_approved_list(p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
 pub fn get_sign_weight(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let (tx, bytes) = parse_tx_param_with_bytes(p)?;
     let tx_id = submitted_tx_id(&tx, &bytes)?;
-    let info = tron_actuator::permission::compute_sign_weight(&s.accounts, &s.dyn_props, &tx)
+    let info = tron_actuator::permission::compute_sign_weight_with_id(&s.accounts, &s.dyn_props, &tx, &tx_id)
         .map_err(|e| RpcError::internal(format!("sign weight: {e}")))?;
     Ok(json!({
         "permission": {
@@ -6285,10 +6307,10 @@ pub fn get_sign_weight(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             "code": info.code.as_str(),
             "message": info.message,
         },
-        "transaction": {
-            "txID": hex_bytes(&tx_id),
-            "signature_count": tx.signature.len(),
-        },
+        "transaction": crate::transaction_json::extension(
+            &tx, &bytes, &tx_id,
+            p.get(0).and_then(|v| v.get("visible")).and_then(Value::as_bool).unwrap_or(false),
+        )?,
     }))
 }
 
@@ -6299,10 +6321,15 @@ pub fn get_sign_weight(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// (java hashes the original `raw_data` bytes; a prost re-encode drops
 /// unknown fields).
 fn parse_tx_param_with_bytes(p: &Value) -> Result<(tron_proto::Transaction, Vec<u8>), RpcError> {
+    if let Some(value) = p.get(0).filter(|v| v.is_object()) {
+        let tx = crate::transaction_json::from_json(value)?;
+        let bytes = tx.encode_to_vec();
+        return Ok((tx, bytes));
+    }
     let raw_str = p
         .get(0)
         .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing tx hex"))?;
+        .ok_or_else(|| RpcError::invalid_params("missing tx hex or transaction JSON"))?;
     let bytes = parse_hex_bytes(raw_str)?;
     let tx = tron_proto::Transaction::decode(bytes.as_slice())
         .map_err(|e| RpcError::invalid_params(format!("decode transaction: {e}")))?;
@@ -6328,157 +6355,198 @@ fn submitted_tx_id(tx: &tron_proto::Transaction, bytes: &[u8]) -> Result<[u8; 32
 // block-keyed reads this is a real difference; the solidified variant
 // is what wallets use for confirmed-only queries.
 //
-// **Divergence note**: java-tron maintains a separate solidified-state
-// snapshot of the account/asset/etc. stores so non-block reads
-// (`getAccount`, `getContract`, etc.) return historical values too.
-// We don't maintain that separate snapshot — only block-keyed reads
-// are genuinely clamped here. Non-block-keyed solidified methods are
-// aliased to the live variant with a `solidified: false` flag in the
-// response so clients can detect it.
+// Account/resource reads require archive coverage. Returning latest state from
+// a confirmed-only endpoint is unsafe; unavailable coverage is an explicit error.
 
-/// Resolve "head" for the solidified namespace to
-/// `LATEST_SOLIDIFIED_BLOCK_NUM`. Falls back to current head if the
-/// pointer hasn't been written yet (a single-node chain that never
-/// reaches 2/3-threshold solidification — common in tests).
-fn solidified_head(s: &RpcState) -> i64 {
+/// The confirmed namespace never falls back to an unconfirmed latest head.
+pub(crate) fn solidified_head(s: &RpcState) -> i64 {
     s.dyn_props
         .latest_solidified_block_num()
-        .unwrap_or_else(|| s.dyn_props.latest_block_header_number().unwrap_or(0))
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// Hold the runtime's apply gate across the full confirmed operation.
+pub(crate) fn with_committed_state(
+    s: &RpcState,
+    mut read: impl FnMut() -> Result<Value, RpcError>,
+) -> Result<Value, RpcError> {
+    match &s.committed_read_gate {
+        Some(gate) => gate(&mut read),
+        None => read(),
+    }
+}
+
+/// Build and consume an at-solid-height state inside the committed-read gate.
+fn solidified_state(
+    s: &RpcState,
+    required: &[tron_chainbase::UndoStoreId],
+    mut read: impl FnMut(&RpcState) -> Result<Value, RpcError>,
+) -> Result<Value, RpcError> {
+    with_committed_state(s, || {
+        let height = solidified_head(s);
+        let archive = s.archive.as_ref().ok_or_else(|| {
+            RpcError::internal("solidified state unavailable: enable index.capture_state_deltas")
+        })?;
+        let latest = s.dyn_props.latest_block_header_number().unwrap_or(0);
+        if !matches!(archive.coverage(), Some((_, captured)) if captured >= latest) {
+            return Err(RpcError::internal(
+                "solidified state unavailable: archive capture is behind committed latest head",
+            ));
+        }
+        if !archive.covers(height) {
+            return Err(RpcError::internal(format!(
+                "solidified state unavailable: block {height} outside archive coverage"
+            )));
+        }
+        for store in required {
+            if !archive.has_store(*store) {
+                return Err(RpcError::internal(format!(
+                    "solidified state unavailable: store {store:?} is not archived"
+                )));
+            }
+        }
+        read(&crate::index_api::state_at_height(s, archive, height))
+    })
 }
 
 /// `getNowBlockSolidity` — newest block at or before the solidified
 /// head. Equivalent to java-tron's `walletsolidity/getnowblock`.
 pub fn get_now_block_solidity(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let head = solidified_head(s);
-    let Ok(id) = s.block_index.get(head) else {
-        return Ok(Value::Null);
-    };
-    let Ok(block) = s.blocks.get(&id) else {
-        return Ok(Value::Null);
-    };
-    Ok(encode_block_for_rpc(&id, &block, true))
+    with_committed_state(s, || {
+        let head = solidified_head(s);
+        let Ok(id) = s.block_index.get(head) else {
+            return Ok(Value::Null);
+        };
+        let Ok(block) = s.blocks.get(&id) else {
+            return Ok(Value::Null);
+        };
+        Ok(encode_block_for_rpc(&id, &block, true))
+    })
 }
 
 /// `getBlockByNumSolidity(num)` — same as `getBlockByNum` but rejects
 /// numbers above the solidified head with `Null`.
 pub fn get_block_by_num_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let num = p
-        .get(0)
-        .and_then(|v| v.as_i64())
-        .or_else(|| {
-            p.get(0)
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-        })
-        .ok_or_else(|| RpcError::invalid_params("missing block number"))?;
-    if num > solidified_head(s) {
-        return Ok(Value::Null);
-    }
-    let Ok(id) = s.block_index.get(num) else {
-        return Ok(Value::Null);
-    };
-    let Ok(block) = s.blocks.get(&id) else {
-        return Ok(Value::Null);
-    };
-    Ok(encode_block_for_rpc(&id, &block, true))
+    with_committed_state(s, || {
+        let num = p
+            .get(0)
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                p.get(0)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .ok_or_else(|| RpcError::invalid_params("missing block number"))?;
+        if num > solidified_head(s) {
+            return Ok(Value::Null);
+        }
+        let Ok(id) = s.block_index.get(num) else {
+            return Ok(Value::Null);
+        };
+        let Ok(block) = s.blocks.get(&id) else {
+            return Ok(Value::Null);
+        };
+        Ok(encode_block_for_rpc(&id, &block, true))
+    })
 }
 
-/// `getTransactionByIdSolidity(tx_id)` — same as `getTransactionById`
-/// but rejects with `Null` if the tx hasn't reached the solidified
-/// head yet. We check via `tx_history` (if present), otherwise fall
-/// back to the live `getTransactionById` (with a flag noting the
-/// divergence).
+/// Confirmed transaction bodies require a known canonical inclusion height.
+/// Runtime block references work even without a tx-id-keyed receipt index.
 pub fn get_transaction_by_id_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    // For the body lookup we use the live store, but gate on the
-    // tx_history's block_num to decide whether it's solidified.
-    let id_str = p
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing tx id"))?;
-    let id_bytes = parse_hex_bytes(id_str)?;
-    if id_bytes.len() != 32 {
-        return Err(RpcError::invalid_params("tx id must be 32 bytes"));
-    }
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&id_bytes);
-
-    // Check the tx's block number against the solidified head.
-    let solid_head = solidified_head(s);
-    let in_solidified = match &s.tx_history {
-        Some(h) => {
-            // Read receipt to learn the block_num.
-            match h
-                .get(&id)
-                .map_err(|e| RpcError::internal(format!("tx history: {e}")))?
-            {
-                Some(info) => info.block_number <= solid_head,
-                None => false,
+    with_committed_state(s, || {
+        let id_str = p
+            .get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing tx id"))?;
+        let bytes = parse_hex_bytes(id_str)?;
+        let id: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| RpcError::invalid_params("tx id must be 32 bytes"))?;
+        let height = match s
+            .transactions
+            .get(&id)
+            .map_err(|e| RpcError::internal(format!("tx read: {e}")))?
+        {
+            Some(tron_chainbase::StoredTransaction::BlockRef(height)) => Some(height),
+            Some(tron_chainbase::StoredTransaction::Full(_)) => {
+                transaction_info(&id, s).map(|info| info.block_number)
             }
+            None => None,
+        };
+        if !matches!(height, Some(h) if h >= 0 && h <= solidified_head(s)) {
+            return Ok(Value::Null);
         }
-        None => {
-            // No history index. Without it we can't know the tx's
-            // block; we'd risk returning unconfirmed data. Reject.
-            false
-        }
-    };
-    if !in_solidified {
-        return Ok(Value::Null);
-    }
-    // Delegate to the regular lookup for body shape.
-    get_transaction_by_id(p, s)
+        get_transaction_by_id(p, s)
+    })
 }
 
-/// `getTransactionInfoByIdSolidity(tx_id)` — solidified counterpart
-/// of `getTransactionInfoById`. Same gate via `tx_history.block_number`.
+/// Confirmed receipts use both tx-id history and the runtime block receipt store.
 pub fn get_transaction_info_by_id_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let id_str = p
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing tx id"))?;
-    let id_bytes = parse_hex_bytes(id_str)?;
-    if id_bytes.len() != 32 {
-        return Err(RpcError::invalid_params("tx id must be 32 bytes"));
-    }
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&id_bytes);
-
-    let Some(h) = &s.tx_history else {
-        return Ok(Value::Null);
-    };
-    let info = match h
-        .get(&id)
-        .map_err(|e| RpcError::internal(format!("tx history: {e}")))?
-    {
-        Some(i) => i,
-        None => return Ok(Value::Null),
-    };
-    if info.block_number > solidified_head(s) {
-        return Ok(Value::Null);
-    }
-    Ok(encode_transaction_info(&info))
+    with_committed_state(s, || {
+        let id_str = p
+            .get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing tx id"))?;
+        let bytes = parse_hex_bytes(id_str)?;
+        let id: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| RpcError::invalid_params("tx id must be 32 bytes"))?;
+        match transaction_info(&id, s) {
+            Some(info) if info.block_number >= 0 && info.block_number <= solidified_head(s) => {
+                Ok(encode_transaction_info(&info))
+            }
+            _ => Ok(Value::Null),
+        }
+    })
 }
 
-/// `getAccountSolidity(address)` — `walletsolidity/getaccount`. java-tron
-/// reads the account at `LATEST_SOLIDIFIED_BLOCK_NUM` from a separate
-/// solidified-state snapshot, which this node does not maintain
-/// (non-block-keyed solidified reads have no historical store). The
-/// returned shape is byte-identical to `getAccount` against the LIVE
-/// state. We deliberately do NOT inject a non-java marker field
-/// (`__solidified`): a wallet diffing this against java's
-/// `walletsolidity/getaccount` must see the same `Account` proto JSON,
-/// and the (rare) staleness window between live head and the solidified
-/// block is the documented limitation here.
+/// `walletsolidity/getaccount` reads the actual solidified account snapshot.
 pub fn get_account_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    get_account(p, s)
+    use tron_chainbase::UndoStoreId::{Accounts, DynProps};
+    solidified_state(s, &[Accounts, DynProps], |at| get_account(p, at))
 }
 
-/// `getDelegatedResourceSolidity(from, to)` — `walletsolidity` alias of
-/// `getDelegatedResource`. Same architectural limitation as
-/// [`get_account_solidity`]: served from live state (no solidified
-/// snapshot), and without a non-java marker field so the response shape
-/// matches java's `walletsolidity/getdelegatedresource`.
+pub fn get_account_resource_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    use tron_chainbase::UndoStoreId::{Accounts, AssetV2, DynProps};
+    let mut stores = vec![Accounts, DynProps];
+    if s.assets_v2.is_some() {
+        stores.push(AssetV2);
+    }
+    solidified_state(s, &stores, |at| get_account_resource(p, at))
+}
+
 pub fn get_delegated_resource_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    get_delegated_resource(p, s)
+    use tron_chainbase::UndoStoreId::DelegatedResources;
+    solidified_state(s, &[DelegatedResources], |at| get_delegated_resource(p, at))
+}
+
+pub fn get_delegated_resource_v2_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    use tron_chainbase::UndoStoreId::DelegatedResources;
+    solidified_state(s, &[DelegatedResources], |at| {
+        get_delegated_resource_v2(p, at)
+    })
+}
+
+pub fn get_brokerage_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    use tron_chainbase::UndoStoreId::Delegation;
+    solidified_state(s, &[Delegation], |at| get_brokerage(p, at))
+}
+
+pub fn get_reward_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    use tron_chainbase::UndoStoreId::{Accounts, Delegation, DynProps};
+    // The optional reward-vi acceleration store has no archived version.
+    if s.reward_vi.is_some() {
+        return Err(RpcError::internal(
+            "solidified reward unavailable: reward-vi historical state is not archived",
+        ));
+    }
+    solidified_state(s, &[Accounts, Delegation, DynProps], |at| get_reward(p, at))
+}
+
+pub fn list_assets_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    use tron_chainbase::UndoStoreId::AssetV2;
+    solidified_state(s, &[AssetV2], |at| list_assets(p, at))
 }
 
 // =============================================================================
@@ -6802,10 +6870,6 @@ fn parse_bytes_field(p: &Value, field: &str) -> Result<Vec<u8>, RpcError> {
 }
 
 /// Optional bytes field — returns empty vec when absent.
-fn parse_bytes_field_opt(p: &Value, field: &str) -> Vec<u8> {
-    parse_bytes_field(p, field).unwrap_or_default()
-}
-
 /// `createTransaction({owner_address, to_address, amount, ...})` —
 /// TRX transfer.
 pub fn create_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
@@ -6843,7 +6907,7 @@ pub fn build_trigger_smart_contract(p: &Value, s: &RpcState) -> Result<Value, Rp
         owner_address: parse_addr_field(p, "owner_address")?,
         contract_address: parse_addr_field(p, "contract_address")?,
         call_value: parse_i64_field(p, "call_value", 0)?,
-        data: parse_bytes_field_opt(p, "data"),
+        data: tron_calldata(p.get(0).and_then(Value::as_object).ok_or_else(||RpcError::invalid_params("missing call object"))?)?,
         call_token_value: parse_i64_field(p, "call_token_value", 0)?,
         token_id: parse_i64_field(p, "token_id", 0)?,
     };
@@ -8077,6 +8141,21 @@ mod account_encoding_tests {
     use tron_proto::account::{AccountResource, FreezeV2};
 
     #[test]
+    fn pending_v2_unfreezes_preserve_resource_amount_and_deadline() {
+        use tron_proto::account::UnFreezeV2;
+        let mut a = tron_proto::Account::default();
+        assert!(encode_account_for_rpc(&a, 0).get("unfrozenV2").is_none());
+        a.unfrozen_v2 = vec![
+            UnFreezeV2 { r#type: 0, unfreeze_amount: 123, unfreeze_expire_time: 1_800_000_000_000 },
+            UnFreezeV2 { r#type: 1, unfreeze_amount: 456, unfreeze_expire_time: 1_800_000_030_000 },
+        ];
+        assert_eq!(encode_account_for_rpc(&a, 0)["unfrozenV2"], json!([
+            {"unfreeze_amount": 123, "unfreeze_expire_time": 1_800_000_000_000_i64},
+            {"type": "ENERGY", "unfreeze_amount": 456, "unfreeze_expire_time": 1_800_000_030_000_i64}
+        ]));
+    }
+
+    #[test]
     fn account_json_matches_java_tron_shape() {
         let a = tron_proto::Account {
             address: vec![0x41; 21],
@@ -8728,5 +8807,97 @@ mod eth_encoding_tests {
             0,
             "absent → default"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod tronweb_broadcast_tests {
+    use super::*;
+    #[test]
+    fn signed_envelope_keeps_raw_wire_and_all_signatures() {
+        let raw = tron_proto::transaction::Raw { timestamp: 123, expiration: 456, fee_limit: 789, ..Default::default() };
+        let bytes = raw.encode_to_vec();
+        let sig = vec![7u8;65];
+        let mut envelope = json!({"raw_data_hex":hex::encode(&bytes),
+          "txID":hex::encode(tron_crypto::hash::sha256(&bytes)),
+          "signature":[hex::encode(&sig),format!("0x{}",hex::encode(&sig))]});
+        let wire=broadcast_wire(&envelope).unwrap();
+        let tx=tron_proto::Transaction::decode(wire.as_slice()).unwrap();
+        assert_eq!(tx.raw_data.unwrap(),raw);assert_eq!(tx.signature,vec![sig.clone(),sig]);
+        envelope["txID"]=json!("00".repeat(32));
+        assert!(broadcast_wire(&envelope).is_err());
+        envelope.as_object_mut().unwrap().remove("txID");envelope["signature"]=json!([]);
+        assert!(broadcast_wire(&envelope).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod signed_broadcast_parser_regression {
+    use super::*;
+    use prost::Message as _;
+
+    fn fixture() -> (tron_proto::transaction::Raw, Value) {
+        let contract = crate::builder::wrap_contract(
+            tron_proto::transaction::contract::ContractType::TransferContract,
+            &tron_proto::TransferContract {
+                owner_address: vec![0x41; 21],
+                to_address: vec![0x42; 21],
+                amount: 1,
+            },
+            0,
+        );
+        let raw = tron_proto::transaction::Raw {
+            ref_block_bytes: vec![0, 1],
+            ref_block_hash: vec![0; 8],
+            expiration: 60001,
+            timestamp: 1,
+            contract: vec![contract],
+            data: b"memo".to_vec(),
+            ..Default::default()
+        };
+        let encoded = raw.encode_to_vec();
+        let envelope = json!({
+            "raw_data_hex":hex::encode(&encoded),
+            "txID":hex::encode(tron_crypto::hash::sha256(&encoded)),
+            "signature":[hex::encode([0x11;65])]
+        });
+        (raw, envelope)
+    }
+
+    #[test]
+    fn signed_broadcast_preserves_exact_raw_and_signatures() {
+        let (raw, envelope) = fixture();
+        let wire = broadcast_wire(&envelope).unwrap();
+        let parsed = tron_proto::Transaction::decode(wire.as_slice()).unwrap();
+        assert_eq!(
+            parsed.raw_data.as_ref().unwrap().encode_to_vec(),
+            raw.encode_to_vec()
+        );
+        assert_eq!(parsed.signature, vec![vec![0x11; 65]]);
+    }
+
+    #[test]
+    fn signed_broadcast_still_rejects_mismatch_noncanonical_raw_and_bad_signatures() {
+        let (_, envelope) = fixture();
+        let mut changed = envelope.clone();
+        changed["txID"] = json!("00".repeat(32));
+        assert!(broadcast_wire(&changed).is_err());
+        let mut changed = envelope.clone();
+        let mut raw = hex::decode(changed["raw_data_hex"].as_str().unwrap()).unwrap();
+        raw.extend_from_slice(&[0xf8, 0x07, 0x01]); // Unknown raw field is noncanonical for broadcast.
+        changed["raw_data_hex"] = json!(hex::encode(&raw));
+        changed["txID"] = json!(hex::encode(tron_crypto::hash::sha256(&raw)));
+        assert!(broadcast_wire(&changed).is_err());
+        for signatures in [
+            json!([]),
+            json!(["00".repeat(64)]),
+            json!(["zz".repeat(65)]),
+        ] {
+            let mut changed = envelope.clone();
+            changed["signature"] = signatures;
+            assert!(broadcast_wire(&changed).is_err());
+        }
     }
 }

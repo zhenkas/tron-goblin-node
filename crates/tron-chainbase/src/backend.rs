@@ -53,6 +53,15 @@ pub enum KvError {
 /// [`KvError::Backend`].
 pub trait KvBackend: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError>;
+
+    /// Read keys in input order, preserving duplicates and missing entries.
+    /// Errors abort the batch rather than turning failed reads into absence.
+    /// Persistent providers override this with one native MultiGet or one
+    /// read transaction; overlays forward unresolved keys as one parent batch.
+    fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError>;
     fn delete(&self, key: &[u8]) -> Result<(), KvError>;
     fn contains(&self, key: &[u8]) -> Result<bool, KvError> {
@@ -129,6 +138,20 @@ pub trait KvBackend: Send + Sync {
     /// [`write_batch`]: KvBackend::write_batch
     fn sync_wal(&self) -> Result<(), KvError> {
         Ok(())
+    }
+
+    /// Materialize committed engine state and make it durable. Overlay layers
+    /// remain tentative; their parent can still checkpoint earlier commits.
+    fn checkpoint(&self) -> Result<(), KvError> {
+        self.sync_wal()
+    }
+
+    /// Export an immutable engine checkpoint through the existing open handle.
+    /// Callers must coordinate writers across all stores. Unsupported engines fail closed.
+    fn checkpoint_to(&self, _destination: &std::path::Path) -> Result<(), KvError> {
+        Err(KvError::Backend(
+            "immutable checkpoint export unsupported".into(),
+        ))
     }
 
     /// Snapshot every `(key, value)` pair currently stored. Callers get
@@ -269,6 +292,11 @@ impl KvBackend for MemBackend {
             .expect("MemBackend lock poisoned")
             .get(key)
             .cloned())
+    }
+
+    fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        let guard = self.inner.read().expect("MemBackend lock poisoned");
+        Ok(keys.iter().map(|key| guard.get(*key).cloned()).collect())
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
@@ -482,7 +510,11 @@ mod scan_back_tests {
         let b = seeded();
         let got = b.scan_back_from(b"c", 10).unwrap();
         let keys: Vec<&[u8]> = got.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(keys, vec![&b"b"[..], b"a"], "strictly below 'c', newest-first");
+        assert_eq!(
+            keys,
+            vec![&b"b"[..], b"a"],
+            "strictly below 'c', newest-first"
+        );
         assert_eq!(b.scan_back_from(b"a", 10).unwrap(), vec![]);
         assert_eq!(b.scan_back_from(b"z", 1).unwrap().len(), 1);
         assert_eq!(b.scan_back_from(b"z", 0).unwrap(), vec![]);
@@ -502,4 +534,37 @@ mod scan_back_tests {
             mem.scan_back_from(b"c", 10).unwrap()
         );
     }
+}
+
+// Resolved slots distinguish an absent overlay entry (None) from an overlay
+// tombstone (Some(None)). Release overlay locks before calling this helper.
+pub(crate) fn merge_multi_get(
+    parent: &dyn KvBackend,
+    keys: &[&[u8]],
+    resolved: Vec<Option<Option<Vec<u8>>>>,
+) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+    let mut out = vec![None; keys.len()];
+    let mut missing = Vec::new();
+    let mut positions = Vec::new();
+    for (i, slot) in resolved.into_iter().enumerate() {
+        match slot {
+            Some(value) => out[i] = value,
+            None => {
+                missing.push(keys[i]);
+                positions.push(i);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        let values = parent.multi_get(&missing)?;
+        if values.len() != positions.len() {
+            return Err(KvError::Backend(
+                "multi_get returned a different result count".into(),
+            ));
+        }
+        for (i, value) in positions.into_iter().zip(values) {
+            out[i] = value;
+        }
+    }
+    Ok(out)
 }

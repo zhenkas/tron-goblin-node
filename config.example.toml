@@ -28,6 +28,8 @@ data_dir = "./tron-data"
 # [storage] — RocksDB tuning + DB lifecycle
 # -----------------------------------------------------------------------------
 [storage]
+# KV engine: rocksdb (default) or tidesdb. Use a matching complete data directory.
+backend = "rocksdb"
 # Per-store write-buffer (memtable) size, MiB. Larger = fewer flushes / higher
 # write throughput while syncing, at the cost of RAM (this is PER store, and
 # there are ~60 stores). 64 suits a mainnet node with a few GB to spare; drop
@@ -56,6 +58,19 @@ snapshot_reorg = false
 # the head get merged into the root and become un-reorgable. Mainnet rarely
 # reorgs past ~10 blocks, so 64 is ample while bounding per-layer RAM.
 snapshot_horizon = 64
+
+# Independent TidesDB resources, PER store. Used only when backend = "tidesdb".
+# See docs/local/kv-providers.md for migration scope and durability semantics.
+[storage.tidesdb]
+write_buffer_size_mb = 64
+block_cache_mb = 8
+max_open_sstables = 8192
+flush_threads = 1
+compaction_threads = 1
+compression = "none"
+bloom_fpr = 0.01
+wal_sync = "buffered"
+wal_sync_interval_ms = 1000
 
 # --- [storage.db_settings] -------------------------------------------------
 # Per-CF RocksDB knobs mirroring java-tron's `storage.dbSettings.*`. Parsed for

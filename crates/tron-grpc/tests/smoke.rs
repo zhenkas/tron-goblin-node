@@ -86,6 +86,7 @@ fn fixture() -> RpcState {
 
     RpcState {
         reward_vi: None,
+        committed_read_gate: None,
         accounts: Arc::new(AccountStore::new(accounts_be)),
         blocks: Arc::new(BlockStore::new(blocks_be)),
         block_index: Arc::new(BlockIndexStore::new(block_index_be)),

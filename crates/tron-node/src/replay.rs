@@ -137,7 +137,7 @@ pub fn run_replay(
     // The daemon's startup runs this same BlockSession-checkpoint
     // recovery (runtime.rs); doing it here keeps an offline run's base
     // state identical to a daemon open of the same data-dir.
-    let stores = OpenedStores::open(&config.data_dir)?;
+    let stores = OpenedStores::open_configured(&config.data_dir, &config.storage)?;
     let state = stores.to_state_backends();
     let checkpoint_dir = tron_chainbase::CheckPointV2::new(&config.data_dir);
     match tron_executor::replay_pending_checkpoints(&state, &checkpoint_dir) {
@@ -340,7 +340,7 @@ pub fn dump_blocks(
     to: i64,
     out_path: &Path,
 ) -> Result<DumpReport, ReplayError> {
-    let stores = OpenedStores::open(&config.data_dir)?;
+    let stores = OpenedStores::open_configured(&config.data_dir, &config.storage)?;
     let block_store = tron_chainbase::BlockStore::new(stores.blocks.clone());
 
     let file = File::create(out_path)?;

@@ -24,6 +24,7 @@ fn fresh_state_with_evm(support_constant: bool) -> RpcState {
         code: mem(),
         storage: mem(),
         witnesses: mem(),
+        votes: mem(),
         contract_state: mem(),
         dyn_props: mem(),
         delegated_resources: mem(),

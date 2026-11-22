@@ -26,3 +26,7 @@ tracing.workspace = true
 hex.workspace = true
 hex-literal.workspace = true
 mimalloc = "0.1"
+
+[features]
+# Offline measurement hooks; no instrumentation in production builds.
+bench-profile = []

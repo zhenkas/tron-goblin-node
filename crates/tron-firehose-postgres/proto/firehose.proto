@@ -21,6 +21,10 @@ service Firehose {
 
 message TailRequest {
   uint64 from_seq = 1;
+  // Inclusive block-height replay, mutually exclusive with nonzero from_seq.
+  // Resolve to the first retained APPLY at this height, then replay and follow.
+  // Resume from a finalized indexed ACK + 1; no global cursor is changed.
+  optional int64 from_height = 2;
 }
 
 message Entry {
@@ -50,6 +54,19 @@ message BlockApplied {
   // though the block may have had VM activity.
   bool txinfo_missing = 7;
   repeated Tx txs = 8;
+  // Native liquid TRX only, in sun, after ALL committed block effects.
+  // Unique addresses in byte order; net-zero changes are omitted.
+  repeated TrxBalanceChange trx_balance_changes = 9;
+  // False for legacy entries / unavailable capture. Empty + true means no
+  // native balance changes; empty + false must NEVER be treated that way.
+  bool trx_balances_complete = 10;
+}
+
+message TrxBalanceChange {
+  bytes address = 1;        // 21 bytes, 0x41 prefix
+  // Raw signed Account.balance values; canonical negative accounts exist.
+  int64 balance_before = 2; // parent state
+  int64 balance_after = 3;  // final committed block state
 }
 
 message Unwind {

@@ -7,7 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "Full-node daemon: opens RocksDB stores, runs the JSON-RPC server, syncs blocks from a peer, executes them into state."
 
+[features]
+block-memory-bench = ["tron-executor/bench-profile"]
+block-tides-bench = ["block-memory-bench", "dep:tidesdb", "dep:rocksdb"]
+devnet-fast = ["tron-tvm/devnet-fast", "tron-actuator/devnet-fast"]
+private-network = ["tron-tvm/private-network"]
+
 [dependencies]
+critical-notify = { path = "../critical-notify" }
+rocksdb = { workspace = true, optional = true }
+tidesdb = { git = "https://github.com/tidesdb/tidesdb-rs", rev = "0b4eca75a3f96799a8cd0c63fd12e62662ffbaa4", optional = true, default-features = false }
 tron-crypto = { path = "../tron-crypto" }
 tron-proto = { path = "../tron-proto" }
 tron-types = { path = "../tron-types" }
@@ -35,6 +44,10 @@ toml = "0.8"
 prost.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+sha2.workspace = true
+tonic = { workspace = true, features = ["tls"] }
+tokio-stream = "0.1"
+futures.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -57,3 +70,13 @@ serial_test = "3"
 [[bin]]
 name = "tron-node"
 path = "src/main.rs"
+
+[[example]]
+name = "block_memory_bench"
+path = "examples/block_memory_bench.rs"
+required-features = ["block-memory-bench"]
+
+[[example]]
+name = "tides_read_probe"
+path = "examples/tides_read_probe.rs"
+required-features = ["block-tides-bench"]

@@ -312,7 +312,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut client =
         fh::firehose_client::FirehoseClient::connect(node_url.clone()).await?;
     let mut stream = client
-        .tail(fh::TailRequest { from_seq: cursor as u64 + 1 })
+        .tail(fh::TailRequest { from_seq: cursor as u64 + 1, ..Default::default() })
         .await?
         .into_inner();
 

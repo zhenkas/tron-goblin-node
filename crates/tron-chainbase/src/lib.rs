@@ -16,6 +16,9 @@ pub mod convert;
 pub mod fee;
 pub mod fork;
 pub mod java_checkpoint;
+mod market_price_backend;
+pub mod provider;
+pub mod tidesdb_backend;
 pub mod pending_overlay;
 pub mod permissions;
 pub mod rocksdb_backend;
@@ -88,5 +91,15 @@ pub const ENERGY_LIMIT_HARD_FORK_BLOCK: i64 = 4_727_890;
 /// than the number of the block being applied, which would activate the fork
 /// one block early.
 pub fn energy_limit_hard_fork_active(dyn_props: &DynamicPropertiesStore) -> bool {
+    // An explicitly isolated private ledger starts at today's protocol without
+    // fabricating historical block height. Ordinary builds ignore this marker.
+    #[cfg(feature = "private-network")]
+    if dyn_props.get_long(b"PRIVATE_PROTOCOL_VERSION") == Some(BLOCK_VERSION as i64) {
+        return true;
+    }
     dyn_props.latest_block_header_number().unwrap_or(0) >= ENERGY_LIMIT_HARD_FORK_BLOCK
 }
+
+pub use tidesdb_backend::{TidesCompression, TidesDbBackend, TidesDbOptions, TidesWalSync};
+
+pub use provider::{KvEngine, KvProvider};

@@ -2,10 +2,11 @@
 //! block for external sinks (P3).
 //!
 //! Entries are **store-derivable by construction**: an `APPLY` entry
-//! is a pure function of `(block, TransactionRet)`, both of which the
+//! is a function of `(block, TransactionRet, native-balance capture)`, which the
 //! node persists — so any gap between the log and the chain (crash
 //! tail, node ran with the firehose off) is repaired by re-deriving
-//! the missing entries from `BlockStore` + `TransactionRetStore`.
+//! the missing entries from `BlockStore` + `TransactionRetStore`. Legacy or missing
+//! balance capture is explicitly incomplete, never an empty complete write-set.
 //! Chain unwinds (reorgs, or the log being *ahead* of consensus after
 //! a power loss) become explicit `UNWIND` entries; consumers must
 //! handle them anyway, so crash recovery and reorgs share one
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use prost::Message as _;
 use tron_chainbase::{
     BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend, StoreError,
-    TransactionRetStore,
+    TransactionRetStore, UndoStoreId,
 };
 use tron_grpc::firehose_proto as fh;
 use tron_index::{FirehoseLogWriter, FirehoseTailHandle, IndexError};
@@ -42,6 +43,64 @@ const RECENT_MS: i64 = 5 * 60 * 1000;
 /// advances one block per apply while a repair pass closes this many, so
 /// the window converges.
 const GAP_REPAIR_MAX: i64 = 512;
+
+/// Adjacent to the height's receipt, in the same WAL/durability barrier.
+/// History pruning removes both rows under the same ACK-gated floor.
+pub(crate) fn balance_key(height: i64) -> Vec<u8> {
+    let mut key = height.to_be_bytes().to_vec();
+    key.push(b'B');
+    key
+}
+
+/// Derive only native liquid balances from the FINAL committed account writes.
+/// Capture collapses intra-block rewrites, including reverted VM frames.
+pub(crate) fn capture_balances(
+    block_id: &BlockId,
+    deltas: Option<&[tron_executor::CapturedDelta]>,
+) -> Result<fh::BlockApplied, IndexError> {
+    let mut event = fh::BlockApplied {
+        block_id: block_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let Some(deltas) = deltas else {
+        return Ok(event);
+    };
+    let mut rows = std::collections::BTreeMap::new();
+    for d in deltas.iter().filter(|d| d.store == UndoStoreId::Accounts) {
+        if d.key.len() != 21 || d.key[0] != 0x41 {
+            return Err(IndexError::Corrupt("invalid TRX account key".into()));
+        }
+        let balance = |bytes: Option<&[u8]>| -> Result<i64, IndexError> {
+            let Some(bytes) = bytes else { return Ok(0) };
+            let account = tron_proto::Account::decode(bytes)
+                .map_err(|e| IndexError::Corrupt(format!("TRX account decode: {e}")))?;
+            // Account.balance is signed int64 on the canonical chain. Historical
+            // negative accounts exist; capture the raw value without clamping.
+            if account.address != d.key {
+                return Err(IndexError::Corrupt("invalid TRX account image".into()));
+            }
+            Ok(account.balance)
+        };
+        let before = balance(d.before.as_deref())?;
+        let after = balance(d.after.as_deref())?;
+        if rows.insert(d.key.clone(), (before, after)).is_some() {
+            return Err(IndexError::Corrupt("duplicate captured TRX account".into()));
+        }
+    }
+    event.trx_balance_changes = rows
+        .into_iter()
+        .filter(|(_, (before, after))| before != after)
+        .map(
+            |(address, (balance_before, balance_after))| fh::TrxBalanceChange {
+                address,
+                balance_before,
+                balance_after,
+            },
+        )
+        .collect();
+    event.trx_balances_complete = true;
+    Ok(event)
+}
 
 #[derive(Debug, Default)]
 pub struct FirehoseCounters {
@@ -97,8 +156,8 @@ impl FirehoseWriter {
             },
             None => (-1, None),
         };
-        let consensus_head_opt = DynamicPropertiesStore::new(dyn_props.clone())
-            .latest_block_header_number();
+        let consensus_head_opt =
+            DynamicPropertiesStore::new(dyn_props.clone()).latest_block_header_number();
         let consensus_head = consensus_head_opt.unwrap_or(0);
         let counters = Arc::new(FirehoseCounters::default());
 
@@ -139,8 +198,7 @@ impl FirehoseWriter {
             // consensus_head, i.e. > 0), so refuse to open and let the operator
             // remove the stale firehose dir intentionally.
             const MAX_PLAUSIBLE_ROLLBACK: i64 = 10_000;
-            if consensus_head_opt.is_none()
-                || head_height - consensus_head > MAX_PLAUSIBLE_ROLLBACK
+            if consensus_head_opt.is_none() || head_height - consensus_head > MAX_PLAUSIBLE_ROLLBACK
             {
                 return Err(IndexError::Corrupt(format!(
                     "firehose log head {head_height} is implausibly far ahead of the \
@@ -154,9 +212,13 @@ impl FirehoseWriter {
             // comparison cannot tell whether the log's entry at consensus_head
             // survived the fork. Without a readable solidified mark, fall back
             // to the recovered head itself.
-            let solidified = DynamicPropertiesStore::new(dyn_props.clone())
-                .latest_solidified_block_num();
-            Some(solidified.map(|s| s.min(consensus_head)).unwrap_or(consensus_head))
+            let solidified =
+                DynamicPropertiesStore::new(dyn_props.clone()).latest_solidified_block_num();
+            Some(
+                solidified
+                    .map(|s| s.min(consensus_head))
+                    .unwrap_or(consensus_head),
+            )
         } else if head_height >= 0 {
             let canonical = BlockIndexStore::new(block_index.clone())
                 .get(head_height)
@@ -166,7 +228,11 @@ impl FirehoseWriter {
                 (Some(logged), Some(canon)) if *logged != canon => {
                     let solidified = DynamicPropertiesStore::new(dyn_props.clone())
                         .latest_solidified_block_num();
-                    Some(solidified.map(|s| s.min(head_height - 1)).unwrap_or(head_height - 1))
+                    Some(
+                        solidified
+                            .map(|s| s.min(head_height - 1))
+                            .unwrap_or(head_height - 1),
+                    )
                 }
                 _ => None,
             }
@@ -194,7 +260,11 @@ impl FirehoseWriter {
         }
         tracing::info!(head_height, consensus_head, "firehose: log open");
         Ok(Self {
-            inner: Mutex::new(Inner { log, head_height, blocks_since_sync: 0 }),
+            inner: Mutex::new(Inner {
+                log,
+                head_height,
+                blocks_since_sync: 0,
+            }),
             blocks,
             block_index,
             txret,
@@ -203,12 +273,65 @@ impl FirehoseWriter {
         })
     }
 
+    /// Maintenance control only; the apply hook and its durability cadence are unchanged.
+    pub fn manage_history(&self, control: Arc<tron_index::HistoryControl>) {
+        self.inner
+            .lock()
+            .expect("firehose poisoned")
+            .log
+            .manage_history(control);
+    }
+
+    pub fn prune_history_segment(&self, floor: i64) -> Result<bool, String> {
+        let tail = self.tail_handle();
+        let control = tail
+            .history_control()
+            .ok_or("history retention is not managed")?;
+        if floor > control.floor() {
+            return Err("unpublished history floor".into());
+        }
+        let mut decode_error = None;
+        let cutoff = tail
+            .reader()
+            .oldest_closed_end_if(tail.durable_seq(), |payload| {
+                match fh::Entry::decode(payload) {
+                    Ok(e) => match e.event {
+                        Some(fh::entry::Event::Apply(a)) => a.height < floor,
+                        Some(fh::entry::Event::Unwind(u)) => u.to_height < floor,
+                        None => false,
+                    },
+                    Err(e) => {
+                        decode_error = Some(e.to_string());
+                        false
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        if let Some(e) = decode_error {
+            return Err(e);
+        }
+        match cutoff {
+            Some(seq) => self
+                .inner
+                .lock()
+                .expect("firehose poisoned")
+                .log
+                .prune_oldest_before(seq)
+                .map_err(|e| e.to_string()),
+            None => Ok(false),
+        }
+    }
+
     pub fn counters(&self) -> Arc<FirehoseCounters> {
         self.counters.clone()
     }
 
     pub fn tail_handle(&self) -> FirehoseTailHandle {
-        self.inner.lock().expect("firehose poisoned").log.tail_handle()
+        self.inner
+            .lock()
+            .expect("firehose poisoned")
+            .log
+            .tail_handle()
     }
 
     /// Append entries for one applied block: an `UNWIND` first when
@@ -260,7 +383,9 @@ impl FirehoseWriter {
                         Some(apply) => {
                             if self.append_apply(&mut inner, apply)? {
                                 inner.head_height = g;
-                                self.counters.gap_repaired_blocks.fetch_add(1, Ordering::Relaxed);
+                                self.counters
+                                    .gap_repaired_blocks
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         None => {
@@ -294,7 +419,8 @@ impl FirehoseWriter {
             }
         }
 
-        let apply = build_apply(h, block, Some(ret), solidified);
+        let mut apply = build_apply(h, block, Some(ret), solidified);
+        self.attach_balances(&mut apply)?;
         if self.append_apply(&mut inner, apply)? {
             self.counters.entries.fetch_add(1, Ordering::Relaxed);
         }
@@ -324,9 +450,112 @@ impl FirehoseWriter {
         Ok(())
     }
 
+    /// Persist before the receipt WAL sync, even if log append/gap repair fails.
+    pub(crate) fn persist_balances(
+        &self,
+        block_id: &BlockId,
+        deltas: Option<&[tron_executor::CapturedDelta]>,
+    ) -> Result<(), IndexError> {
+        let event = capture_balances(block_id, deltas);
+        // Always overwrite a former fork's row, including unavailable capture.
+        let stored = event
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| fh::BlockApplied {
+                block_id: block_id.as_bytes().to_vec(),
+                ..Default::default()
+            });
+        self.txret
+            .put(&balance_key(block_id.num() as i64), &stored.encode_to_vec())?;
+        event.map(|_| ())
+    }
+
+    fn attach_balances(&self, apply: &mut fh::BlockApplied) -> Result<(), IndexError> {
+        if let Some(bytes) = self.txret.get(&balance_key(apply.height))? {
+            let stored = fh::BlockApplied::decode(bytes.as_slice())
+                .map_err(|e| IndexError::Corrupt(format!("TRX sidecar decode: {e}")))?;
+            if stored.block_id == apply.block_id {
+                apply.trx_balance_changes = stored.trx_balance_changes;
+                apply.trx_balances_complete = stored.trx_balances_complete;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a complete authenticated solid block using this node's own
+    /// sequence. Recovery can repeat the final append without duplication.
+    pub(crate) fn align_assisted_head(&self,height:i64)->Result<(),IndexError>{
+        let mut inner=self.inner.lock().expect("firehose poisoned");
+        if inner.head_height>height {
+            self.append(&mut inner,fh::entry::Event::Unwind(fh::Unwind{to_height:height}))?;
+            inner.head_height=height;
+            self.counters.unwinds.fetch_add(1,Ordering::Relaxed);
+        }
+        let solid=DynamicPropertiesStore::new(self.dyn_props.clone()).latest_solidified_block_num().unwrap_or(0);
+        while inner.head_height<height && inner.head_height>=0 {
+            let next=inner.head_height+1;
+            let apply=self.derive_from_stores(next,solid)?.ok_or_else(||IndexError::Corrupt("missing canonical Firehose repair block".into()))?;
+            if apply.txinfo_missing || !apply.trx_balances_complete || !self.append_apply(&mut inner,apply)? {
+                return Err(IndexError::Corrupt("incomplete canonical Firehose repair".into()));
+            }
+            inner.head_height=next;
+        }
+        inner.log.sync()?;
+        inner.blocks_since_sync=0;
+        Ok(())
+    }
+
+    pub(crate) fn import_apply(&self, apply: fh::BlockApplied) -> Result<(), IndexError> {
+        if apply.txinfo_missing || !apply.trx_balances_complete {
+            return Err(IndexError::Corrupt("incomplete imported Firehose block".into()));
+        }
+        let mut inner = self.inner.lock().expect("firehose poisoned");
+        while inner.head_height >= 0 && inner.head_height+1 < apply.height {
+            let next=inner.head_height+1;
+            let repaired=self.derive_from_stores(next,apply.solidified_height)?
+                .ok_or_else(||IndexError::Corrupt("missing canonical import repair".into()))?;
+            if repaired.txinfo_missing || !repaired.trx_balances_complete || !self.append_apply(&mut inner,repaired)? {
+                return Err(IndexError::Corrupt("incomplete canonical import repair".into()));
+            }
+            inner.head_height=next;
+        }
+        if inner.head_height == apply.height {
+            let head = inner.log.tail_handle().reader().head()?;
+            if let Some((_, bytes)) = head {
+                let entry = fh::Entry::decode(bytes.as_slice())
+                    .map_err(|e| IndexError::Corrupt(e.to_string()))?;
+                let equal=match entry.event {
+                    Some(fh::entry::Event::Apply(mut old))=>{
+                        let mut expected=apply.clone();old.solidified_height=0;expected.solidified_height=0;old==expected
+                    },_=>false
+                };
+                if equal {
+                    inner.log.sync()?;
+                    return Ok(());
+                }
+            }
+            return Err(IndexError::Corrupt("conflicting imported Firehose block".into()));
+        }
+        if inner.head_height >= 0 && inner.head_height + 1 != apply.height {
+            return Err(IndexError::Corrupt("import would leave a Firehose history gap".into()));
+        }
+        let height = apply.height;
+        if !self.append_apply(&mut inner, apply)? {
+            return Err(IndexError::Corrupt("imported Firehose block exceeds frame limit".into()));
+        }
+        inner.log.sync()?;
+        inner.head_height = height;
+        inner.blocks_since_sync = 0;
+        self.counters.entries.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn append(&self, inner: &mut Inner, event: fh::entry::Event) -> Result<u64, IndexError> {
         let seq = inner.log.next_seq();
-        let entry = fh::Entry { seq, event: Some(event) };
+        let entry = fh::Entry {
+            seq,
+            event: Some(event),
+        };
         inner.log.append(&entry.encode_to_vec())
     }
 
@@ -340,7 +569,10 @@ impl FirehoseWriter {
     fn append_apply(&self, inner: &mut Inner, apply: fh::BlockApplied) -> Result<bool, IndexError> {
         let height = apply.height;
         let seq = inner.log.next_seq();
-        let entry = fh::Entry { seq, event: Some(fh::entry::Event::Apply(apply)) };
+        let entry = fh::Entry {
+            seq,
+            event: Some(fh::entry::Event::Apply(apply)),
+        };
         let payload = entry.encode_to_vec();
         if payload.len() > tron_index::FIREHOSE_MAX_FRAME_PAYLOAD {
             tracing::error!(
@@ -376,7 +608,9 @@ impl FirehoseWriter {
             Err(e) => return Err(e.into()),
         };
         let ret = TransactionRetStore::new(self.txret.clone()).get(height)?;
-        Ok(Some(build_apply(height, &block, ret.as_ref(), solidified)))
+        let mut apply = build_apply(height, &block, ret.as_ref(), solidified);
+        self.attach_balances(&mut apply)?;
+        Ok(Some(apply))
     }
 }
 
@@ -388,7 +622,10 @@ pub fn build_apply(
     ret: Option<&TransactionRet>,
     solidified: i64,
 ) -> fh::BlockApplied {
-    let raw = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref());
+    let raw = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref());
     let block_id = tron_types::block_id_from_block(block)
         .map(|id| id.as_bytes().to_vec())
         .unwrap_or_default();
@@ -399,6 +636,8 @@ pub fn build_apply(
     // would have made firehose entries disagree with index rows over
     // identical blocks.
     let matcher = tron_index::TxInfoMatcher::new(ret);
+
+    let mut txinfo_missing = ret.is_none() && !block.transactions.is_empty();
 
     let txs = block
         .transactions
@@ -414,22 +653,22 @@ pub fn build_apply(
                 .unwrap_or_else(|| tron_crypto::hash::sha256(&raw_tx.encode_to_vec()));
             let facts = tron_index::tx_facts(tx, &tx_id);
             let info = matcher.for_tx(&tx_id, i);
-            let success = tx
-                .ret
-                .first()
-                .map(|r| {
-                    r.contract_ret
-                        == tron_proto::transaction::result::ContractResult::Success as i32
-                })
-                .unwrap_or(false);
+            txinfo_missing |= info.is_none();
+            let success = tron_index::transaction_succeeded(tx, info);
             Some(fh::Tx {
                 txid: tx_id.to_vec(),
                 contract_type: facts.as_ref().map(|f| f.contract_type).unwrap_or(0),
                 success,
                 from: facts.as_ref().map(|f| f.from.clone()).unwrap_or_default(),
-                to: facts.as_ref().and_then(|f| f.to.clone()).unwrap_or_default(),
+                to: facts
+                    .as_ref()
+                    .and_then(|f| f.to.clone())
+                    .unwrap_or_default(),
                 amount: facts.as_ref().map(|f| f.amount).unwrap_or(0),
-                asset: facts.as_ref().and_then(|f| f.asset.clone()).unwrap_or_default(),
+                asset: facts
+                    .as_ref()
+                    .and_then(|f| f.asset.clone())
+                    .unwrap_or_default(),
                 vm_contract: info.map(|i| i.contract_address.clone()).unwrap_or_default(),
                 logs: info
                     .map(|i| {
@@ -484,8 +723,9 @@ pub fn build_apply(
         timestamp_ms: raw.map(|r| r.timestamp).unwrap_or(0),
         witness: raw.map(|r| r.witness_address.clone()).unwrap_or_default(),
         solidified_height: solidified,
-        txinfo_missing: ret.is_none() && !block.transactions.is_empty(),
+        txinfo_missing,
         txs,
+        ..Default::default()
     }
 }
 
@@ -493,6 +733,141 @@ pub fn build_apply(
 mod tests {
     use super::*;
     use tron_chainbase::MemBackend;
+
+    fn account_delta(
+        n: u8,
+        before: Option<i64>,
+        after: Option<i64>,
+    ) -> tron_executor::CapturedDelta {
+        let key = [vec![0x41], vec![n; 20]].concat();
+        let image = |balance| {
+            tron_proto::Account {
+                address: key.clone(),
+                balance,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        tron_executor::CapturedDelta {
+            store: UndoStoreId::Accounts,
+            key: key.clone(),
+            before: before.map(image),
+            after: after.map(image),
+        }
+    }
+
+    #[test]
+    fn native_balances_preserve_signed_canonical_accounts() {
+        let id = BlockId::from_hash_and_num(&[1; 32], 1);
+        let canonical_negative = -9_222_875_799_431_851_942i64;
+        let captured = capture_balances(&id, Some(&[
+            account_delta(1, Some(canonical_negative), Some(canonical_negative)),
+            account_delta(2, Some(i64::MIN), Some(i64::MAX)),
+            account_delta(3, Some(7), Some(-1)),
+        ])).unwrap();
+        assert!(captured.trx_balances_complete);
+        let rows = captured.trx_balance_changes;
+        assert_eq!(rows.len(), 2, "unchanged negative accounts are omitted");
+        assert_eq!((rows[0].balance_before, rows[0].balance_after), (i64::MIN, i64::MAX));
+        assert_eq!((rows[1].balance_before, rows[1].balance_after), (7, -1));
+    }
+
+    #[test]
+    fn native_balances_are_final_native_only_sorted_and_complete() {
+        let id = BlockId::from_hash_and_num(&[1; 32], 1);
+        let mut other = account_delta(9, Some(30), Some(40));
+        other.store = UndoStoreId::DynProps;
+        let deltas = vec![
+            account_delta(3, Some(8), None),
+            account_delta(1, None, Some(7)),
+            account_delta(2, Some(5), Some(5)),
+            other,
+        ];
+        let captured = capture_balances(&id, Some(&deltas)).unwrap();
+        assert!(captured.trx_balances_complete);
+        assert_eq!(
+            captured
+                .trx_balance_changes
+                .iter()
+                .map(|c| (c.address[1], c.balance_before, c.balance_after))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 7), (3, 8, 0)]
+        );
+        assert!(
+            capture_balances(&id, Some(&[]))
+                .unwrap()
+                .trx_balances_complete
+        );
+        assert!(!capture_balances(&id, None).unwrap().trx_balances_complete);
+        let mut wrong_image = account_delta(1, Some(7), Some(8));
+        wrong_image.key[1] = 2;
+        assert!(capture_balances(&id, Some(&[wrong_image])).is_err());
+        assert!(capture_balances(&id, Some(&[deltas[0].clone(), deltas[0].clone()])).is_err());
+    }
+
+    #[test]
+    fn native_balance_sidecar_repairs_gaps_and_never_crosses_forks() {
+        let rig = Rig::new("native-repair");
+        let w = rig.open();
+        rig.apply(&w, 1);
+        let (block, id, ret) = rig.make_block(2, 0);
+        rig.persist(&block, &id, &ret);
+        w.persist_balances(&id, Some(&[account_delta(1, Some(7), Some(15))]))
+            .unwrap();
+        drop(w); // Capture persisted, log append lost.
+        let w = rig.open();
+        rig.apply(&w, 3);
+        let entries = rig.entries();
+        let apply = match &entries[1].event {
+            Some(fh::entry::Event::Apply(a)) => a,
+            _ => panic!(),
+        };
+        assert!(apply.trx_balances_complete);
+        assert_eq!(apply.trx_balance_changes[0].balance_after, 15);
+        let (fork, fork_id, fork_ret) = rig.make_block(2, 1);
+        rig.persist(&fork, &fork_id, &fork_ret);
+        let repaired = w.derive_from_stores(2, 1).unwrap().unwrap();
+        assert!(
+            !repaired.trx_balances_complete,
+            "old fork sidecar must not match"
+        );
+        w.persist_balances(&fork_id, Some(&[])).unwrap();
+        let repaired = w.derive_from_stores(2, 1).unwrap().unwrap();
+        assert!(repaired.trx_balances_complete);
+        assert!(repaired.trx_balance_changes.is_empty());
+        w.persist_balances(&fork_id, None).unwrap();
+        assert!(
+            !w.derive_from_stores(2, 1)
+                .unwrap()
+                .unwrap()
+                .trx_balances_complete
+        );
+        std::fs::remove_dir_all(rig.dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_status_without_block_ret_and_partial_receipt_gap() {
+        let rig = Rig::new("receipt-status");
+        let (mut block, _, mut ret) = rig.make_block(1, 0);
+        block.transactions[0].ret.clear();
+        ret.transactioninfo[0].receipt = Some(tron_proto::ResourceReceipt {
+            result: tron_proto::transaction::result::ContractResult::Success as i32,
+            ..Default::default()
+        });
+        let event = build_apply(1, &block, Some(&ret), 1);
+        assert!(event.txs[0].success);
+        assert!(!event.txinfo_missing);
+        ret.transactioninfo[0].receipt.as_mut().unwrap().result =
+            tron_proto::transaction::result::ContractResult::Revert as i32;
+        assert!(!build_apply(1, &block, Some(&ret), 1).txs[0].success);
+        // A present TransactionRet container is insufficient: every tx needs
+        // its own info or the consumer must stop rather than miss events.
+        let mut second = block.transactions[0].clone();
+        second.raw_data.as_mut().unwrap().data.push(99);
+        block.transactions.push(second);
+        assert!(build_apply(1, &block, Some(&ret), 1).txinfo_missing);
+        std::fs::remove_dir_all(rig.dir).unwrap();
+    }
 
     fn mem() -> Arc<dyn KvBackend> {
         Arc::new(MemBackend::new())
@@ -554,9 +929,8 @@ mod tests {
             let tx = tron_proto::Transaction {
                 raw_data: Some(tron_proto::transaction::Raw {
                     contract: vec![tron_proto::transaction::Contract {
-                        r#type:
-                            tron_proto::transaction::contract::ContractType::TransferContract
-                                as i32,
+                        r#type: tron_proto::transaction::contract::ContractType::TransferContract
+                            as i32,
                         parameter: Some(prost_types::Any {
                             type_url: String::new(),
                             value: c.encode_to_vec(),
@@ -567,14 +941,12 @@ mod tests {
                     ..Default::default()
                 }),
                 ret: vec![tron_proto::transaction::Result {
-                    contract_ret:
-                        tron_proto::transaction::result::ContractResult::Success as i32,
+                    contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
             };
-            let tx_id =
-                tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
+            let tx_id = tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
             let block = Block {
                 transactions: vec![tx],
                 block_header: Some(tron_proto::BlockHeader {
@@ -604,7 +976,9 @@ mod tests {
         /// node has already done by the time the hook fires.
         fn persist(&self, block: &Block, id: &BlockId, ret: &TransactionRet) {
             BlockStore::new(self.blocks.clone()).put(id, block).unwrap();
-            BlockIndexStore::new(self.block_index.clone()).put(id).unwrap();
+            BlockIndexStore::new(self.block_index.clone())
+                .put(id)
+                .unwrap();
             TransactionRetStore::new(self.txret.clone())
                 .put(id.num() as i64, ret)
                 .unwrap();
@@ -663,7 +1037,9 @@ mod tests {
         rig.apply(&w, 2);
         let entries = rig.entries();
         assert_eq!(heights(&entries), vec![('A', 1), ('A', 2)]);
-        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else { panic!() };
+        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else {
+            panic!()
+        };
         assert_eq!(a.txs.len(), 1);
         let tx = &a.txs[0];
         assert!(tx.success);
@@ -711,12 +1087,54 @@ mod tests {
         let w = rig.open();
         rig.apply(&w, 4);
         let entries = rig.entries();
-        assert_eq!(heights(&entries), vec![('A', 1), ('A', 2), ('A', 3), ('A', 4)]);
+        assert_eq!(
+            heights(&entries),
+            vec![('A', 1), ('A', 2), ('A', 3), ('A', 4)]
+        );
         // Repaired entries carry the same decoded facts as live ones.
-        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else { panic!() };
+        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else {
+            panic!()
+        };
         assert_eq!(a.txs[0].amount, 20);
         assert!(!a.txinfo_missing);
         assert_eq!(w.counters().gap_repaired_blocks.load(Ordering::Relaxed), 2);
+    }
+
+    /// A power loss left a zero-filled region after the last fsynced entry.
+    /// It frames as length/CRC-valid empty entries, and the old open took
+    /// such a head for an EMPTY log: no reconciliation, no gap repair — the
+    /// next apply landed as an orphan far above the last logged height. The
+    /// head must be the last real entry, so the lost heights re-derive.
+    #[test]
+    fn zero_filled_tail_is_not_an_empty_log() {
+        let rig = Rig::new("zerotail");
+        {
+            let w = rig.open();
+            rig.apply(&w, 1);
+            rig.apply(&w, 2);
+        }
+        let seg = std::fs::read_dir(&rig.dir).unwrap().next().unwrap().unwrap().path();
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes.extend_from_slice(&[0u8; 341 * 8]);
+        std::fs::write(&seg, bytes).unwrap();
+        // Blocks 3-4 were applied by the chain but their entries were lost.
+        for h in 3..=4 {
+            let (block, id, ret) = rig.make_block(h, 0);
+            rig.persist(&block, &id, &ret);
+        }
+
+        let w = rig.open();
+        rig.apply(&w, 5);
+        let entries = rig.entries();
+        assert_eq!(
+            heights(&entries),
+            vec![('A', 1), ('A', 2), ('A', 3), ('A', 4), ('A', 5)]
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "the zero-fill consumed no seqs"
+        );
     }
 
     /// When the APPLY following a reorg's UNWIND cannot be appended, the
@@ -866,7 +1284,10 @@ mod tests {
         assert_eq!(itxs.len(), 2);
         // Plain call leg: TRX value carried, no phantom token id.
         assert_eq!(itxs[0].call_value, 7);
-        assert_eq!(itxs[0].token_id, "", "the \"0\" sentinel must not surface as a token");
+        assert_eq!(
+            itxs[0].token_id, "",
+            "the \"0\" sentinel must not surface as a token"
+        );
         // Real TRC10 move: positive id preserved.
         assert_eq!(itxs[1].token_id, "1000001");
     }
@@ -885,7 +1306,11 @@ mod tests {
         let w = rig.open();
         let entries = rig.entries();
         assert_eq!(entries.len(), 6);
-        assert_eq!(heights(&entries)[5], ('U', 3), "startup unwind to the recovered head");
+        assert_eq!(
+            heights(&entries)[5],
+            ('U', 3),
+            "startup unwind to the recovered head"
+        );
         // Re-applying 4 continues normally (no extra unwind).
         rig.apply(&w, 4);
         assert_eq!(heights(&rig.entries())[6], ('A', 4));
@@ -933,10 +1358,25 @@ mod tests {
         let entries = rig.entries();
         assert_eq!(
             heights(&entries),
-            vec![('A', 1), ('A', 2), ('A', 3), ('A', 4), ('A', 5), ('U', 3), ('A', 4), ('A', 5)]
+            vec![
+                ('A', 1),
+                ('A', 2),
+                ('A', 3),
+                ('A', 4),
+                ('A', 5),
+                ('U', 3),
+                ('A', 4),
+                ('A', 5)
+            ]
         );
-        let Some(fh::entry::Event::Apply(a)) = &entries[6].event else { panic!() };
-        assert_eq!(a.block_id, id4b.as_bytes().to_vec(), "height 4 repairs to the canonical branch");
+        let Some(fh::entry::Event::Apply(a)) = &entries[6].event else {
+            panic!()
+        };
+        assert_eq!(
+            a.block_id,
+            id4b.as_bytes().to_vec(),
+            "height 4 repairs to the canonical branch"
+        );
     }
 
     /// A log head at `APPLY(N, B)` whose canonical id at height N is a

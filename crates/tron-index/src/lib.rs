@@ -30,6 +30,8 @@ pub mod db;
 pub mod engine;
 pub mod extract;
 pub mod firehose_log;
+pub mod history_control;
+pub use history_control::{HistoryAck, HistoryControl};
 pub mod keys;
 pub mod query;
 pub mod rows;
@@ -49,7 +51,7 @@ pub use commitment::{
 pub use db::{IndexDb, IndexError, InitOutcome, FORMAT_VERSION};
 pub use engine::{EngineOptions, IndexCounters, IndexEngine, IndexStatus, Tick};
 pub use extract::{
-    created_contract_address, extract_block, tx_facts, CaptureSet, TxFacts, TxInfoMatcher,
+    created_contract_address, extract_block, transaction_succeeded, tx_facts, CaptureSet, TxFacts, TxInfoMatcher,
     TRANSFER_TOPIC,
 };
 pub use firehose_log::{

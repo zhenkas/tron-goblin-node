@@ -54,4 +54,10 @@ fn main() {
         .build_server(true)
         .compile_protos(&[firehose_proto], &[PathBuf::from("proto")])
         .expect("firehose tonic codegen failed");
+
+    let assist_proto = PathBuf::from("proto/assisted_sync.proto");
+    println!("cargo:rerun-if-changed={}", assist_proto.display());
+    tonic_build::configure().build_client(true).build_server(true)
+        .compile_protos(&[assist_proto], &[PathBuf::from("proto")])
+        .expect("assisted sync tonic codegen failed");
 }

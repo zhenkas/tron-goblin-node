@@ -35,9 +35,22 @@ async fn http_call(addr: std::net::SocketAddr, body: Value) -> Value {
 
 #[tokio::test]
 async fn node_starts_serves_rpc_and_shuts_down_cleanly() {
+    runtime_smoke(tron_chainbase::KvEngine::Rocksdb).await;
+}
+#[tokio::test]
+async fn tidesdb_node_starts_serves_rpc_and_shuts_down_cleanly() {
+    runtime_smoke(tron_chainbase::KvEngine::Tidesdb).await;
+}
+async fn runtime_smoke(engine: tron_chainbase::KvEngine) {
     let data_dir = temp_dir();
     let mut config = tron_node::NodeConfig::default();
     config.data_dir = data_dir.clone();
+    config.storage.backend = engine;
+    config.storage.write_buffer_size_mb = 1;
+    config.storage.max_open_files = 32;
+    config.storage.tidesdb.write_buffer_size_mb = 1;
+    config.storage.tidesdb.block_cache_mb = 1;
+    config.storage.tidesdb.max_open_sstables = 64;
     // Bind on :0 by tweaking the host+port via TcpListener pre-binding —
     // we ask the OS for a free port up front and pass it through.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -46,8 +59,8 @@ async fn node_starts_serves_rpc_and_shuts_down_cleanly() {
     config.rpc.host = "127.0.0.1".into();
     config.rpc.port = bound.port();
     config.p2p.disabled = true; // no peers — RPC-only
-    // Disable every other server so two parallel smoke tests don't
-    // fight over their default ports.
+                                // Disable every other server so two parallel smoke tests don't
+                                // fight over their default ports.
     config.metrics.disabled = true;
     config.grpc.disabled = true;
     config.http.disabled = true;

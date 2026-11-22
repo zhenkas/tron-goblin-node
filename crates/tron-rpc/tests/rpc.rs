@@ -765,6 +765,7 @@ async fn eth_call_runs_simple_contract_when_evm_backends_attached() {
         code: code_be,
         storage: storage_be,
         witnesses: witnesses_be,
+        votes: mem(),
         contract_state: contract_state_be,
         dyn_props: dp_be,
         delegated_resources: delegated_be,
@@ -1766,33 +1767,15 @@ async fn get_now_block_solidity_returns_solid_head_block() {
 }
 
 #[tokio::test]
-async fn get_account_solidity_matches_get_account_shape() {
+async fn get_account_solidity_refuses_live_state_without_archive() {
     let (addr, accounts, ..) = spawn_server().await;
-    let mut a = [0u8; 21];
-    a[0] = 0x41;
-    a[1..].fill(0x99);
-    accounts.put(
-        &Address::from_raw(a),
-        &Account {
-            address: a.to_vec(),
-            balance: 42,
-            ..Default::default()
-        },
-    ).unwrap();
-    let resp = call(
-        addr,
-        json!({"jsonrpc":"2.0","method":"getAccountSolidity",
-               "params":["0x9999999999999999999999999999999999999999"],"id":1}),
-    )
-    .await;
-    // No solidified snapshot exists, so this aliases live state — but the
-    // shape must be byte-identical to java's `walletsolidity/getaccount`
-    // (the live `Account` proto JSON). No non-java marker field.
-    assert_eq!(resp["result"]["balance"], 42);
-    assert!(
-        resp["result"].get("__solidified").is_none(),
-        "non-java __solidified field must not be emitted"
-    );
+    let mut a = [0x99u8; 21]; a[0] = 0x41;
+    accounts.put(&Address::from_raw(a),
+        &Account {address:a.to_vec(),balance:42,..Default::default()}).unwrap();
+    let resp=call(addr,json!({"jsonrpc":"2.0","method":"getAccountSolidity",
+        "params":["0x9999999999999999999999999999999999999999"],"id":1})).await;
+    assert!(resp["error"]["message"].as_str().unwrap().contains("capture_state_deltas"));
+    assert!(resp.get("result").is_none());
 }
 
 #[tokio::test]
@@ -3150,6 +3133,7 @@ async fn get_contract_info_matches_java_wrapper_shape() {
         code: code_be.clone(),
         storage: storage_be.clone(),
         witnesses: mem(),
+        votes: mem(),
         contract_state: contract_state_be.clone(),
         dyn_props: dp_be.clone(),
         delegated_resources: mem(),

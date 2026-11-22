@@ -11,7 +11,7 @@ use tron_proto::{
     WithdrawExpireUnfreezeContract,
 };
 
-use crate::freeze::{FROZEN_PERIOD_MS, TRX_PRECISION};
+use crate::freeze::TRX_PRECISION;
 use crate::helpers::{check_add, check_sub, require_owner};
 use crate::transfer::ExecutionResult;
 use crate::ActuatorError;
@@ -30,8 +30,7 @@ fn require_unfreeze_delay(dyn_props: &DynamicPropertiesStore) -> Result<(), Actu
 }
 
 fn unfreeze_delay_ms(dyn_props: &DynamicPropertiesStore) -> i64 {
-    let days = dyn_props.get_long(b"UNFREEZE_DELAY_DAYS").unwrap_or(14);
-    days * (FROZEN_PERIOD_MS / 3)
+    tron_tvm::unfreeze_delay_ms(dyn_props)
 }
 
 fn resource_valid(r: i32, dyn_props: &DynamicPropertiesStore) -> bool {
@@ -85,6 +84,9 @@ pub fn execute_freeze_balance_v2(
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    if dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1 {
+        tron_tvm::votes::initialize_old_tron_power(&mut account);
+    }
     account.balance = check_sub(account.balance, contract.frozen_balance)?;
 
     // Capture the old weight basis BEFORE mutating frozen_v2 — java-tron's

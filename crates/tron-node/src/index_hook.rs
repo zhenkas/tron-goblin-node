@@ -39,6 +39,8 @@ use tron_types::BlockId;
 /// Shared between the apply paths (writers) and the follower task
 /// (waiter). Cheap to clone.
 pub struct IndexHook {
+    processing_stats:
+        std::sync::Mutex<Option<Arc<crate::assisted_sync::processing::ProcessingStats>>>,
     ret_store: TransactionRetStore,
     /// `trans` store — tx-id → block-num refs, written per block so
     /// `gettransactionbyid` / `gettransactioninfobyid` resolve live
@@ -76,8 +78,16 @@ pub struct IndexHook {
 }
 
 impl IndexHook {
+    pub(crate) fn attach_processing_stats(
+        &self,
+        stats: Arc<crate::assisted_sync::processing::ProcessingStats>,
+    ) {
+        *self.processing_stats.lock().expect("statistics attachment") = Some(stats);
+    }
+
     pub fn new(transaction_ret_backend: Arc<dyn KvBackend>) -> Self {
         Self {
+            processing_stats: std::sync::Mutex::new(None),
             ret_store: TransactionRetStore::new(transaction_ret_backend.clone()),
             tx_refs: None,
             tx_refs_backend: None,
@@ -123,6 +133,74 @@ impl IndexHook {
         self
     }
 
+    /// Imports already contain receipts and tx references in their redo
+    /// record. Only record derived archive data and append the supplied
+    /// complete event; never rebuild receipts from an empty execution report.
+    pub(crate) fn on_assisted_rewind(&self, height: i64) -> Result<(), String> {
+        self.firehose
+            .as_ref()
+            .ok_or("assisted sync requires Firehose")?
+            .align_assisted_head(height)
+            .map_err(|e| e.to_string())?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn on_assisted_block(
+        &self,
+        _block: &Block,
+        block_id: &[u8],
+        deltas: &[tron_executor::CapturedDelta],
+        event: tron_grpc::firehose_proto::BlockApplied,
+    ) -> Result<(), String> {
+        let height = event.height;
+        if event.block_id != block_id {
+            return Err("import event ID differs".into());
+        }
+        if let Some(archive) = &self.archive {
+            let refs: Vec<_> = deltas
+                .iter()
+                .map(|d| tron_index::DeltaRef {
+                    store: d.store,
+                    key: &d.key,
+                    before: d.before.as_deref(),
+                    after: d.after.as_deref(),
+                })
+                .collect();
+            archive
+                .on_block_applied(height, Some(&refs))
+                .map_err(|e| e.to_string())?;
+        }
+        self.firehose
+            .as_ref()
+            .ok_or("assisted imports require Firehose")?
+            .import_apply(event)
+            .map_err(|e| e.to_string())?;
+        if let Some(tx) = &self.commitment_tx {
+            let changes = deltas
+                .iter()
+                .map(|d| tron_index::CommitmentDeltaRef {
+                    store: d.store,
+                    key: d.key.clone(),
+                    after: d.after.clone(),
+                })
+                .collect();
+            if tx
+                .try_send(tron_index::CommitmentMsg::Block {
+                    height,
+                    deltas: changes,
+                })
+                .is_err()
+            {
+                if let Some(c) = &self.commitment_counters {
+                    c.lagged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
     /// The follower parks on this between gap-closing passes.
     pub fn notify_handle(&self) -> Arc<tokio::sync::Notify> {
         self.notify.clone()
@@ -139,7 +217,10 @@ impl IndexHook {
     ) {
         let ret = build_transaction_ret(block, block_id, report);
         if let Some(tx_refs) = &self.tx_refs {
-            let refs = report.tx_results.iter().map(|r| (r.tx_id, block_id.num() as i64));
+            let refs = report
+                .tx_results
+                .iter()
+                .map(|r| (r.tx_id, block_id.num() as i64));
             if let Err(e) = tx_refs.put_block_refs(refs) {
                 tracing::warn!(
                     block = block_id.num(),
@@ -154,6 +235,12 @@ impl IndexHook {
                 error = %e,
                 "index hook: transactionRetStore put failed; block stands, range will lack txinfo"
             );
+        }
+        if let Some(firehose) = &self.firehose {
+            if let Err(e) = firehose.persist_balances(block_id, report.state_deltas.as_deref()) {
+                tracing::error!(block = block_id.num(), error = %e,
+                    "index hook: TRX capture unavailable; consumers must stop at incomplete entries");
+            }
         }
         // Durability barrier for the txinfo store. It sits OUTSIDE the
         // consensus checkpoint manifest, so a power loss could keep a
@@ -241,7 +328,10 @@ impl IndexHook {
                         .collect()
                 })
                 .unwrap_or_default();
-            if tx.try_send(tron_index::CommitmentMsg::Block { height, deltas }).is_err() {
+            if tx
+                .try_send(tron_index::CommitmentMsg::Block { height, deltas })
+                .is_err()
+            {
                 // Drop-and-record: never block apply on the builder. The dropped
                 // height becomes a gap the builder detects and repairs (resume
                 // source, else re-bootstrap); count the backpressure for metrics.
@@ -257,6 +347,16 @@ impl IndexHook {
         }
         // notify_one stores a permit when no waiter is parked, so a
         // wake-up that lands mid-tick is never lost.
+        if let Some(stats) = self
+            .processing_stats
+            .lock()
+            .expect("statistics attachment")
+            .clone()
+        {
+            if let Err(error) = stats.local(block_id.num() as i64, block_id.as_bytes()) {
+                tracing::error!(%error,"processing statistics persistence failed");
+            }
+        }
         self.notify.notify_one();
     }
 }
@@ -311,11 +411,7 @@ pub fn build_transaction_ret(
                 // java-tron's exact aggregation
                 // (`TransactionUtil.buildTransactionInfoInstance`):
                 // `ret.fee + energyFee + netFee + multiSignFee + memoFee`.
-                fee: res.actuator_fee
-                    + r.energy_fee
-                    + r.net_fee
-                    + r.multi_sign_fee
-                    + r.memo_fee,
+                fee: res.actuator_fee + r.energy_fee + r.net_fee + r.multi_sign_fee + r.memo_fee,
                 block_number,
                 block_time_stamp,
                 contract_address: vm_contract_address(tx, &res.tx_id),
@@ -356,8 +452,7 @@ pub fn build_transaction_ret(
                 // structured halt detail not yet plumbed here).
                 res_message: if res.outcome.is_success() {
                     Vec::new()
-                } else if r.result
-                    == tron_proto::transaction::result::ContractResult::Revert as i32
+                } else if r.result == tron_proto::transaction::result::ContractResult::Revert as i32
                 {
                     b"REVERT opcode executed".to_vec()
                 } else {
@@ -389,18 +484,26 @@ pub fn build_transaction_ret(
         })
         .collect();
 
-    TransactionRet { block_number, block_time_stamp, transactioninfo: infos }
+    TransactionRet {
+        block_number,
+        block_time_stamp,
+        transactioninfo: infos,
+    }
 }
 
 /// The `contract_address` java-tron stamps on a VM tx's
 /// `TransactionInfo`: the called contract for a trigger, the derived
-/// address (`0x41 ‖ keccak256(owner ‖ tx_id)[12..]`) for a create.
+/// address (`0x41 ‖ keccak256(tx_id ‖ owner)[12..]`) for a create.
 /// Empty for non-VM txs.
 fn vm_contract_address(tx: &tron_proto::Transaction, tx_id: &[u8; 32]) -> Vec<u8> {
     let Some(contract) = tx.raw_data.as_ref().and_then(|r| r.contract.first()) else {
         return Vec::new();
     };
-    let param = contract.parameter.as_ref().map(|p| p.value.as_slice()).unwrap_or(&[]);
+    let param = contract
+        .parameter
+        .as_ref()
+        .map(|p| p.value.as_slice())
+        .unwrap_or(&[]);
     match ContractType::try_from(contract.r#type).ok() {
         Some(ContractType::TriggerSmartContract) => {
             tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param)
@@ -446,8 +549,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let tx_id =
-            tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
+        let tx_id = tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
         let block = Block {
             transactions: vec![tx],
             block_header: Some(tron_proto::BlockHeader {
@@ -463,7 +565,11 @@ mod tests {
         (block, id, tx_id)
     }
 
-    fn report_for(id: &BlockId, tx_id: [u8; 32], success: bool) -> tron_executor::BlockExecutionReport {
+    fn report_for(
+        id: &BlockId,
+        tx_id: [u8; 32],
+        success: bool,
+    ) -> tron_executor::BlockExecutionReport {
         tron_executor::BlockExecutionReport {
             block_id: *id,
             tx_results: vec![TxResult {
@@ -516,9 +622,16 @@ mod tests {
         assert_eq!(ret.transactioninfo.len(), 1);
         let info = &ret.transactioninfo[0];
         assert_eq!(info.id, tx_id.to_vec());
-        assert_eq!(info.result, tron_proto::transaction_info::Code::Sucess as i32);
+        assert_eq!(
+            info.result,
+            tron_proto::transaction_info::Code::Sucess as i32
+        );
         assert_eq!(info.log.len(), 1);
-        assert_eq!(info.log[0].address.len(), 20, "VM 20-byte form, java-tron stored shape");
+        assert_eq!(
+            info.log[0].address.len(),
+            20,
+            "VM 20-byte form, java-tron stored shape"
+        );
         // Receipt + fee + return data ride through.
         let receipt = info.receipt.as_ref().expect("receipt present");
         assert_eq!(receipt.net_usage, 265);
@@ -528,7 +641,10 @@ mod tests {
         // java-tron always stores contractResult as a one-element list.
         assert_eq!(info.contract_result, vec![vec![0xAB]]);
         assert_eq!(info.contract_result.len(), 1);
-        assert!(info.res_message.is_empty(), "success carries no res_message");
+        assert!(
+            info.res_message.is_empty(),
+            "success carries no res_message"
+        );
 
         let failed = build_transaction_ret(&block, &id, &report_for(&id, tx_id, false));
         assert_eq!(
@@ -561,7 +677,10 @@ mod tests {
         let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
         let info = &ret.transactioninfo[0];
         assert_eq!(info.contract_result.len(), 1, "always a one-element list");
-        assert!(info.contract_result[0].is_empty(), "single zero-length entry");
+        assert!(
+            info.contract_result[0].is_empty(),
+            "single zero-length entry"
+        );
         // Non-revert failure keeps our outcome description, not the
         // java REVERT literal.
         assert_ne!(info.res_message, b"REVERT opcode executed".to_vec());
@@ -594,7 +713,10 @@ mod tests {
         let info = &ret.transactioninfo[0];
         assert_eq!(info.res_message, b"REVERT opcode executed".to_vec());
         assert_eq!(info.contract_result.len(), 1, "always a one-element list");
-        assert_eq!(info.contract_result[0], payload, "revert payload rides through");
+        assert_eq!(
+            info.contract_result[0], payload,
+            "revert payload rides through"
+        );
     }
 
     /// F4 receipt-fidelity: the non-fee actuator `ret` fields must ride from
@@ -635,8 +757,14 @@ mod tests {
         };
         let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
         let info = &ret.transactioninfo[0];
-        assert_eq!(info.withdraw_amount, 12_345, "WithdrawBalance carries withdraw_amount");
-        assert_eq!(info.asset_issue_id, "1000001", "AssetIssue carries asset_issue_id");
+        assert_eq!(
+            info.withdraw_amount, 12_345,
+            "WithdrawBalance carries withdraw_amount"
+        );
+        assert_eq!(
+            info.asset_issue_id, "1000001",
+            "AssetIssue carries asset_issue_id"
+        );
         assert_eq!(info.unfreeze_amount, 777);
         assert_eq!(info.exchange_id, 5);
         assert_eq!(info.withdraw_expire_amount, 88);
@@ -658,7 +786,23 @@ mod tests {
         let hook = IndexHook::new(backend.clone());
         let (block, id, tx_id) = block_with_transfer();
         hook.on_block_applied(&block, &id, &report_for(&id, tx_id, true));
-        let got = TransactionRetStore::new(backend).get(7).unwrap().expect("persisted");
+        let got = TransactionRetStore::new(backend)
+            .get(7)
+            .unwrap()
+            .expect("persisted");
         assert_eq!(got.transactioninfo[0].id, tx_id.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod deployment_address_tests {
+    #[test]
+    fn indexed_creation_address_matches_the_vm_execution_address() {
+        let owner = [0x41u8; 21];
+        let txid = [0xabu8; 32];
+        assert_eq!(
+            tron_index::created_contract_address(&owner, &txid),
+            tron_tvm::execute::derive_top_level_contract_address(&txid, &owner)
+        );
     }
 }

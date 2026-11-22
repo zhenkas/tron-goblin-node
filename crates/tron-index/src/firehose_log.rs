@@ -28,6 +28,22 @@
 //! protocol (consumers resume by last-applied seq) makes that loss
 //! safe, and the node's writer re-derives the lost entries from its
 //! stores.
+//!
+//! ### Padding frames (zero-filled regions)
+//!
+//! A zero-length frame is 8 zero bytes (`len = 0`, and the CRC32 of an
+//! empty payload is `0`), so a region the filesystem zero-filled after
+//! a power loss (file size persisted, data blocks not) frames as a run
+//! of "valid" empty entries. No real entry is ever empty — `append`
+//! refuses one — so a zero-length frame is **padding**, never an entry:
+//!
+//! * a padding run at the tail of the newest segment is torn tail and
+//!   is truncated by the writer open like any other torn frame;
+//! * a padding run *followed by valid frames* (a log written by a
+//!   build that did not truncate it) is kept: the later frames' seqs
+//!   were already handed out counting the padding, so each padding
+//!   frame keeps consuming one seq. Readers return it as an empty
+//!   payload and callers skip it; `head`/`last_before` never return it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -169,6 +185,25 @@ impl FirehoseLogReader {
         Self { dir: dir.into() }
     }
 
+    /// Inspect one immutable closed segment without holding the apply writer lock.
+    /// An incomplete/corrupt segment is never eligible for deletion.
+    pub fn oldest_closed_end_if(
+        &self, durable: u64, mut eligible: impl FnMut(&[u8]) -> bool,
+    ) -> Result<Option<u64>, IndexError> {
+        let segments = list_segments(&self.dir)?;
+        if segments.len() < 2 || segments[1].0.saturating_sub(1) > durable { return Ok(None); }
+        let mut all = true;
+        let (next, _) = scan_segment_from(&segments[0].1, (segments[0].0, 8), segments[1].0 - 1, |_, payload| {
+            // Padding carries no history, so it never pins a segment.
+            all = payload.is_empty() || eligible(&payload);
+            all
+        })?;
+        Ok((all && next == segments[1].0).then_some(segments[1].0))
+    }
+    /// First seq of every retained segment, oldest first.
+    pub fn segment_starts(&self) -> Result<Vec<u64>, IndexError> {
+        Ok(list_segments(&self.dir)?.into_iter().map(|(s, _)| s).collect())
+    }
     /// Oldest seq still retained, if any entries exist.
     pub fn oldest_seq(&self) -> Result<Option<u64>, IndexError> {
         Ok(list_segments(&self.dir)?.first().map(|(s, _)| *s))
@@ -177,6 +212,7 @@ impl FirehoseLogReader {
     /// Collect up to `limit` entries with `seq >= from_seq`, in order.
     /// A `from_seq` older than retention starts at the oldest retained
     /// entry (the consumer sees the jump in the returned seqs).
+    /// Padding frames are returned as empty payloads (see module docs).
     pub fn read_from(
         &self,
         from_seq: u64,
@@ -210,7 +246,8 @@ impl FirehoseLogReader {
     /// tail O(new data) instead of re-scanning (and re-CRC-ing) the
     /// active segment from its start on every wake-up. A stale `pos`
     /// (rotated/pruned segment, mismatched seq) silently falls back to
-    /// the locate-by-seq path.
+    /// the locate-by-seq path. Padding frames are returned as empty
+    /// payloads (they consume a seq; see module docs) — skip them.
     pub fn read_chunk(
         &self,
         from_seq: u64,
@@ -277,19 +314,30 @@ impl FirehoseLogReader {
         Ok((out, next_pos))
     }
 
-    /// The newest entry `(seq, payload)`, if any.
+    /// The newest entry `(seq, payload)`, if any. Never a padding frame:
+    /// a zero-filled tail must not masquerade as the log head.
     pub fn head(&self) -> Result<Option<(u64, Vec<u8>)>, IndexError> {
+        self.last_before(u64::MAX)
+    }
+
+    /// The newest non-padding entry with `seq < before`, if retained.
+    pub fn last_before(&self, before: u64) -> Result<Option<(u64, Vec<u8>)>, IndexError> {
         let segments = list_segments(&self.dir)?;
         for (first_seq, path) in segments.into_iter().rev() {
+            if first_seq >= before {
+                continue;
+            }
             let mut last: Option<(u64, Vec<u8>)> = None;
-            scan_segment_from(&path, (first_seq, 8), u64::MAX, |seq, payload| {
-                last = Some((seq, payload));
+            scan_segment_from(&path, (first_seq, 8), before - 1, |seq, payload| {
+                if !payload.is_empty() {
+                    last = Some((seq, payload));
+                }
                 true
             })?;
             if last.is_some() {
                 return Ok(last);
             }
-            // Empty/torn-to-empty segment: look at the previous one.
+            // Empty/torn-to-empty/all-padding segment: look at the previous one.
         }
         Ok(None)
     }
@@ -306,9 +354,11 @@ impl FirehoseLogReader {
 pub struct FirehoseTailHandle {
     dir: PathBuf,
     durable_rx: tokio::sync::watch::Receiver<u64>,
+    history: Option<std::sync::Arc<crate::HistoryControl>>,
 }
 
 impl FirehoseTailHandle {
+    pub fn history_control(&self) -> Option<std::sync::Arc<crate::HistoryControl>> { self.history.clone() }
     pub fn reader(&self) -> FirehoseLogReader {
         FirehoseLogReader::new(self.dir.clone())
     }
@@ -341,6 +391,7 @@ pub struct FirehoseLogWriter {
     seg_bytes: u64,
     next_seq: u64,
     retain_bytes: u64,
+    history: Option<std::sync::Arc<crate::HistoryControl>>,
     /// Latest fsynced seq — what tailers are allowed to see.
     durable_tx: tokio::sync::watch::Sender<u64>,
 }
@@ -378,7 +429,25 @@ impl FirehoseLogWriter {
                 f.sync_all().ok();
                 (seg_first_seq, 8)
             } else {
-                scan_segment_from(&path, (seg_first_seq, 8), u64::MAX, |_, _| true)?
+                // The recovery point is just past the last REAL frame, not the
+                // last frame that passes the length/CRC check: 8 zero bytes are
+                // a "valid" zero-length frame (CRC32 of nothing is 0), so a tail
+                // the filesystem zero-filled after a power loss scans as a run
+                // of empty entries. Keeping it would hand its seqs out as
+                // durable entries that decode to nothing and make `head()` see
+                // an empty log. A trailing padding run is therefore torn tail
+                // and is truncated below; padding FOLLOWED by a real frame is
+                // kept, because the seqs after it were already handed out.
+                let mut end = 8u64;
+                let mut real = (seg_first_seq, 8u64);
+                scan_segment_from(&path, (seg_first_seq, 8), u64::MAX, |seq, payload| {
+                    end += (FRAME_HEADER + payload.len()) as u64;
+                    if !payload.is_empty() {
+                        real = (seq + 1, end);
+                    }
+                    true
+                })?;
+                real
             }
         } else {
             let mut f = File::create(&path)
@@ -417,10 +486,23 @@ impl FirehoseLogWriter {
             seg_bytes: good_end,
             next_seq,
             retain_bytes,
+            history: None,
             durable_tx,
         })
     }
 
+    /// Disable independent byte-budget eviction while ACK-based history retention owns it.
+    pub fn manage_history(&mut self, control: std::sync::Arc<crate::HistoryControl>) {
+        self.history = Some(control);
+    }
+    /// Unlink at most one closed segment, after it was inspected outside the writer lock.
+    pub fn prune_oldest_before(&mut self, before_seq: u64) -> Result<bool, IndexError> {
+        if self.history.is_none() { return Err(IndexError::Io("history retention is not managed".into())); }
+        let segments = list_segments(&self.dir)?;
+        if segments.len() < 2 || segments[1].0 > before_seq { return Ok(false); }
+        std::fs::remove_file(&segments[0].1).map_err(|e| IndexError::Io(format!("history segment unlink: {e}")))?;
+        Ok(true)
+    }
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -430,7 +512,7 @@ impl FirehoseLogWriter {
     }
 
     pub fn tail_handle(&self) -> FirehoseTailHandle {
-        FirehoseTailHandle { dir: self.dir.clone(), durable_rx: self.durable_tx.subscribe() }
+        FirehoseTailHandle { dir: self.dir.clone(), durable_rx: self.durable_tx.subscribe(), history: self.history.clone() }
     }
 
     /// Append one payload; returns its seq. Durable only after
@@ -446,6 +528,13 @@ impl FirehoseLogWriter {
                 payload.len(),
                 MAX_FRAME_PAYLOAD
             )));
+        }
+        // A zero-length frame is indistinguishable from zero-fill left by a
+        // power loss; it is reserved as padding (see module docs).
+        if payload.is_empty() {
+            return Err(IndexError::Io(
+                "firehose append: empty payload (zero-length frames are padding)".into(),
+            ));
         }
         if self.seg_bytes >= SEGMENT_TARGET_BYTES {
             self.rotate()?;
@@ -508,6 +597,7 @@ impl FirehoseLogWriter {
     /// budget (never the active segment). Consumers further behind
     /// than retention resume at the oldest retained seq.
     fn prune(&self) -> Result<(), IndexError> {
+        if self.history.is_some() { return Ok(()); }
         let segments = list_segments(&self.dir)?;
         let mut sizes: Vec<(u64, PathBuf, u64)> = Vec::with_capacity(segments.len());
         let mut total = 0u64;
@@ -614,6 +704,93 @@ mod tests {
             all,
             vec![(1, b"good-1".to_vec()), (2, b"good-2".to_vec()), (3, b"good-3".to_vec())]
         );
+    }
+
+    /// The on-disk shape a power loss left on mainnet: the last real frame,
+    /// then a zero-filled region up to the page boundary. 8 zero bytes are a
+    /// length/CRC-valid empty frame, so the old open kept them all as
+    /// durable entries.
+    #[test]
+    fn zero_filled_tail_is_truncated_on_open() {
+        let dir = tmp_dir("zerotail");
+        {
+            let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+            w.append(b"good-1").unwrap();
+            w.append(b"good-2").unwrap();
+            w.sync().unwrap();
+        }
+        let seg = list_segments(&dir).unwrap()[0].1.clone();
+        let good_len = std::fs::metadata(&seg).unwrap().len();
+        // 341 whole zero frames plus a ragged 5-byte remainder.
+        let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&vec![0u8; 341 * 8 + 5]).unwrap();
+        drop(f);
+
+        // The zero-fill is never the head, even before the writer repairs it.
+        assert_eq!(FirehoseLogReader::new(&dir).head().unwrap().unwrap().0, 2);
+
+        let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+        assert_eq!(w.next_seq(), 3, "zero-fill consumed no seqs");
+        assert_eq!(w.tail_handle().durable_seq(), 2);
+        assert_eq!(std::fs::metadata(&seg).unwrap().len(), good_len);
+        assert_eq!(w.append(b"good-3").unwrap(), 3);
+        w.sync().unwrap();
+        let all = FirehoseLogReader::new(&dir).read_from(1, 1000).unwrap();
+        assert_eq!(
+            all,
+            vec![(1, b"good-1".to_vec()), (2, b"good-2".to_vec()), (3, b"good-3".to_vec())]
+        );
+    }
+
+    /// The same damage after an old build already appended past it: the
+    /// zero frames were counted as entries, so the frames after them carry
+    /// seqs that include the padding. Nothing may be truncated or renumbered.
+    #[test]
+    fn padding_followed_by_entries_keeps_its_seqs() {
+        let dir = tmp_dir("zeromid");
+        {
+            let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+            w.append(b"good-1").unwrap();
+            w.append(b"good-2").unwrap();
+            w.sync().unwrap();
+        }
+        let seg = list_segments(&dir).unwrap()[0].1.clone();
+        let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&[0u8; 3 * 8]).unwrap(); // seqs 3, 4, 5
+        let late = b"late-6";
+        f.write_all(&(late.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&crc32(late).to_le_bytes()).unwrap();
+        f.write_all(late).unwrap();
+        // ...and a fresh zero-filled tail from a second power loss.
+        f.write_all(&[0u8; 16]).unwrap();
+        drop(f);
+
+        let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+        assert_eq!(w.next_seq(), 7, "interior padding keeps its seqs; the tail run is cut");
+        assert_eq!(w.append(b"new-7").unwrap(), 7);
+        w.sync().unwrap();
+
+        let r = FirehoseLogReader::new(&dir);
+        let all = r.read_from(1, 100).unwrap();
+        assert_eq!(all.iter().map(|(s, _)| *s).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+        assert!(all[2..5].iter().all(|(_, p)| p.is_empty()), "padding reads back empty");
+        assert_eq!(all[5], (6, b"late-6".to_vec()));
+        // Chunked reads stay seq-contiguous across the padding.
+        let (chunk, _) = r.read_chunk(2, 7, 100, None).unwrap();
+        assert_eq!(chunk.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![2, 3, 4, 5, 6, 7]);
+        // Padding is never "the entry before".
+        assert_eq!(r.last_before(6).unwrap(), Some((2, b"good-2".to_vec())));
+        assert_eq!(r.last_before(3).unwrap(), Some((2, b"good-2".to_vec())));
+        assert_eq!(r.last_before(1).unwrap(), None);
+        assert_eq!(r.head().unwrap().unwrap().0, 7);
+    }
+
+    #[test]
+    fn append_rejects_empty_payload() {
+        let dir = tmp_dir("emptypayload");
+        let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+        assert!(w.append(b"").is_err());
+        assert_eq!(w.append(b"ok").unwrap(), 1);
     }
 
     #[test]
@@ -739,5 +916,24 @@ mod tests {
             FirehoseLogReader::new(&dir).read_from(1, 10).unwrap(),
             vec![(1, b"ok".to_vec())]
         );
+    }
+}
+
+#[cfg(test)]
+mod history_retention_tests {
+    use super::*;
+    fn dir()->PathBuf {
+        let p=std::env::temp_dir().join(format!("history-log-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&p).unwrap();p
+    }
+    #[test] fn managed_retention_never_evicts_on_size_and_only_deletes_inspected_closed_segment(){
+        let dir=dir();let mut w=FirehoseLogWriter::open(&dir,1).unwrap();w.manage_history(std::sync::Arc::new(crate::HistoryControl::new(1)));
+        w.append(b"old").unwrap();w.sync().unwrap();w.seg_bytes=SEGMENT_TARGET_BYTES;
+        w.append(b"new").unwrap();w.sync().unwrap();
+        assert_eq!(w.reader().oldest_seq().unwrap(),Some(1));
+        assert_eq!(w.reader().oldest_closed_end_if(2,|p|p==b"new").unwrap(),None);
+        let next=w.reader().oldest_closed_end_if(2,|p|p==b"old").unwrap().unwrap();
+        assert!(w.prune_oldest_before(next).unwrap());assert_eq!(w.reader().oldest_seq().unwrap(),Some(2));
+        assert!(!w.prune_oldest_before(u64::MAX).unwrap());drop(w);std::fs::remove_dir_all(dir).unwrap();
     }
 }

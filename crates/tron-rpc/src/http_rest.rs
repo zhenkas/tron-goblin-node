@@ -12,7 +12,7 @@
 //!   request body arrive as `T...` base58 (we decode to hex first) and
 //!   the response is post-processed to re-encode them back.
 //! * Mounts both `/wallet/*` (full-node aliases) and
-//!   `/walletsolidity/*` (solidified-state aliases) URL prefixes.
+//!   `/walletsolidity/*` (solidified-state reads) URL prefixes.
 //!
 //! Endpoint coverage is the most-used 12 from java-tron, sized to be
 //! useful for TronWeb and standard wallets without trying to chase
@@ -62,7 +62,7 @@ pub fn router_with_limits(
     // `params[0]` shape that `methods::*` expects.
     macro_rules! builder {
         ($name:literal, $method:path) => {
-            post(|state, query, body| forward_builder($method, state, query, body))
+            post(|state, query, body| forward_builder($name, $method, state, query, body))
         };
     }
     // Forward a java-shaped POST body to a positional-params method:
@@ -160,12 +160,13 @@ pub fn router_with_limits(
         .route("/wallet/getblockbylatestnum", post(http_get_block_by_latest_num))
         .route("/wallet/getblockbylimitnext", post(http_get_block_by_limit_next))
         .route("/wallet/getaccountbalance", post(http_get_account_balance))
-        // ---- /walletsolidity (read-only aliases) ----
-        .route("/walletsolidity/getnowblock", get(get_now_block).post(get_now_block))
-        .route("/walletsolidity/getblockbynum", post(get_block_by_num))
-        .route("/walletsolidity/getaccount", post(get_account))
-        .route("/walletsolidity/gettransactionbyid", post(get_transaction_by_id))
-        .route("/walletsolidity/gettransactioninfobyid", post(get_transaction_info_by_id))
+        // ---- /walletsolidity (confirmed state, never latest aliases) ----
+        .route("/walletsolidity/getnowblock", get(get_now_block_solidity).post(get_now_block_solidity))
+        .route("/walletsolidity/getblockbynum", post(get_block_by_num_solidity))
+        .route("/walletsolidity/getaccount", post(get_account_solidity))
+        .route("/walletsolidity/getaccountresource", post(get_account_resource_solidity))
+        .route("/walletsolidity/gettransactionbyid", post(get_transaction_by_id_solidity))
+        .route("/walletsolidity/gettransactioninfobyid", post(get_transaction_info_by_id_solidity))
         // ---- java parity sweep (4.8.x servlet list) ----
         // Reads forwarded onto the same positional-params methods the
         // JSON-RPC surface dispatches to; bodies use java's field names.
@@ -285,20 +286,20 @@ pub fn router_with_limits(
         // Solidity mirrors for the read set java exposes there.
         .route(
             "/walletsolidity/getdelegatedresource",
-            mapped!(methods::get_delegated_resource, ["fromAddress", "toAddress"]),
+            mapped!(methods::get_delegated_resource_solidity, ["fromAddress", "toAddress"]),
         )
         .route(
             "/walletsolidity/getdelegatedresourcev2",
-            mapped!(methods::get_delegated_resource_v2, ["fromAddress", "toAddress"]),
+            mapped!(methods::get_delegated_resource_v2_solidity, ["fromAddress", "toAddress"]),
         )
         .route(
             "/walletsolidity/getassetissuelist",
-            getter_no_arg!(methods::list_assets),
+            getter_no_arg!(methods::list_assets_solidity),
         )
-        .route("/walletsolidity/getreward", mapped!(methods::get_reward, ["address"]))
+        .route("/walletsolidity/getreward", mapped!(methods::get_reward_solidity, ["address"]))
         .route(
             "/walletsolidity/getbrokerage",
-            mapped!(methods::get_brokerage, ["address"]),
+            mapped!(methods::get_brokerage_solidity, ["address"]),
         )
         // ---- /monitor (java-tron operational endpoints) ----
         // `/monitor/getnodeinfo` is the standard `MetricsInfoServlet`
@@ -452,6 +453,7 @@ async fn rate_limit_middleware(
 /// address-rewritten JSON response. Handles the visible-flag base58 ↔
 /// hex translation in both directions.
 async fn forward_builder(
+    name: &'static str,
     method: fn(&Value, &RpcState) -> Result<Value, methods::RpcError>,
     State(state): State<RpcState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -468,8 +470,23 @@ async fn forward_builder(
     // under heavy sync load (see `crate::blocking`).
     match crate::blocking::run_blocking(|| method(&params, &state)) {
         Ok(mut v) => {
+            // Java omits signatures on unsigned transactions. An empty array
+            // is truthy in TronWeb and is rejected as "already signed".
+            if v.get("signature")
+                .and_then(Value::as_array)
+                .map_or(false, |s| s.is_empty())
+            {
+                v.as_object_mut()
+                    .expect("transaction envelope")
+                    .remove("signature");
+            }
+            transaction_for_http(&mut v);
             rewrite_addresses(&mut v, visible);
-            api_ok(v)
+            if name == "triggerSmartContract" {
+                api_ok(json!({"result":{"result":true},"txid":v["txID"],"transaction":v}))
+            } else {
+                api_ok(v)
+            }
         }
         Err(e) => api_err(e),
     }
@@ -483,9 +500,11 @@ async fn forward_mapped(
     method: fn(&Value, &RpcState) -> Result<Value, methods::RpcError>,
     fields: &'static [&'static str],
     State(state): State<RpcState>,
-    Query(_query): Query<std::collections::HashMap<String, String>>,
-    Json(body): Json<Value>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(mut body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let visible = visible_flag(&body, &query);
+    translate_addresses_to_hex(&mut body);
     let params = if fields == ["@body"] {
         Value::Array(vec![body])
     } else {
@@ -497,7 +516,10 @@ async fn forward_mapped(
         )
     };
     match crate::blocking::run_blocking(|| method(&params, &state)) {
-        Ok(v) => api_ok(v),
+        Ok(mut v) => {
+            rewrite_addresses(&mut v, visible);
+            api_ok(v)
+        }
         Err(e) => api_err(e),
     }
 }
@@ -749,6 +771,7 @@ static ADDR_FIELDS: &[&str] = &[
     "contract_address",
     "contractAddress",
     "from",
+    "fromAddress",
     "to",
     "origin_address",
     "originAddress",
@@ -880,6 +903,32 @@ async fn get_now_block(
     let mut v = format_block_for_http(&id, &block);
     rewrite_addresses(&mut v, visible);
     api_ok(v)
+}
+
+async fn get_now_block_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|j| j.0).unwrap_or_else(|| json!({}));
+    let visible = visible_flag(&body, &query);
+    let result = crate::blocking::run_blocking(|| {
+        methods::with_committed_state(&state, || {
+            let Ok(id) = state.block_index.get(methods::solidified_head(&state)) else {
+                return Ok(json!({}));
+            };
+            let Ok(block) = state.blocks.get(&id) else {
+                return Ok(json!({}));
+            };
+            let mut value = format_block_for_http(&id, &block);
+            rewrite_addresses(&mut value, visible);
+            Ok(value)
+        })
+    });
+    match result {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(e),
+    }
 }
 
 /// Resolve the current head block (`getNowBlock` / java's
@@ -1114,6 +1163,37 @@ async fn get_block_by_num(
     let mut v = format_block_for_http(&id, &block);
     rewrite_addresses(&mut v, visible);
     api_ok(v)
+}
+
+async fn get_block_by_num_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let visible = visible_flag(&body, &query);
+    let Some(num) = body.get("num").and_then(Value::as_i64) else {
+        return api_err_str("missing 'num'".into());
+    };
+    let result = crate::blocking::run_blocking(|| {
+        methods::with_committed_state(&state, || {
+            if num < 0 || num > methods::solidified_head(&state) {
+                return Ok(json!({}));
+            }
+            let Ok(id) = state.block_index.get(num) else {
+                return Ok(json!({}));
+            };
+            let Ok(block) = state.blocks.get(&id) else {
+                return Ok(json!({}));
+            };
+            let mut value = format_block_for_http(&id, &block);
+            rewrite_addresses(&mut value, visible);
+            Ok(value)
+        })
+    });
+    match result {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(e),
+    }
 }
 
 async fn get_block_by_id(
@@ -1575,6 +1655,28 @@ async fn get_account(
     }
 }
 
+async fn get_account_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let visible = visible_flag(&body, &query);
+    let addr = match read_address(&body, "address", visible) {
+        Ok(a) => a,
+        Err(e) => return api_err_str(e.to_string()),
+    };
+    let addr_hex = format!("0x{}", hex::encode(&addr.as_bytes()[1..]));
+    match crate::blocking::run_blocking(|| {
+        methods::get_account_solidity(&Value::Array(vec![Value::String(addr_hex)]), &state)
+    }) {
+        Ok(mut v) => {
+            rewrite_addresses(&mut v, visible);
+            api_ok(v)
+        }
+        Err(e) => api_err(e),
+    }
+}
+
 async fn get_account_resource(
     State(state): State<RpcState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -1587,6 +1689,28 @@ async fn get_account_resource(
     };
     let addr_hex = format!("0x{}", hex::encode(&addr.as_bytes()[1..]));
     match methods::get_account_resource(&Value::Array(vec![Value::String(addr_hex)]), &state) {
+        Ok(mut v) => {
+            rewrite_addresses(&mut v, visible);
+            api_ok(v)
+        }
+        Err(e) => api_err(e),
+    }
+}
+
+async fn get_account_resource_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let visible = visible_flag(&body, &query);
+    let addr = match read_address(&body, "address", visible) {
+        Ok(a) => a,
+        Err(e) => return api_err_str(e.to_string()),
+    };
+    let addr_hex = format!("0x{}", hex::encode(&addr.as_bytes()[1..]));
+    match crate::blocking::run_blocking(|| {
+        methods::get_account_resource_solidity(&Value::Array(vec![Value::String(addr_hex)]), &state)
+    }) {
         Ok(mut v) => {
             rewrite_addresses(&mut v, visible);
             api_ok(v)
@@ -1616,6 +1740,33 @@ async fn get_contract(
     }
 }
 
+/// JSON-RPC byte strings carry 0x; java wallet HTTP transaction bytes do not.
+fn transaction_for_http(value: &mut Value) {
+    for key in ["txID", "raw_data_hex"] {
+        if let Some(value) = value.get_mut(key) {
+            if let Some(bare) = value.as_str().and_then(|s| s.strip_prefix("0x")) {
+                *value = Value::String(bare.to_owned());
+            }
+        }
+    }
+    if let Some(raw) = value.get_mut("raw_data") {
+        for key in ["ref_block_bytes", "ref_block_hash", "data"] {
+            if let Some(value) = raw.get_mut(key) {
+                if let Some(bare) = value.as_str().and_then(|s| s.strip_prefix("0x")) {
+                    *value = Value::String(bare.to_owned());
+                }
+            }
+        }
+    }
+    if let Some(signatures) = value.get_mut("signature").and_then(Value::as_array_mut) {
+        for signature in signatures {
+            if let Some(bare) = signature.as_str().and_then(|s| s.strip_prefix("0x")) {
+                *signature = Value::String(bare.to_owned());
+            }
+        }
+    }
+}
+
 async fn get_transaction_by_id(
     State(state): State<RpcState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -1629,6 +1780,37 @@ async fn get_transaction_by_id(
     let txid = if txid.starts_with("0x") { txid } else { format!("0x{}", txid) };
     match methods::get_transaction_by_id(&Value::Array(vec![Value::String(txid)]), &state) {
         Ok(mut v) => {
+            transaction_for_http(&mut v);
+            rewrite_addresses(&mut v, visible);
+            api_ok(v)
+        }
+        Err(e) => api_err(e),
+    }
+}
+
+async fn get_transaction_by_id_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let visible = visible_flag(&body, &query);
+    let txid = match body.get("value").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return api_err_str("missing 'value' (tx id)".into()),
+    };
+    let txid = if txid.starts_with("0x") {
+        txid
+    } else {
+        format!("0x{}", txid)
+    };
+    match crate::blocking::run_blocking(|| {
+        methods::get_transaction_by_id_solidity(&Value::Array(vec![Value::String(txid)]), &state)
+    }) {
+        Ok(mut v) => {
+            if v.is_null() {
+                v = json!({});
+            }
+            transaction_for_http(&mut v);
             rewrite_addresses(&mut v, visible);
             api_ok(v)
         }
@@ -1652,6 +1834,38 @@ async fn get_transaction_info_by_id(
         &state,
     ) {
         Ok(mut v) => {
+            rewrite_addresses(&mut v, visible);
+            api_ok(v)
+        }
+        Err(e) => api_err(e),
+    }
+}
+
+async fn get_transaction_info_by_id_solidity(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let visible = visible_flag(&body, &query);
+    let txid = match body.get("value").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return api_err_str("missing 'value' (tx id)".into()),
+    };
+    let txid = if txid.starts_with("0x") {
+        txid
+    } else {
+        format!("0x{}", txid)
+    };
+    match crate::blocking::run_blocking(|| {
+        methods::get_transaction_info_by_id_solidity(
+            &Value::Array(vec![Value::String(txid)]),
+            &state,
+        )
+    }) {
+        Ok(mut v) => {
+            if v.is_null() {
+                v = json!({});
+            }
             rewrite_addresses(&mut v, visible);
             api_ok(v)
         }
@@ -1704,15 +1918,8 @@ async fn broadcast_transaction(
     State(state): State<RpcState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // java-tron's HTTP form: full envelope `{txID, raw_data, raw_data_hex,
-    // signature, visible}`. We hand the underlying JSON-RPC handler
-    // either the raw_data_hex form or the envelope itself — it
-    // accepts both.
-    let inner = body
-        .get("raw_data_hex")
-        .cloned()
-        .or_else(|| body.get("transaction").cloned())
-        .unwrap_or(body);
+    // Preserve raw_data_hex AND signatures from the TronWeb envelope.
+    let inner = body.get("transaction").cloned().unwrap_or(body);
     match methods::broadcast_transaction_v2(&Value::Array(vec![inner]), &state) {
         Ok(v) => api_ok(v),
         Err(e) => api_err(e),
@@ -1723,8 +1930,12 @@ async fn broadcast_transaction(
 // Response helpers
 // =============================================================================
 
+// java wallet HTTP serializes an absent protobuf message as {}, unlike JSON-RPC null.
 fn api_ok(v: Value) -> (StatusCode, Json<Value>) {
-    (StatusCode::OK, Json(v))
+    (
+        StatusCode::OK,
+        Json(if v.is_null() { json!({}) } else { v }),
+    )
 }
 
 fn api_err(e: methods::RpcError) -> (StatusCode, Json<Value>) {

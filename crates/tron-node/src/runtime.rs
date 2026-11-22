@@ -76,6 +76,8 @@ impl Default for ShutdownSignal {
 /// Top-level error returned from [`run`].
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
+    #[error("configuration: {0}")]
+    Configuration(String),
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
     #[error("RPC server: {0}")]
@@ -112,7 +114,10 @@ fn raise_fd_limit() {
     // SAFETY: `get/setrlimit` with `RLIMIT_NOFILE` and a stack-owned
     // `rlimit`; no aliasing, both return codes checked.
     unsafe {
-        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
             warn!("could not read RLIMIT_NOFILE; leaving the open-file limit as inherited");
             return;
@@ -121,7 +126,10 @@ fn raise_fd_limit() {
             // Surface the effective limit: if a sync still hits EMFILE with
             // this already high, the cause is descriptor *leakage*, not the
             // ceiling.
-            info!(limit = rl.rlim_cur as u64, "open-file limit (RLIMIT_NOFILE) already at hard ceiling");
+            info!(
+                limit = rl.rlim_cur as u64,
+                "open-file limit (RLIMIT_NOFILE) already at hard ceiling"
+            );
             return;
         };
         let prev = rl.rlim_cur as u64;
@@ -134,11 +142,62 @@ fn raise_fd_limit() {
             );
             return;
         }
-        info!(from = prev, to = target, "raised open-file limit (RLIMIT_NOFILE soft → hard)");
+        info!(
+            from = prev,
+            to = target,
+            "raised open-file limit (RLIMIT_NOFILE soft → hard)"
+        );
     }
 }
 
 pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), RunError> {
+    let result = run_inner(config, shutdown).await;
+    if let Err(error) = &result {
+        crate::critical_notifications::report(
+            critical_notify::CriticalEvent::new("node_runtime_failed",
+                "TRON node runtime failed").fingerprint(error), true);
+    }
+    result
+}
+
+async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), RunError> {
+    #[cfg(not(feature = "private-network"))]
+    if config.private_network.is_some() || config.data_dir.join("private-profile.json").exists() {
+        return Err(RunError::Configuration("private profile requires dedicated private-network binary".into()));
+    }
+    #[cfg(feature = "private-network")]
+    let private_profile = crate::private_network::validate_config(&config)
+        .map_err(|e| RunError::Configuration(e.to_string()))?;
+    config.assist.validate().map_err(RunError::Configuration)?;
+
+    #[cfg(feature = "devnet-fast")]
+    {
+        crate::devnet::validate(&config).map_err(|e| RunError::Configuration(e.to_string()))?;
+        if !config.data_dir.join("devnet.json").exists()
+            && !(config.assist.enable
+                && config.assist.upstream_peer.is_some()
+                && config.assist.bootstrap_genesis.is_some())
+        {
+            return Err(RunError::Configuration(
+                "devnet-fast requires explicit private genesis bootstrap".into(),
+            ));
+        }
+    }
+    config.assist.validate().map_err(RunError::Configuration)?;
+    if config.assist.enable
+        && (config.witness.is_some()
+            || config.storage.snapshot_reorg
+            || !config.index.enable
+            || !config.index.firehose.enable)
+    {
+        return Err(RunError::Configuration(
+            "assisted sync requires index+Firehose, BlockSession storage, and a non-witness node"
+                .into(),
+        ));
+    }
+    crate::assisted_sync::receive_bootstrap(&config, shutdown.clone())
+        .await
+        .map_err(RunError::Configuration)?;
     // Give RocksDB (one instance per store) + peer sockets enough file
     // descriptors before anything opens one (M-21).
     raise_fd_limit();
@@ -150,14 +209,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     );
     info!(
         data_dir = ?config.data_dir,
+        backend = ?config.storage.backend,
         block_cache_mb = config.storage.block_cache_mb,
         "opening stores"
     );
-    let mut stores = OpenedStores::open_tuned(
-        &config.data_dir,
-        config.storage.write_buffer_size_mb,
-        config.storage.max_open_files,
-    )?;
+    let mut stores = OpenedStores::open_configured(&config.data_dir, &config.storage)?;
 
     // java-tron checkpoint replay: a data dir copied straight from a
     // java-tron node (the usual mainnet-snapshot form) carries a redo
@@ -238,14 +294,31 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             Ok((0, _)) => {}
             Ok((cp_count, entries)) => info!(
                 checkpoints = cp_count,
-                entries,
-                "replayed orphan BlockSession checkpoint manifests into base stores"
+                entries, "replayed orphan BlockSession checkpoint manifests into base stores"
             ),
             Err(e) => {
                 error!(error = ?e, "BlockSession checkpoint recovery failed");
                 return Err(RunError::Sync(format!(
                     "BlockSession checkpoint recovery failed: {e}"
                 )));
+            }
+        }
+        // After a power loss the durable state can be ahead of the block
+        // store; such a node cannot sync. Roll back to the last stored block.
+        let undo = tron_chainbase::BlockUndoStore::new(stores.block_undo.clone());
+        match tron_executor::repair_head_ahead_of_blocks(&state, &stores.blocks, &undo) {
+            Ok(None) => {}
+            Ok(Some((from, to))) => warn!(
+                from,
+                to, "crash repair: state was ahead of the block store; rolled back to the last stored block"
+            ),
+            Err(tron_executor::RollbackError::RepairRefused(why)) => error!(
+                %why,
+                "crash repair: blocks are missing below the state head and cannot be restored by rollback"
+            ),
+            Err(e) => {
+                error!(error = ?e, "crash repair failed");
+                return Err(RunError::Sync(format!("crash repair failed: {e}")));
             }
         }
         // Block-hash history rows written under the legacy key by a build
@@ -258,12 +331,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             Ok(rows) => info!(rows, "moved block-hash history rows to their optimized storage keys"),
             Err(e) => {
                 error!(error = ?e, "block-hash history key migration failed");
-                return Err(RunError::Sync(format!(
-                    "block-hash history key migration failed: {e}"
-                )));
+                return Err(RunError::Sync(format!("block-hash history key migration failed: {e}")));
             }
         }
     }
+
+    #[cfg(feature = "private-network")]
+    crate::private_network::verify_ledger(&config, &stores)
+        .map_err(|e| RunError::Configuration(e.to_string()))?;
 
     // Data directories synced before the fork statistics existed get them
     // seeded from the recent headers (a converted java snapshot has them).
@@ -331,7 +406,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .as_ref()
             .map(|h| fp(&h[..]))
             .unwrap_or_else(|| "—".to_string());
-        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
 
         info!(
             "🧌 build: tron-goblin/{} · {} · {} · {}-{} · mimalloc",
@@ -375,13 +454,25 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             "🧠 vm: Block-STM {} · pipelined-apply {} · reorg={}",
             on(config.vm.parallel_exec),
             on(config.vm.pipelined_apply),
-            if config.storage.snapshot_reorg { "snapshot" } else { "undo-log" },
+            if config.storage.snapshot_reorg {
+                "snapshot"
+            } else {
+                "undo-log"
+            },
         );
         info!(
             "📡 p2p :{} ({}) · discovery {} · max {} peers",
             config.p2p.advertise_port,
-            if config.p2p.listen { "listening" } else { "outbound-only" },
-            if config.p2p.discover_enable { "DNS+Kad" } else { "off" },
+            if config.p2p.listen {
+                "listening"
+            } else {
+                "outbound-only"
+            },
+            if config.p2p.discover_enable {
+                "DNS+Kad"
+            } else {
+                "off"
+            },
             config.p2p.max_peers,
         );
         info!(
@@ -422,11 +513,8 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // the exact silent-divergence the startup consistency guard above
         // warns about. A fresh / genesis-only data-dir is safe to spoof.
         guard_head_spoof(&stores, "--tip-test")?;
-        let hash = hex::decode(&checkpoint.block_id_hex).map_err(|e| {
-            RunError::Sync(format!(
-                "--tip-test hash hex: {e}"
-            ))
-        })?;
+        let hash = hex::decode(&checkpoint.block_id_hex)
+            .map_err(|e| RunError::Sync(format!("--tip-test hash hex: {e}")))?;
         if hash.len() != 32 {
             return Err(RunError::Sync(format!(
                 "--tip-test hash must be 32 bytes (got {})",
@@ -680,7 +768,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // TRON_VERIFY_CONTRACT_RET env gate, for a strict-validation
                     // re-sync. Default (unset) is log-only so a production node
                     // never halts on a divergence.
-                    verify_contract_ret: std::env::var("TRON_VERIFY_CONTRACT_RET").is_ok(),
+                    verify_contract_ret: crate::execution_policy::verify_contract_ret(),
                 };
                 (
                     vm.support_constant,
@@ -700,6 +788,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             }
         };
     let mut exec_config = exec_config;
+    exec_config.verify_contract_ret |= crate::execution_policy::verify_contract_ret();
 
     // === Address-history index (the `[index]` subsystem) ===
     //
@@ -721,7 +810,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     info!("index: capture_internal is on — enabling vm.save_internal_tx for trace capture");
                     exec_config.save_internal_tx = true;
                 }
-                if parts.archive.is_some() || parts.commitment.is_some() {
+                if parts.archive.is_some()
+                    || parts.commitment.is_some()
+                    || (parts.firehose_tail.is_some() && !config.storage.snapshot_reorg)
+                {
                     // The archive and the commitment builder both consume the
                     // per-block write-set; tell the executor to capture it
                     // (pure observation — no consensus-path behavior change).
@@ -737,7 +829,89 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     } else {
         None
     };
+    if config.index.firehose.history.enable
+        && index_parts
+            .as_ref()
+            .and_then(|p| p.history.as_ref())
+            .is_none()
+    {
+        return Err(RunError::Rpc(
+            "history pruning requires a working index + Firehose subsystem".into(),
+        ));
+    }
+    if let Some(pruner) = index_parts.as_ref().and_then(|p| p.history.clone()) {
+        // Loopback-only; ACK mutates RAM, and never wakes this independent timer.
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            pruner.config.ack_port,
+        )))
+        .await
+        .map_err(|e| RunError::Rpc(format!("history ACK bind: {e}")))?;
+        let app = crate::history_pruning::router(pruner.clone());
+        let ack_shutdown = shutdown.clone();
+        let mut sd = ack_shutdown.subscribe();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    if !ack_shutdown.is_shutdown() {
+                        let _ = sd.recv().await;
+                    }
+                })
+                .await
+            {
+                error!(error = %e, "history ACK listener exited");
+                    crate::critical_notifications::required_subsystem_failure("node_history_ack_failed", &e);
+            }
+        }));
+        handles.push(tokio::spawn(crate::history_pruning::run(
+            pruner,
+            shutdown.clone(),
+        )));
+    }
     let index_hook = index_parts.as_ref().map(|p| p.hook.clone());
+    let leadership = std::sync::Arc::new(crate::sync::SyncLeadership::new());
+    let shared_khaos = std::sync::Arc::new(tron_consensus::KhaosDb::new());
+    let assisted_sync = if config.assist.enable {
+        exec_config.capture_state_deltas = true;
+        exec_config.save_internal_tx = true;
+        let hook = index_hook.clone().ok_or_else(|| {
+            RunError::Configuration("assisted sync requires a working index hook".into())
+        })?;
+        Some(std::sync::Arc::new(
+            crate::assisted_sync::AssistRuntime::open(
+                config.assist.clone(),
+                &config.data_dir,
+                stores.clone(),
+                hook,
+                leadership.clone(),
+                shared_khaos.clone(),
+            )
+            .map_err(RunError::Configuration)?,
+        ))
+    } else {
+        None
+    };
+    if let Some(assist) = &assisted_sync {
+        metrics.set_processing_metrics(format!(
+            "{}{}",
+            assist.processing.prometheus(assist.is_assisted()),
+            assist.cluster_prometheus()
+        ));
+        let a = assist.clone();
+        let m = metrics.clone();
+        let mut stop = shutdown.subscribe();
+        handles.push(tokio::spawn(async move{
+            loop{
+                tokio::select!{_=stop.recv()=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                m.set_processing_metrics(format!("{}{}",a.processing.prometheus(a.is_assisted()),a.cluster_prometheus()));
+            }
+        }));
+        handles.extend(
+            crate::assisted_sync::start(assist.clone(), shutdown.clone())
+                .await
+                .map_err(RunError::Configuration)?,
+        );
+    }
 
     // Spawn the dedicated state-commitment builder task. It takes ownership of
     // the builder + receiver (the tree's single writer), runs the one-time
@@ -1001,6 +1175,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             )
             .with_constant_call_timeout_ms(constant_call_timeout_ms)
             .with_pubsub(pubsub.clone());
+        // Producers have a separate apply loop; wallet gateways use a follower.
+        if config.witness.is_none() {
+            let read_leadership = leadership.clone();
+            rpc_state = rpc_state.with_committed_read_gate(std::sync::Arc::new(move |read| {
+                let _apply = read_leadership.lock_apply_for_read();
+                read()
+            }));
+        }
         if let Some(a) = &archive_api {
             rpc_state = rpc_state.with_archive(a.clone());
         }
@@ -1037,6 +1219,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 r = server => {
                     if let Err(e) = r {
                         error!(error = %e, "RPC server exited");
+                    crate::critical_notifications::required_subsystem_failure("node_rpc_failed", &e);
                     }
                 }
                 _ = sd.recv() => {
@@ -1113,6 +1296,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .await
             {
                 error!(error = %e, "gRPC server exited");
+                    crate::critical_notifications::required_subsystem_failure("node_grpc_failed", &e);
             }
         }));
     }
@@ -1143,6 +1327,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             // wall-clock budget must apply here exactly as it does on
             // the JSON-RPC and gRPC servers.
             .with_constant_call_timeout_ms(constant_call_timeout_ms);
+        // Producers have a separate apply loop; wallet gateways use a follower.
+        if config.witness.is_none() {
+            let read_leadership = leadership.clone();
+            http_state = http_state.with_committed_read_gate(std::sync::Arc::new(move |read| {
+                let _apply = read_leadership.lock_apply_for_read();
+                read()
+            }));
+        }
         // The /v1 address-history surface reads the embedded index;
         // token-metadata resolution additionally needs the constant-
         // call machinery, which `to_rpc_state` already attached.
@@ -1186,8 +1378,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             let shutdown_fut = async move {
                 let _ = sd.recv().await;
             };
-            let app =
-                tron_rpc::http_rest::router_with_limits(http_state, http_limits, http_global);
+            let app = tron_rpc::http_rest::router_with_limits(http_state, http_limits, http_global);
             let app = tron_rpc::lite_gate::layer(app, lite_gate_for_http);
             let server = axum::serve(
                 listener,
@@ -1196,6 +1387,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .with_graceful_shutdown(shutdown_fut);
             if let Err(e) = server.await {
                 error!(error = %e, "HTTP REST server exited");
+                    crate::critical_notifications::required_subsystem_failure("node_http_failed", &e);
             }
         }));
     }
@@ -1211,36 +1403,37 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // blocks channel and forwards every notice as a
     // `MessageType::Block` frame — same pattern as the mempool tx
     // broadcast hook.
-    let (sr_produced_tx, pbft_channels, sr_snapshot) = if let Some(witness_cfg) =
-        &config.witness
-    {
-        let sr_identity = crate::sr_runtime::SrIdentity::from_node_config(&config.local_witness, witness_cfg)
-            .map_err(|e| RunError::Rpc(format!("SR identity: {e}")))?;
+    let (sr_produced_tx, pbft_channels, sr_snapshot) = if let Some(witness_cfg) = &config.witness {
+        let sr_identity =
+            crate::sr_runtime::SrIdentity::from_runtime_config(&config, witness_cfg)
+                .map_err(|e| RunError::Rpc(format!("SR identity: {e}")))?;
         // PBFT runtime needs its own identity clone (same witness key).
-        let pbft_identity = crate::sr_runtime::SrIdentity::from_node_config(&config.local_witness, witness_cfg)
-            .map_err(|e| RunError::Rpc(format!("PBFT identity: {e}")))?;
+        let pbft_identity =
+            crate::sr_runtime::SrIdentity::from_runtime_config(&config, witness_cfg)
+                .map_err(|e| RunError::Rpc(format!("PBFT identity: {e}")))?;
 
         // Build the cross-rotation SR snapshot seeded from the current
         // on-disk active list. Each SyncDriver below clones this Arc
         // and writes future rotations into it; the PBFT runtime clones
         // it and reads from it on every vote-membership check.
-        let initial_active = tron_chainbase::WitnessScheduleStore::new(
-            stores.witness_schedule.clone(),
-        )
-        .load_active()
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+        let initial_active =
+            tron_chainbase::WitnessScheduleStore::new(stores.witness_schedule.clone())
+                .load_active()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
         let sr_snapshot = tron_consensus::shared_from_current(initial_active);
+        #[cfg(feature = "private-network")]
+        let producer_khaos = shared_khaos.clone();
+        #[cfg(not(feature = "private-network"))]
+        let producer_khaos = Arc::new(tron_consensus::KhaosDb::new());
         let runtime = crate::sr_runtime::SrRuntime::new(
             stores.to_state_backends(),
             stores.blocks.clone(),
             stores.witness_schedule.clone(),
-            // Each SyncDriver builds its own KhaosDb today; the SR
-            // runtime needs its own too. KhaosDb push is idempotent
-            // (dedup), so the duplicate trees re-converge whenever a
-            // block is observed by both paths.
-            Arc::new(tron_consensus::KhaosDb::new()),
+            // Private producers share the canonical fork tree with peer
+            // drivers; a separate tree goes stale as local production advances.
+            producer_khaos,
             tron_chainbase::BlockUndoStore::new(stores.block_undo.clone()),
             mempool.clone(),
             sr_identity,
@@ -1249,17 +1442,20 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         .with_metrics(metrics.clone())
         .with_exec_config(exec_config)
         .with_pubsub(pubsub.clone());
+        #[cfg(feature = "private-network")]
+        let runtime = runtime.with_private_identities(
+            crate::private_network::witness_identities(&config)
+                .map_err(|e| RunError::Configuration(e.to_string()))?
+        ).with_private_apply_lock(leadership.clone());
         // Witness HA: when a backup group is configured, run the UDP
         // keepalive election and gate production on MASTER status
         // (java BackupManager + BlockHandleImpl.BACKUP_IS_NOT_MASTER).
         let runtime = if !config.node_backup.members.is_empty() {
             let mut sd_backup = shutdown.subscribe();
-            let (backup_handle, backup_fut) = crate::backup::start(
-                config.node_backup.clone(),
-                async move {
+            let (backup_handle, backup_fut) =
+                crate::backup::start(config.node_backup.clone(), async move {
                     let _ = sd_backup.recv().await;
-                },
-            );
+                });
             handles.push(tokio::spawn(backup_fut));
             info!(
                 members = config.node_backup.members.len(),
@@ -1307,8 +1503,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // peer-observed Prepare, including emitting onto outbound
         // for SyncDriver to forward to peers.
         let bridge_channels = pbft_channels.clone();
-        let bridge_identity = crate::sr_runtime::SrIdentity::from_node_config(&config.local_witness, witness_cfg)
-            .map_err(|e| RunError::Rpc(format!("PBFT bridge identity: {e}")))?;
+        let bridge_identity =
+            crate::sr_runtime::SrIdentity::from_runtime_config(&config, witness_cfg)
+                .map_err(|e| RunError::Rpc(format!("PBFT bridge identity: {e}")))?;
         let mut produced_rx = tx.subscribe();
         let mut sd_bridge = shutdown.subscribe();
         handles.push(tokio::spawn(async move {
@@ -1381,8 +1578,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // We dedupe against the seed set so an explicit CLI peer doesn't
     // get duplicated.
     if node_persist.enabled() {
-        let mut seen: std::collections::HashSet<String> =
-            combined_peers.iter().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = combined_peers.iter().cloned().collect();
         let mut loaded = 0usize;
         for node in node_persist.read() {
             let s = format!("{}:{}", node.host, node.port);
@@ -1415,16 +1611,19 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     if !config.p2p.disabled && config.p2p.discover_enable && !seed_peers.is_empty() {
-        let seed_socks: Vec<std::net::SocketAddr> = seed_peers
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let bind_addr: std::net::SocketAddr =
-            format!("0.0.0.0:{}", config.p2p.advertise_port).parse().unwrap();
+        let seed_socks: Vec<std::net::SocketAddr> =
+            seed_peers.iter().filter_map(|s| s.parse().ok()).collect();
+        let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.p2p.advertise_port)
+            .parse()
+            .unwrap();
         let home_id = random_node_id_64();
-        let public_addr: std::net::SocketAddr =
-            format!("0.0.0.0:{}", config.p2p.advertise_port).parse().unwrap();
+        let public_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.p2p.advertise_port)
+            .parse()
+            .unwrap();
+        #[cfg(not(feature = "private-network"))]
         let network_id = tron_net::MAINNET_P2P_VERSION;
+        #[cfg(feature = "private-network")]
+        let network_id = private_profile.p2p_network_id;
         match tron_net::KadService::new(bind_addr, home_id, public_addr, network_id, seed_socks)
             .await
         {
@@ -1441,10 +1640,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 // Block briefly so the first wave of pongs/neighbours can
                 // populate the table. After this we snapshot — if more
                 // peers arrive later they're picked up on the next run.
-                tokio::time::sleep(Duration::from_millis(
-                    config.p2p.discover_bootstrap_ms,
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(config.p2p.discover_bootstrap_ms)).await;
                 let discovered = handle.known_peers();
                 let discovered_n = discovered.len();
                 let mut seen: std::collections::HashSet<String> =
@@ -1474,9 +1670,8 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     let interval_ms = config.p2p.node_discovery_persist_interval_ms;
                     let mut sd_persist = shutdown.subscribe();
                     handles.push(tokio::spawn(async move {
-                        let mut ticker = tokio::time::interval(Duration::from_millis(
-                            interval_ms.max(1_000),
-                        ));
+                        let mut ticker =
+                            tokio::time::interval(Duration::from_millis(interval_ms.max(1_000)));
                         ticker.tick().await; // skip the immediate tick
                         loop {
                             tokio::select! {
@@ -1562,8 +1757,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     if !config.p2p.disabled && !config.p2p.discover_tree_urls.is_empty() {
         let query_timeout = Duration::from_millis(config.p2p.discover_tree_query_timeout_ms);
         let mut tree_total = 0usize;
-        let mut seen: std::collections::HashSet<String> =
-            combined_peers.iter().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = combined_peers.iter().cloned().collect();
         for url in &config.p2p.discover_tree_urls {
             match tron_net::resolve_dns_tree(url, query_timeout).await {
                 Ok(eps) => {
@@ -1575,9 +1769,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                             combined_peers.push(s);
                         }
                     }
-                    info!(url = url.as_str(), endpoints = n,
-                          total_unique = combined_peers.len(),
-                          "dns: tree walk complete");
+                    info!(
+                        url = url.as_str(),
+                        endpoints = n,
+                        total_unique = combined_peers.len(),
+                        "dns: tree walk complete"
+                    );
                 }
                 Err(e) => {
                     warn!(url = url.as_str(), error = %e,
@@ -1679,7 +1876,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // flags are set.
     let mut explore_state: Option<Arc<crate::explore::ExploreState>> = None;
     if config.p2p.explore || config.p2p.mempool {
-        let mode = if config.p2p.mempool { "mempool" } else { "explore" };
+        let mode = if config.p2p.mempool {
+            "mempool"
+        } else {
+            "explore"
+        };
         let tip_num = if let Some(cp) = &config.p2p.tip_test {
             cp.block_num
         } else {
@@ -1734,7 +1935,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         } else {
             let st = Arc::new(crate::explore::ExploreState::new(tip_num));
             st.set_discovered(combined_peers.len());
-            tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
+            tokio::spawn(crate::explore::run_renderer(
+                st.clone(),
+                shutdown.subscribe(),
+            ));
             explore_state = Some(st);
         }
     }
@@ -1767,9 +1971,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             "peer-state: skipping recently-dialed peers"
         );
         if combined_peers.is_empty() {
-            warn!(
-                "peer-state filtered the entire dial list; restoring to avoid stall"
-            );
+            warn!("peer-state filtered the entire dial list; restoring to avoid stall");
             combined_peers = filtered_out;
         } else {
             let _ = before_filter;
@@ -1831,12 +2033,21 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                         stores.blocks.clone(),
                         inbound_state.dyn_props.clone(),
                         Some(mempool.clone()),
-                        tron_types::genesis_block_id(&tron_types::mainnet_inputs()),
+                        tron_chainbase::BlockIndexStore::new(stores.block_index.clone())
+                            .get(0)
+                            .unwrap_or_else(|_| {
+                                tron_types::genesis_block_id(&tron_types::mainnet_inputs())
+                            }),
                         config.p2p.advertise_port,
                         Some(metrics.clone()),
                         config.p2p.max_peers,
                     )
                     .with_inbound_budget(inbound_budget.clone()),
+                );
+                #[cfg(feature = "private-network")]
+                let server = std::sync::Arc::new(
+                    std::sync::Arc::try_unwrap(server).ok().expect("new private inbound server")
+                        .with_private_network(private_profile.p2p_network_id)
                 );
                 let sd = shutdown.subscribe();
                 handles.push(tokio::spawn(crate::inbound::run_inbound_listener(
@@ -1877,12 +2088,8 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // string (matches the peer key used by the driver) — IP-only
         // entries would need normalisation that this loader doesn't
         // do today.
-        let fast_forward_set: std::collections::HashSet<String> = config
-            .p2p
-            .fast_forward_nodes
-            .iter()
-            .cloned()
-            .collect();
+        let fast_forward_set: std::collections::HashSet<String> =
+            config.p2p.fast_forward_nodes.iter().cloned().collect();
 
         // Shared P2P-scoring scaffolding: each SyncDriver writes
         // touches + disconnect reasons against `node_stats`; each
@@ -1912,12 +2119,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             }));
         }
         let peer_registry = crate::PeerRegistry::new();
-        let (eviction_tx, _eviction_rx_keep_alive) =
-            tokio::sync::broadcast::channel::<String>(64);
+        let (eviction_tx, _eviction_rx_keep_alive) = tokio::sync::broadcast::channel::<String>(64);
         // Single-active-syncer coordinator shared by every per-peer driver:
         // exactly one leads (requests + applies blocks) while the rest
         // stand by, so concurrent drivers don't race the shared head.
-        let leadership = std::sync::Arc::new(crate::sync::SyncLeadership::new());
+        let leadership = leadership.clone();
 
         // ONE fork tree shared by the whole driver fleet. Each driver used to
         // keep a private KhaosDb; a driver promoted to leader after a standby
@@ -1927,7 +2133,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // goes into the same tree under the fleet apply lock, so a promoted
         // leader's next block always links and executes. (The SR runtime keeps
         // its own tree — separate apply path, witness mode only.)
-        let shared_khaos = std::sync::Arc::new(tron_consensus::KhaosDb::new());
+        let shared_khaos = shared_khaos.clone();
 
         // Cooperative multi-peer fetch pool, shared by every driver: workers
         // fetch the backlog in parallel (each within its peer's offered
@@ -1937,7 +2143,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         } else {
             None
         };
-        info!(multi_peer_fetch = config.p2p.multi_peer_fetch, "cooperative fetch");
+        info!(
+            multi_peer_fetch = config.p2p.multi_peer_fetch,
+            "cooperative fetch"
+        );
 
         // Active-peers gauge sampler. Reads `peer_registry.len()` every
         // 5 s and pushes it into the metrics handle so a Prometheus
@@ -2101,9 +2310,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // shared state outside the sync driver, and the pipeline's
         // visibility overlay must be the only in-flight writer. The
         // snapshot-stack reorg path ignores the flag internally.
-        let pipelined_apply_enabled = config.vm.pipelined_apply && config.witness.is_none();
+        let pipelined_apply_enabled =
+            config.vm.pipelined_apply && config.witness.is_none() && !config.assist.enable;
         if config.vm.pipelined_apply && config.witness.is_some() {
-            info!("vm.pipelined_apply disabled: witness mode applies blocks outside the sync drivers");
+            info!(
+                "vm.pipelined_apply disabled: witness mode applies blocks outside the sync drivers"
+            );
         }
         for (driver_peers, pinned) in driver_specs {
             let peer_is_fast_forward = pinned
@@ -2134,10 +2346,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 fetch_block_timeout: std::time::Duration::from_millis(
                     config.p2p.fetch_block_timeout_ms.clamp(100, 1000),
                 ),
-                fetch_inflight_per_peer: config
-                    .p2p
-                    .sync_fetch_inflight_per_peer
-                    .clamp(16, 100),
+                fetch_inflight_per_peer: config.p2p.sync_fetch_inflight_per_peer.clamp(16, 100),
                 peer_is_fast_forward,
                 follow_tip: config.p2p.follow_tip,
             };
@@ -2181,8 +2390,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             let fetch_pool_for_peer = fetch_pool.clone();
             let explore_for_peer = explore_state.clone();
             let index_hook_for_peer = index_hook.clone();
+            let assist_for_peer = assisted_sync.clone();
             let event_bus_for_peer = event_bus.clone();
             let inbound_budget_for_peer = inbound_budget.clone();
+            #[cfg(feature = "private-network")]
+            let private_network_id = private_profile.p2p_network_id;
+            #[cfg(feature = "private-network")]
+            let private_poll_interval = std::time::Duration::from_millis(
+                config.private_network.as_ref().expect("validated private profile").tip_poll_interval_ms);
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
@@ -2202,6 +2417,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // `initialize_genesis` onward, so the validator
                     // has chain history to compare against.
                     .with_strict_ref_block_check();
+                #[cfg(feature = "private-network")]
+                { driver = driver.with_private_network(private_network_id, private_poll_interval); }
+                if let Some(assist) = assist_for_peer {
+                    driver = driver.with_assisted_sync(assist);
+                }
                 if let Some(dp) = dynamic_pool_for_peer {
                     driver = driver.with_dynamic_pool(dp);
                 }
@@ -2279,14 +2499,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                             "per-peer sync stats"
                         );
                         combined.blocks_applied += stats.blocks_applied;
-                        combined.blocks_rejected_validation +=
-                            stats.blocks_rejected_validation;
-                        combined.blocks_rejected_execution +=
-                            stats.blocks_rejected_execution;
+                        combined.blocks_rejected_validation += stats.blocks_rejected_validation;
+                        combined.blocks_rejected_execution += stats.blocks_rejected_execution;
                         combined.peer_failures += stats.peer_failures;
                         combined.reconnects += stats.reconnects;
                     }
-                    Err(e) => warn!(error = %e, "sync driver task panicked"),
+                    Err(e) => {
+                        warn!(error = %e, "sync driver task panicked");
+                        crate::critical_notifications::required_subsystem_failure(
+                            "node_sync_task_failed", &e);
+                    }
                 }
             }
             info!(
@@ -2434,14 +2656,17 @@ fn resolve_bundler_key(cfg: &crate::config::BundlerConfig) -> Result<[u8; 32], R
     } else if let Some(hex) = &cfg.key_hex {
         parse_bundler_key_hex(hex)
     } else {
-        Err(RunError::Rpc("[bundler] requires one of: keystore, key_env, key_hex".into()))
+        Err(RunError::Rpc(
+            "[bundler] requires one of: keystore, key_env, key_hex".into(),
+        ))
     }
 }
 
 fn parse_bundler_key_hex(s: &str) -> Result<[u8; 32], RunError> {
     let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
     let v = hex::decode(s).map_err(|e| RunError::Rpc(format!("[bundler] key hex: {e}")))?;
-    v.try_into().map_err(|_| RunError::Rpc("[bundler] key must be 32 bytes".into()))
+    v.try_into()
+        .map_err(|_| RunError::Rpc("[bundler] key must be 32 bytes".into()))
 }
 
 fn build_rate_limit_registry(
@@ -2474,9 +2699,7 @@ fn build_rate_limit_registry(
 /// Pulls the host:port pair off each `SocketAddr` returned by the
 /// `KadService::known_peers` accessor — no recency sort because the
 /// service already returns its table in MRU order.
-fn snapshot_for_persist(
-    kad: &tron_net::KadHandle,
-) -> Vec<crate::node_persist::DbNode> {
+fn snapshot_for_persist(kad: &tron_net::KadHandle) -> Vec<crate::node_persist::DbNode> {
     kad.known_peers()
         .into_iter()
         .map(|addr| crate::node_persist::DbNode::new(addr.ip().to_string(), addr.port()))
@@ -2673,7 +2896,6 @@ fn pick_anchor_tip(heads: Vec<(i64, [u8; 32])>) -> Option<(i64, [u8; 32])> {
         .min_by_key(|(n, _)| *n)
 }
 
-
 // ---------------------------------------------------------------------------
 // Address-history index wiring
 // ---------------------------------------------------------------------------
@@ -2695,12 +2917,16 @@ struct IndexParts {
     /// gRPC server so external consumers can tail the durable log.
     firehose_tail: Option<tron_index::FirehoseTailHandle>,
     firehose_counters: Option<Arc<crate::firehose::FirehoseCounters>>,
+    history: Option<Arc<crate::history_pruning::HistoryPruner>>,
 }
 
 struct ArchiveParts {
     reader: tron_index::ArchiveReader,
     counters: Arc<tron_index::ArchiveCounters>,
-    backends: Vec<(tron_chainbase::UndoStoreId, Arc<dyn tron_chainbase::KvBackend>)>,
+    backends: Vec<(
+        tron_chainbase::UndoStoreId,
+        Arc<dyn tron_chainbase::KvBackend>,
+    )>,
     /// Write-side handle, cloned out so `run` can spawn the rolling-window
     /// retention timer (the writer is otherwise consumed by the index hook).
     writer: Arc<tron_index::ArchiveWriter>,
@@ -2732,7 +2958,10 @@ const COMMITMENT_CHANNEL_CAP: usize = 4096;
 /// backends behind the `/v1/archive` at-height views.
 fn store_id_backends(
     stores: &OpenedStores,
-) -> Vec<(tron_chainbase::UndoStoreId, Arc<dyn tron_chainbase::KvBackend>)> {
+) -> Vec<(
+    tron_chainbase::UndoStoreId,
+    Arc<dyn tron_chainbase::KvBackend>,
+)> {
     use tron_chainbase::UndoStoreId as Id;
     vec![
         (Id::Accounts, stores.accounts.clone()),
@@ -2775,11 +3004,8 @@ fn store_id_backends(
 /// a format-version bump or scope change deletes and re-derives it
 /// from the node's own committed stores — the rebuild path IS the
 /// follower's ordinary cold start.
-fn open_index_subsystem(
-    config: &NodeConfig,
-    stores: &OpenedStores,
-) -> Result<IndexParts, String> {
-    use tron_chainbase::RocksDbBackend;
+fn open_index_subsystem(config: &NodeConfig, stores: &OpenedStores) -> Result<IndexParts, String> {
+    let provider = config.storage.provider().map_err(|e| e.to_string())?;
     use tron_index::{IndexDb, IndexEngine, IndexReader, InitOutcome};
 
     let caps = config.index.capture_set();
@@ -2790,13 +3016,9 @@ fn open_index_subsystem(
         std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
     }
     let open = || -> Result<Arc<dyn tron_chainbase::KvBackend>, String> {
-        RocksDbBackend::open_tuned(
-            &dir,
-            config.storage.write_buffer_size_mb,
-            config.storage.max_open_files,
-        )
-        .map(|b| Arc::new(b) as Arc<dyn tron_chainbase::KvBackend>)
-        .map_err(|e| format!("open index db {dir:?}: {e:?}"))
+        provider
+            .open(&dir, "index")
+            .map_err(|e| format!("open index db {dir:?}: {e}"))
     };
 
     let mut backend = open()?;
@@ -2844,21 +3066,17 @@ fn open_index_subsystem(
         } else {
             let arch_dir = config.data_dir.join("archive").join("db");
             if let Some(parent) = arch_dir.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create {parent:?}: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
             }
-            let arch_backend: Arc<dyn tron_chainbase::KvBackend> = Arc::new(
-                RocksDbBackend::open_tuned(
-                    &arch_dir,
-                    config.storage.write_buffer_size_mb,
-                    config.storage.max_open_files,
-                )
-                .map_err(|e| format!("open archive db {arch_dir:?}: {e:?}"))?,
-            );
+            let arch_backend = provider
+                .open(&arch_dir, "archive")
+                .map_err(|e| format!("open archive db {arch_dir:?}: {e}"))?;
             let backends = store_id_backends(stores);
             let writer = Arc::new(tron_index::ArchiveWriter::new(
                 arch_backend,
-                Some(tron_chainbase::BlockUndoStore::new(stores.block_undo.clone())),
+                Some(tron_chainbase::BlockUndoStore::new(
+                    stores.block_undo.clone(),
+                )),
                 backends.clone(),
             ));
             let fresh = writer.check_or_init().map_err(|e| e.to_string())?;
@@ -2892,14 +3110,9 @@ fn open_index_subsystem(
             if let Some(parent) = commit_dir.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
             }
-            let commit_backend: Arc<dyn tron_chainbase::KvBackend> = Arc::new(
-                RocksDbBackend::open_tuned(
-                    &commit_dir,
-                    config.storage.write_buffer_size_mb,
-                    config.storage.max_open_files,
-                )
-                .map_err(|e| format!("open commitment db {commit_dir:?}: {e:?}"))?,
-            );
+            let commit_backend = provider
+                .open(&commit_dir, "commitment")
+                .map_err(|e| format!("open commitment db: {e}"))?;
             let store = tron_index::CommitmentStore::new(commit_backend);
             let fresh = store.check_or_init().map_err(|e| e.to_string())?;
             let counters = Arc::new(tron_index::CommitmentCounters::new());
@@ -2949,14 +3162,24 @@ fn open_index_subsystem(
     // <data_dir>/firehose/, reconciled against consensus at open (a
     // log ahead of the recovered chain emits an UNWIND; a log behind
     // repairs from the stores on the next apply).
+    let mut history = None;
     let mut firehose_tail: Option<tron_index::FirehoseTailHandle> = None;
     let mut firehose_counters: Option<Arc<crate::firehose::FirehoseCounters>> = None;
     if config.index.firehose.enable {
+        if config.storage.snapshot_reorg {
+            warn!(
+                "firehose: native TRX balances unavailable with snapshot_reorg; use BlockSession"
+            );
+        }
         let fh_dir = config.data_dir.join("firehose");
         let writer = Arc::new(
             crate::firehose::FirehoseWriter::open(
                 &fh_dir,
-                config.index.firehose.retain_mb.saturating_mul(1024 * 1024),
+                if config.index.firehose.history.enable {
+                    u64::MAX
+                } else {
+                    config.index.firehose.retain_mb.saturating_mul(1024 * 1024)
+                },
                 stores.blocks.clone(),
                 stores.block_index.clone(),
                 stores.transaction_ret.clone(),
@@ -2964,6 +3187,16 @@ fn open_index_subsystem(
             )
             .map_err(|e| format!("firehose open {fh_dir:?}: {e}"))?,
         );
+        if config.index.firehose.history.enable {
+            let pruner = crate::history_pruning::HistoryPruner::open_with_provider(
+                &config.data_dir.join("history-pruning"),
+                config.index.firehose.history.clone(),
+                stores,
+                writer.clone(),
+                &provider,
+            )?;
+            history = Some(Arc::new(pruner));
+        }
         firehose_tail = Some(writer.tail_handle());
         firehose_counters = Some(writer.counters());
         info!(dir = ?fh_dir, retain_mb = config.index.firehose.retain_mb, "index: firehose log enabled");
@@ -3000,6 +3233,7 @@ fn open_index_subsystem(
         commitment: commitment_parts,
         firehose_tail,
         firehose_counters,
+        history,
     })
 }
 
@@ -3062,7 +3296,9 @@ async fn run_commitment_builder(
             let r = builder.ingest_with_resume(
                 height,
                 deltas,
-                resume_src.as_ref().map(|s| s as &dyn tron_index::ResumeSource),
+                resume_src
+                    .as_ref()
+                    .map(|s| s as &dyn tron_index::ResumeSource),
             );
             (builder, r)
         })
@@ -3070,7 +3306,10 @@ async fn run_commitment_builder(
         {
             Ok(pair) => pair,
             Err(_) => {
-                error!(block = height, "commitment: fold task panicked; builder stopping");
+                error!(
+                    block = height,
+                    "commitment: fold task panicked; builder stopping"
+                );
                 return;
             }
         };
@@ -3323,7 +3562,11 @@ fn initialize_genesis(stores: &OpenedStores) -> Result<(), crate::storage::Stora
     block_index.put(&id)?;
     let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
     dp.save_latest_block_header_number(0);
-    if let Some(raw) = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref()) {
+    if let Some(raw) = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+    {
         dp.save_latest_block_header_timestamp(raw.timestamp);
         // Pin the genesis timestamp so per-block slot attribution
         // (`total_missed`) can compute absolute slot indices without
@@ -3361,14 +3604,17 @@ fn initialize_genesis(stores: &OpenedStores) -> Result<(), crate::storage::Stora
 /// in `Manager.initGenesisData`, where the committee config feeds each
 /// `save*` setter unconditionally; on-chain proposal records can then
 /// override values later via the normal maintenance flow.
-fn seed_committee_initial_values(
+pub(crate) fn seed_committee_initial_values(
     stores: &crate::storage::OpenedStores,
     cfg: &crate::config::CommitteeConfig,
 ) {
     let dp = tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone());
     let write = |key: &[u8], v: i64| dp.put_long(key, v);
 
-    write(b"ALLOW_CREATION_OF_CONTRACTS", cfg.allow_creation_of_contracts);
+    write(
+        b"ALLOW_CREATION_OF_CONTRACTS",
+        cfg.allow_creation_of_contracts,
+    );
     write(b"ALLOW_MULTI_SIGN", cfg.allow_multi_sign);
     write(b"ALLOW_ADAPTIVE_ENERGY", cfg.allow_adaptive_energy);
     write(b"ALLOW_DELEGATE_RESOURCE", cfg.allow_delegate_resource);
@@ -3376,13 +3622,19 @@ fn seed_committee_initial_values(
     write(b"ALLOW_TVM_TRANSFER_TRC10", cfg.allow_tvm_transfer_trc10);
     write(b"ALLOW_TVM_CONSTANTINOPLE", cfg.allow_tvm_constantinople);
     write(b"ALLOW_TVM_SOLIDITY_059", cfg.allow_tvm_solidity_059);
-    write(b"FORBID_TRANSFER_TO_CONTRACT", cfg.forbid_transfer_to_contract);
+    write(
+        b"FORBID_TRANSFER_TO_CONTRACT",
+        cfg.forbid_transfer_to_contract,
+    );
     write(
         b"ALLOW_SHIELDED_TRC20_TRANSACTION",
         cfg.allow_shielded_trc20_transaction,
     );
     write(b"ALLOW_MARKET_TRANSACTION", cfg.allow_market_transaction);
-    write(b"ALLOW_TRANSACTION_FEE_POOL", cfg.allow_transaction_fee_pool);
+    write(
+        b"ALLOW_TRANSACTION_FEE_POOL",
+        cfg.allow_transaction_fee_pool,
+    );
     write(
         b"ALLOW_BLACKHOLE_OPTIMIZATION",
         cfg.allow_black_hole_optimization,
@@ -3391,7 +3643,7 @@ fn seed_committee_initial_values(
     write(b"ALLOW_TVM_ISTANBUL", cfg.allow_tvm_istanbul);
     write(b"ALLOW_PROTO_FILTER_NUM", cfg.allow_proto_filter_num);
     write(b"ALLOW_ACCOUNT_STATE_ROOT", cfg.allow_account_state_root);
-    write(b"CHANGED_DELEGATION", cfg.changed_delegation);
+    write(b"CHANGE_DELEGATION", cfg.changed_delegation);
     write(b"ALLOW_PBFT", cfg.allow_pbft);
     write(b"PBFT_EXPIRE_NUM", cfg.pbft_expire_num);
     write(b"ALLOW_TVM_FREEZE", cfg.allow_tvm_freeze);
@@ -3421,7 +3673,10 @@ fn seed_committee_initial_values(
     write(b"ALLOW_TVM_CANCUN", cfg.allow_tvm_cancun);
     write(b"ALLOW_TVM_BLOB", cfg.allow_tvm_blob);
     write(b"UNFREEZE_DELAY_DAYS", cfg.unfreeze_delay_days);
-    write(b"ALLOW_RECEIPTS_MERKLE_ROOT", cfg.allow_receipts_merkle_root);
+    write(
+        b"ALLOW_RECEIPTS_MERKLE_ROOT",
+        cfg.allow_receipts_merkle_root,
+    );
     write(
         b"ALLOW_ACCOUNT_ASSET_OPTIMIZATION",
         cfg.allow_account_asset_optimization,
@@ -3439,10 +3694,7 @@ fn seed_committee_initial_values(
         b"DYNAMIC_ENERGY_INCREASE_FACTOR",
         cfg.dynamic_energy_increase_factor,
     );
-    write(
-        b"DYNAMIC_ENERGY_MAX_FACTOR",
-        cfg.dynamic_energy_max_factor,
-    );
+    write(b"DYNAMIC_ENERGY_MAX_FACTOR", cfg.dynamic_energy_max_factor);
 
     // java `DynamicPropertiesStore.init()` seeds the global energy resource pool
     // at genesis (chainbase DynamicPropertiesStore.java:455/736/742). A fresh
@@ -3594,8 +3846,14 @@ mod assemble_peers_tests {
         let err = super::guard_head_spoof(&stores, "--explore")
             .expect_err("synced chain must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("already-synced"), "message explains the refusal: {msg}");
-        assert!(msg.contains("83316752"), "message reports the current head: {msg}");
+        assert!(
+            msg.contains("already-synced"),
+            "message explains the refusal: {msg}"
+        );
+        assert!(
+            msg.contains("83316752"),
+            "message reports the current head: {msg}"
+        );
     }
 }
 
@@ -3622,7 +3880,10 @@ mod shutdown_signal_tests {
         let sig = ShutdownSignal::new();
         let clone = sig.clone();
         clone.shutdown();
-        assert!(sig.is_shutdown(), "shutdown via a clone is visible everywhere");
+        assert!(
+            sig.is_shutdown(),
+            "shutdown via a clone is visible everywhere"
+        );
     }
 
     #[tokio::test]
@@ -3639,6 +3900,9 @@ mod shutdown_signal_tests {
             }
         })
         .await;
-        assert!(waited.is_ok(), "guarded wait must not block when shutdown already fired");
+        assert!(
+            waited.is_ok(),
+            "guarded wait must not block when shutdown already fired"
+        );
     }
 }

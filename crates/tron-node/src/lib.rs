@@ -4,6 +4,7 @@
 //! parses CLI args and a TOML config. Everything else lives in this
 //! crate so integration tests can spawn a node in-process.
 
+pub mod assisted_sync;
 pub mod abi_event_decoder;
 pub mod admin;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod event_loader;
 pub mod explore;
 pub mod fetch_block;
 pub mod firehose;
+pub mod history_pruning;
 pub mod fork_stats;
 pub mod inbound;
 pub mod index_hook;
@@ -27,6 +29,7 @@ pub mod peer_registry;
 pub mod relay;
 pub mod resilience;
 pub mod runtime;
+pub mod critical_notifications;
 pub mod pbft_runtime;
 pub mod peer_state;
 pub mod ref_block;
@@ -35,6 +38,7 @@ pub mod snapshot_export;
 pub mod snapshot_import;
 pub mod sr_runtime;
 pub mod storage;
+mod sync_peer_retention;
 pub mod sync;
 
 pub use admin::{
@@ -77,3 +81,11 @@ pub use snapshot_import::{
 };
 pub use storage::{OpenedStores, StorageError};
 pub use sync::{AcceptOutcome, DriverStats, SyncConfig, SyncDriver};
+
+mod execution_policy;
+
+#[cfg(feature = "devnet-fast")]
+pub mod devnet;
+
+#[cfg(feature = "private-network")]
+pub mod private_network;

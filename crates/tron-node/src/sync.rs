@@ -38,6 +38,7 @@
 //! * Parallel header-then-body fetch across multiple peers.
 //! * Pruning / snapshot import.
 
+use crate::sync_peer_retention::AheadPeerRetention;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +212,11 @@ pub struct SyncLeadership {
     /// no-ops. Uncontended in steady state (only the leader applies); contended
     /// only during the brief handoff overlap.
     apply_lock: std::sync::Mutex<()>,
+    /// Confirmed-state readers currently queued on `apply_lock`. The mutex is
+    /// not fair: during bulk sync the applier releases and immediately retakes
+    /// it, so a queued reader could wait for minutes. Appliers therefore let
+    /// queued readers in first (see [`SyncLeadership::lock_apply`]).
+    readers_waiting: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -247,6 +253,7 @@ impl SyncLeadership {
             }),
             network_tip: std::sync::atomic::AtomicI64::new(0),
             apply_lock: std::sync::Mutex::new(()),
+            readers_waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -258,7 +265,28 @@ impl SyncLeadership {
     /// halting the fleet's apply loudly is safer than letting another driver
     /// build on possibly-inconsistent state (a restart + reconcile repairs).
     pub fn lock_apply(&self) -> std::sync::MutexGuard<'_, ()> {
+        // Give queued readers the lock first; bounded, so a stream of reads
+        // can slow the applier but never stop it.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while self.readers_waiting() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(200));
+        }
         self.apply_lock.lock().expect("SyncLeadership apply lock poisoned")
+    }
+
+    /// The apply lock for a short read of committed state (the confirmed RPC
+    /// namespace). Appliers yield to a reader queued here.
+    pub fn lock_apply_for_read(&self) -> std::sync::MutexGuard<'_, ()> {
+        use std::sync::atomic::Ordering;
+        self.readers_waiting.fetch_add(1, Ordering::SeqCst);
+        let guard = self.apply_lock.lock();
+        self.readers_waiting.fetch_sub(1, Ordering::SeqCst);
+        guard.expect("SyncLeadership apply lock poisoned")
+    }
+
+    /// Whether a confirmed-state reader is queued on the apply lock.
+    pub fn readers_waiting(&self) -> bool {
+        self.readers_waiting.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     /// Claim or retain leadership for `peer`. Returns `true` if `peer` is
@@ -387,6 +415,69 @@ impl Default for SyncLeadership {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What became of a block handed to [`SyncDriver::apply_block`], reduced to
+/// what the caller has to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlockDisposition {
+    /// Executed; the head advanced to it.
+    Applied,
+    /// Already in the fork tree, or recorded on a side fork.
+    Known,
+    /// Not applied for an ordinary fork/ordering reason (unlinked parent,
+    /// fork diverging from the solidified block). Self-recovering.
+    Churn(String),
+    /// Not applied although it should have been: validation or execution
+    /// failed. Reported as a critical event.
+    Failed(String),
+}
+
+impl BlockDisposition {
+    fn of(outcome: &AcceptOutcome) -> Self {
+        match outcome {
+            AcceptOutcome::Accepted(_) => Self::Applied,
+            AcceptOutcome::AlreadyKnown(_) | AcceptOutcome::SideFork(_) => Self::Known,
+            AcceptOutcome::RejectedValidation(reason) => {
+                if reason.contains("parent link")
+                    || reason.contains("unlinked block")
+                    || reason.contains("outside the 65,536-block window")
+                {
+                    Self::Churn(reason.clone())
+                } else {
+                    Self::Failed(format!("validation: {reason}"))
+                }
+            }
+            AcceptOutcome::RejectedExecution(reason) => {
+                Self::Failed(format!("execution: {reason}"))
+            }
+            AcceptOutcome::ReorgRequired(_, new_head) => Self::Failed(format!(
+                "reorg to {new_head} required but no undo store is attached"
+            )),
+            AcceptOutcome::RejectedSolidifiedDiverged(_) => {
+                Self::Churn("fork diverges from the solidified block".into())
+            }
+        }
+    }
+}
+
+/// Raise the critical event for a block that failed to apply, once per
+/// block height in a row (a re-fetched copy failing the same way is the same
+/// incident).
+fn report_block_not_applied(block_num: i64, reason: &str) {
+    static LAST_REPORTED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    if LAST_REPORTED.swap(block_num, std::sync::atomic::Ordering::AcqRel) == block_num {
+        return;
+    }
+    crate::critical_notifications::report(
+        critical_notify::CriticalEvent::new(
+            "node_block_not_applied",
+            "TRON block failed to apply",
+        )
+        .fingerprint(reason)
+        .context("block", block_num),
+        false,
+    );
 }
 
 /// Shared block-fetch pool that lets the connected peer fleet fetch a sync
@@ -640,6 +731,29 @@ impl SyncFetchPool {
         }
     }
 
+    /// Leader: stop tracking `id` altogether — it is already on our chain.
+    /// Unlike [`Self::forget`] this also clears the dedup entry, so nothing
+    /// stale is left behind for a queue entry that no longer matters.
+    pub fn discard(&self, id: &[u8; 32]) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.inflight.remove(id);
+        g.ready.remove(id);
+        if let Some(n) = g.num_of.remove(id) {
+            if g.want.get(&n) == Some(id) {
+                g.want.remove(&n);
+            }
+        }
+        g.seen.remove(id);
+    }
+
+    /// Leader: copy of a fetched body, left in place. The drain applies from
+    /// this copy and removes the entry ([`Self::take_ready`]) only once the
+    /// outcome is known, so a body is never out of the pool while unapplied.
+    pub fn peek_ready(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.ready.get(id).cloned()
+    }
+
     /// Leader: drop a want/inflight id the leader fetched itself (backstop)
     /// or applied, so workers don't redundantly fetch it. Keeps `seen` so it
     /// isn't re-enqueued by a later `push_wants`.
@@ -649,6 +763,53 @@ impl SyncFetchPool {
         g.want.retain(|_, v| v != id);
         g.ready.remove(id);
         g.num_of.remove(id);
+    }
+
+    /// Leader: put a body it took out of the pool but still holds unapplied
+    /// back into `ready`, so whoever leads next inherits it through
+    /// [`Self::ordered_ids_above`]. Without this a leader displaced (or
+    /// disconnected) with bodies in hand takes them out of the fleet: the
+    /// pool no longer tracks them and no live connection may re-request a
+    /// hash it already fetched, so the head pins right below the first one
+    /// until the stall watchdog resets the sync.
+    pub fn restore_ready(&self, num: i64, id: [u8; 32], bytes: Vec<u8>) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.inflight.remove(&id);
+        if g.want.get(&num) == Some(&id) {
+            g.want.remove(&num);
+        }
+        g.seen.insert(id);
+        g.num_of.insert(id, num);
+        g.ready.entry(id).or_insert(bytes);
+    }
+
+    /// Leader: a body taken with [`Self::take_ready`] failed to apply. Track
+    /// the id again as a want so a connection that has not fetched it yet
+    /// downloads a fresh copy (the per-connection fetched history keeps the
+    /// connections that already served it from being asked twice).
+    pub fn requeue_want(&self, num: i64, id: [u8; 32]) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        if g.ready.contains_key(&id) || g.inflight.contains_key(&id) {
+            return;
+        }
+        g.seen.insert(id);
+        g.num_of.insert(id, num);
+        g.want.insert(num, id);
+    }
+
+    /// Where the pool currently tracks `id` — for the takeover / wedge
+    /// diagnostics (`untracked` is the lost head-of-line signature).
+    pub fn locate(&self, id: &[u8; 32]) -> &'static str {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        if g.ready.contains_key(id) {
+            "ready"
+        } else if g.inflight.contains_key(id) {
+            "inflight"
+        } else if g.num_of.contains_key(id) {
+            "want"
+        } else {
+            "untracked"
+        }
     }
 
     /// Count of ids still to fetch or in flight (not yet ready).
@@ -1014,6 +1175,47 @@ mod fetch_pool_tests {
     }
 
     #[test]
+    fn restore_ready_makes_a_held_body_inheritable_again() {
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1), w(2)]);
+        let c = p.claim(T1, HI, 2, 100, Duration::from_secs(60), fresh);
+        for i in &c {
+            p.deliver(*i, vec![i[0]]);
+        }
+        // The leader takes #1 out and is displaced before applying it.
+        assert_eq!(p.take_ready(&id(1)), Some(vec![1]));
+        assert_eq!(p.locate(&id(1)), "untracked");
+        assert_eq!(p.ordered_ids_above(0), vec![w(2)]);
+        p.restore_ready(1, id(1), vec![1]);
+        assert_eq!(p.locate(&id(1)), "ready");
+        assert_eq!(p.ordered_ids_above(0), vec![w(1), w(2)]);
+        assert_eq!(p.take_ready(&id(1)), Some(vec![1]));
+        // A want for the same id is superseded rather than fetched again.
+        p.requeue_want(1, id(1));
+        p.restore_ready(1, id(1), vec![1]);
+        assert!(p.claim(T2, HI, 4, 100, Duration::from_secs(60), fresh).is_empty());
+    }
+
+    #[test]
+    fn requeue_want_offers_a_failed_block_to_a_connection_that_has_not_fetched_it() {
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1)]);
+        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(60), fresh);
+        p.deliver(c[0], vec![1]);
+        assert_eq!(p.take_ready(&id(1)), Some(vec![1]));
+        p.requeue_want(1, id(1));
+        assert_eq!(p.locate(&id(1)), "want");
+        // The connection that already served it is never asked twice…
+        let served = |i: &[u8; 32]| *i == id(1);
+        assert!(p.claim(T1, HI, 1, 100, Duration::from_secs(60), served).is_empty());
+        // …another one gets it.
+        assert_eq!(p.claim(T2, HI, 1, 100, Duration::from_secs(60), fresh), vec![id(1)]);
+        // Requeueing an id that is in flight or ready changes nothing.
+        p.requeue_want(1, id(1));
+        assert_eq!(p.locate(&id(1)), "inflight");
+    }
+
+    #[test]
     fn reset_clears_pool_but_caller_history_still_guards_refetch() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
@@ -1041,6 +1243,10 @@ mod fetch_pool_tests {
 
 /// Block-sync driver. Hold one per node; spawn it on a task.
 pub struct SyncDriver {
+    network_id: i32,
+    local_poll_interval: Option<Duration>,
+    assisted_sync: Option<Arc<crate::assisted_sync::AssistRuntime>>,
+    assist_generation: u64,
     state: StateBackends,
     blocks_backend: Arc<dyn KvBackend>,
     config: SyncConfig,
@@ -1214,8 +1420,16 @@ pub struct SyncDriver {
     /// an immediate full re-acceptance — the in-process equivalent of
     /// java-tron re-delivering an `UnLinked` block once its parent lands.
     /// Drained by `accept_block` after the primary block completes, under the
-    /// caller's apply lock; always empty between calls.
+    /// caller's apply lock, in time-bounded passes — so a long chain can stay
+    /// queued between calls. A driver that stops leading hands the remainder
+    /// back to the fetch pool ([`Self::return_orphans_to_pool`]).
     ready_orphans: std::collections::VecDeque<(Block, Option<Vec<u8>>)>,
+    /// Re-fetches already issued for a head-of-line block that failed to
+    /// apply (see [`Self::drain_pool`]).
+    refetch_attempts: std::collections::HashMap<[u8; 32], u8>,
+    /// Wall-clock budget of one orphan re-feed pass
+    /// ([`Self::refeed_ready_orphans`]); `MAX_DRAIN_TIME` outside tests.
+    refeed_budget: Duration,
     /// Optional shared single-active-syncer coordinator. The runtime
     /// spawns one driver per peer; without coordination they all apply
     /// the same blocks against shared state concurrently, racing the head
@@ -1311,6 +1525,8 @@ impl SyncDriver {
         // dedup-window expires (minutes).
         let node_id = random_node_id();
         Self {
+            network_id: MAINNET_P2P_VERSION,
+            local_poll_interval: None,
             state,
             blocks_backend,
             config,
@@ -1346,11 +1562,15 @@ impl SyncDriver {
             snapshot_stack: None,
             pubsub: None,
             index_hook: None,
+            assisted_sync: None,
+            assist_generation: 0,
             strict_ref_block: false,
             dynamic_pool: None,
             fetch_pool: None,
             pending_raw_block: None,
             ready_orphans: std::collections::VecDeque::new(),
+            refetch_attempts: std::collections::HashMap::new(),
+            refeed_budget: Self::MAX_DRAIN_TIME,
             leadership: None,
             pipelined_apply: false,
             pipeline: None,
@@ -1359,12 +1579,27 @@ impl SyncDriver {
         }
     }
 
+    #[cfg(feature = "private-network")]
+    pub(crate) fn with_private_network(mut self, network_id: i32, poll_interval: Duration) -> Self {
+        self.network_id = network_id;
+        self.local_poll_interval = Some(poll_interval);
+        self
+    }
+    pub(crate) fn tip_repoll_interval(&self) -> Duration {
+        self.local_poll_interval.unwrap_or(self.config.tail_interval * 4)
+    }
+
     /// Attach the shared single-active-syncer coordinator. All per-peer
     /// drivers in a node share one [`SyncLeadership`]; exactly one leads
     /// (requests + applies blocks) while the rest stand by. Without it,
     /// every driver applies the same blocks concurrently and races the
     /// shared head. Omitted by tests / the SR runtime / single-peer setups,
     /// which keep the always-active behavior.
+    pub fn with_assisted_sync(mut self, runtime: Arc<crate::assisted_sync::AssistRuntime>) -> Self {
+        self.assisted_sync = Some(runtime);
+        self
+    }
+
     pub fn with_leadership(mut self, leadership: Arc<SyncLeadership>) -> Self {
         self.leadership = Some(leadership);
         self
@@ -1546,7 +1781,7 @@ impl SyncDriver {
         peer: &str,
         prev_id: &mut Option<BlockId>,
         last_block_ts: &mut i64,
-    ) {
+    ) -> BlockDisposition {
         self.pending_raw_block = Some(raw);
         // Full per-block apply time (accept_block = txTrieRoot validate + khaos
         // fork-tree + execute + commit + events + mempool drop + solidified). The
@@ -1557,6 +1792,10 @@ impl SyncDriver {
         let outcome = self.accept_block(block, *prev_id);
         if let Some(t0) = accept_t0 {
             node_apply_timing::record(t0.elapsed().as_micros() as u64);
+        }
+        let disposition = BlockDisposition::of(&outcome);
+        if let BlockDisposition::Failed(reason) = &disposition {
+            report_block_not_applied(block_num, reason);
         }
         match outcome {
             AcceptOutcome::Accepted(id) => {
@@ -1676,6 +1915,49 @@ impl SyncDriver {
                 }
             }
         }
+        disposition
+    }
+
+    /// Whether `block`'s parent is linked in the fork tree, i.e. whether
+    /// accepting it now could do anything but reject it as unlinked.
+    fn parent_in_fork_tree(&self, block: &Block) -> bool {
+        block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .and_then(|r| <[u8; 32]>::try_from(r.parent_hash.as_slice()).ok())
+            .is_some_and(|p| self.khaos.contains_in_linked(&BlockId::from_raw(p)))
+    }
+
+    /// Hand every stashed-but-unapplied orphan back to the shared fetch pool.
+    /// The stash is per driver, and only the leader drains it; a driver that
+    /// stops leading (displaced, or its connection ended) would otherwise
+    /// keep bodies the pool has already forgotten. Returns how many moved.
+    fn return_orphans_to_pool(&mut self) -> usize {
+        let Some(pool) = self.fetch_pool.clone() else {
+            return 0;
+        };
+        let mut returned = 0usize;
+        while let Some((block, raw)) = self.ready_orphans.pop_front() {
+            let Ok(id) = block_id_from_block(&block) else {
+                continue;
+            };
+            let num = id.num() as i64;
+            if self.already_have_canonical(num, id.as_bytes()) {
+                continue;
+            }
+            let bytes = raw.unwrap_or_else(|| block.encode_to_vec());
+            pool.restore_ready(num, *id.as_bytes(), bytes);
+            returned += 1;
+        }
+        if returned > 0 {
+            info!(
+                returned,
+                head = self.head_number(),
+                "returned unapplied stashed blocks to the fetch pool for the next leader"
+            );
+        }
+        returned
     }
 
     /// Apply one block from an offline source (no p2p), driving the exact
@@ -1715,6 +1997,19 @@ impl SyncDriver {
     /// real ~10 blk/s this cap is far above one tick's worth, so it costs no
     /// throughput.
     const MAX_DRAIN_PER_CALL: usize = 64;
+
+    /// Wall-clock bound on one `drain_pool` batch. The block cap above assumes
+    /// ~10 blk/s; on a slower machine or during heavy blocks 64 blocks take
+    /// 20-60 s, longer than a peer waits for our pong (~20 s). The peer then
+    /// drops us with PING_TIMEOUT after every batch and sync crawls at one
+    /// batch per leadership handover (mainnet catch-up on a 2.1 GHz VPS:
+    /// exactly 64 blocks a minute). Ending the batch after a few seconds keeps
+    /// the keepalive served whatever the apply speed.
+    const MAX_DRAIN_TIME: Duration = Duration::from_secs(4);
+
+    /// How many times a head-of-line block that failed to apply is fetched
+    /// again (each time from a connection that has not served it yet).
+    const MAX_REFETCH_ATTEMPTS: u8 = 3;
 
     fn drain_pool(
         &mut self,
@@ -1756,20 +2051,48 @@ impl SyncDriver {
             // leadership transfer, locator building, the at-tip apply path —
             // observes fully committed base state.
             self.open_pipeline();
-            let mut applied = 0usize;
+            let batch_started = Instant::now();
+            // A stashed chain left over from an earlier accept goes first: it
+            // is the direct continuation of the head, and the pool's own next
+            // block cannot link before it.
+            let mut applied = self.refeed_ready_orphans_if_any();
             while applied < Self::MAX_DRAIN_PER_CALL {
+                // A queued confirmed read ends the batch early: the window
+                // closes below and the reader gets the lock before the next
+                // batch, instead of waiting out up to 64 blocks.
+                if applied > 0 && lead.as_ref().is_some_and(|l| l.readers_waiting()) {
+                    break;
+                }
+                if applied > 0 && batch_started.elapsed() >= Self::MAX_DRAIN_TIME {
+                    break;
+                }
                 let Some(front) = expected.front().copied() else {
                     break;
                 };
-                let Some(raw) = pool.take_ready(&front) else {
+                // A queue entry for a block that is already on our chain (it
+                // was applied from the orphan stash, or by a previous leader)
+                // is finished business. Left at the front it stalls the
+                // drain until the id happens to be fetched again.
+                let front_num = BlockId::from_raw(front).num() as i64;
+                let head_now = self.head_number();
+                if front_num <= head_now && self.already_have_canonical(front_num, &front) {
+                    pool.discard(&front);
+                    expected.pop_front();
+                    continue;
+                }
+                // Apply from a copy; the pool keeps the body until the
+                // outcome is known, so nothing that interrupts this batch can
+                // leave the fleet without its next block.
+                let Some(raw) = pool.peek_ready(&front) else {
                     break;
                 };
-                expected.pop_front();
                 let raw = Bytes::from(raw);
                 let block = match Block::decode(raw.clone()) {
                     Ok(b) => b,
                     Err(e) => {
                         warn!(error = %e, "decode pooled Block");
+                        pool.take_ready(&front);
+                        expected.pop_front();
                         continue;
                     }
                 };
@@ -1779,8 +2102,77 @@ impl SyncDriver {
                     .and_then(|h| h.raw_data.as_ref())
                     .map(|r| r.number)
                     .unwrap_or(-1);
-                self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
+                // Not applicable yet: it is beyond the next height and its
+                // parent is not in the fork tree. Applying it now could only
+                // reject it as unlinked and throw the body away — a queue
+                // that starts above a gap burned its whole window that way
+                // and left a hole for the head to stall at later. Keep it
+                // pooled; bring any lower entry to the front and stop.
+                if block_num > head_now + 1 && !self.parent_in_fork_tree(&block) {
+                    let lowest = expected
+                        .iter()
+                        .map(|id| BlockId::from_raw(*id).num() as i64)
+                        .min()
+                        .unwrap_or(front_num);
+                    if lowest < front_num {
+                        expected
+                            .make_contiguous()
+                            .sort_by_key(|id| BlockId::from_raw(*id).num() as i64);
+                        continue;
+                    }
+                    break;
+                }
+                let head_before = head_now;
+                let disposition =
+                    self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
+                // Outcome known: only now does the body leave the pool.
+                pool.take_ready(&front);
+                expected.pop_front();
                 applied += 1;
+                match disposition {
+                    BlockDisposition::Applied | BlockDisposition::Known => {}
+                    BlockDisposition::Churn(reason) => {
+                        // Not an error, but it used to be invisible outside
+                        // debug logs while it decided whether the head moved.
+                        info!(
+                            block = block_num,
+                            head = head_before,
+                            reason = reason.as_str(),
+                            "pooled block not applied"
+                        );
+                    }
+                    BlockDisposition::Failed(reason) => {
+                        // This copy is no good and the pool has dropped it.
+                        // If it is the direct continuation of our head
+                        // nothing else can move the chain, so ask a
+                        // connection that has not fetched it yet for a fresh
+                        // copy — a bounded number of times, so a block that
+                        // is genuinely bad cannot hold the queue forever.
+                        let head_unmoved = self.head_number() == head_before;
+                        let attempts = self.refetch_attempts.entry(front).or_insert(0);
+                        let refetch = block_num == head_before + 1
+                            && head_unmoved
+                            && *attempts < Self::MAX_REFETCH_ATTEMPTS;
+                        if refetch {
+                            *attempts += 1;
+                        }
+                        warn!(
+                            block = block_num,
+                            head = head_before,
+                            reason = reason.as_str(),
+                            refetch,
+                            "pooled block failed to apply"
+                        );
+                        if refetch {
+                            pool.requeue_want(block_num, front);
+                            expected.push_front(front);
+                            break;
+                        }
+                    }
+                }
+            }
+            if self.refetch_attempts.len() > 64 {
+                self.refetch_attempts.clear();
             }
             self.close_pipeline();
             applied
@@ -2334,6 +2726,9 @@ impl SyncDriver {
                 }
                 o = self.run_against_peer(&peer) => o,
             };
+            // The pass is over, so this driver no longer leads: bodies it
+            // still holds go back to the pool for whoever leads next.
+            self.return_orphans_to_pool();
             // Drop the live registry entry now — the peer-pass is
             // over either way. Stats table retains the disconnect
             // record (set just above PeerFailure / inside the
@@ -2659,7 +3054,9 @@ impl SyncDriver {
         if let Some(budget) = &self.inbound_budget {
             conn = conn.with_inbound_budget(budget.clone());
         }
-        let genesis = genesis_block_id(&mainnet_inputs());
+        let genesis = self.state.block_index.as_ref()
+            .and_then(|b| BlockIndexStore::new(b.clone()).get(0).ok())
+            .unwrap_or_else(|| genesis_block_id(&mainnet_inputs()));
         let head = self.resume_head().unwrap_or(genesis);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2684,7 +3081,7 @@ impl SyncDriver {
                 port: self.config.advertise_port,
                 node_id: attempt_node_id.clone(),
             },
-            network_id: 11_111,
+            network_id: self.network_id,
             version: 2,
             timestamp_ms: now,
         };
@@ -2710,7 +3107,7 @@ impl SyncDriver {
                 port: self.config.advertise_port,
                 node_id: attempt_node_id.clone(),
             },
-            version: MAINNET_P2P_VERSION,
+            version: self.network_id,
             timestamp_ms: now,
             genesis,
             solid,
@@ -3033,6 +3430,7 @@ impl SyncDriver {
         // raised by live Inventory(BLOCK) adverts; also seeds the shared
         // network-tip estimate so a single fast peer is enough to detect lag.
         let mut my_peer_tip: i64 = peer_head.max(0);
+        let mut ahead_peer = AheadPeerRetention::new(peer_head, self.head_number(), Instant::now());
         if let Some(l) = &self.leadership {
             l.observe_network_tip(my_peer_tip);
         }
@@ -3150,6 +3548,9 @@ impl SyncDriver {
         }
 
         loop {
+            // Keep a peer with newer blocks through transient sync stalls. This
+            // also gates the independent rotation and liveness disconnects.
+            let keep_ahead_peer = ahead_peer.should_retain(self.head_number(), Instant::now());
             if let Some(cap) = self.config.max_blocks {
                 if self.stats.blocks_applied >= cap {
                     return PeerOutcome::CapReached;
@@ -3162,7 +3563,7 @@ impl SyncDriver {
             // service before the broadcast.
             if let Some(rx) = eviction_rx.as_mut() {
                 match rx.try_recv() {
-                    Ok(target) if target == peer => {
+                    Ok(target) if target == peer && !keep_ahead_peer => {
                         return PeerOutcome::PeerFailure(format!(
                             "resilience: evicted by scheduler"
                         ));
@@ -3178,7 +3579,7 @@ impl SyncDriver {
             }
 
             // KeepAlive: enforce inbound-deadline + send periodic Pings.
-            if last_inbound_at.elapsed() > KEEPALIVE_INBOUND_DEADLINE {
+            if last_inbound_at.elapsed() > KEEPALIVE_INBOUND_DEADLINE && !keep_ahead_peer {
                 return PeerOutcome::PeerFailure(format!(
                     "peer silent for {}s — keepalive timeout",
                     last_inbound_at.elapsed().as_secs()
@@ -3362,6 +3763,7 @@ impl SyncDriver {
             // rebuilds the queue from it.
             if multi_peer && was_leader && !am_leader {
                 expected.clear();
+                self.return_orphans_to_pool();
             }
             // Rising edge (just promoted): REBUILD `expected` from the shared
             // pool. The previous leader owned the apply order; when it died
@@ -3438,11 +3840,23 @@ impl SyncDriver {
                             &mut prev_id,
                             &mut last_block_ts,
                         );
+                        // `front`/`front_state` name the block the queue is
+                        // waiting on and where the pool has it; a `front`
+                        // above `head + 1` means the head-of-line block is
+                        // not tracked at all.
+                        let head_after = self.head_number();
+                        let (front, front_state) = match expected.front() {
+                            Some(id) => (BlockId::from_raw(*id).num() as i64, pool.locate(id)),
+                            None => (-1, "none"),
+                        };
                         info!(
                             peer,
                             inherited,
                             adopted = took - inherited,
                             applied,
+                            head = head_after,
+                            front,
+                            front_state,
                             "took over leadership mid-window; rebuilt apply queue from the pool"
                         );
                         if applied > 0 {
@@ -3495,6 +3909,7 @@ impl SyncDriver {
                     && last_block_ts > 0
                     && behind_ms > STALL_RESET_LAG_MS
                     && head_idle >= STALL_RESET_AFTER
+                    && !keep_ahead_peer
                 {
                     warn!(
                         peer,
@@ -3537,6 +3952,7 @@ impl SyncDriver {
                         && behind_ms > STALL_RESET_LAG_MS
                         && progressed < CRAWL_MIN_PROGRESS
                         && ready < FETCH_CHUNK_SIZE
+                        && !keep_ahead_peer
                     {
                         warn!(
                             peer,
@@ -3810,7 +4226,9 @@ impl SyncDriver {
                 // other workers even when this leader isn't itself receiving
                 // frames. Cheap no-op when nothing is ready.
                 _ = tokio::time::sleep(Duration::from_millis(150)),
-                    if multi_peer && am_leader && !expected.is_empty() =>
+                    if multi_peer
+                        && am_leader
+                        && (!expected.is_empty() || !self.ready_orphans.is_empty()) =>
                 {
                     if let Some(pool) = self.fetch_pool.clone() {
                         let applied = self.drain_pool(
@@ -3855,6 +4273,13 @@ impl SyncDriver {
                 // Read branch: wait up to 60s for the next frame. The
                 // timeout lets us periodically wake up to re-check the
                 // cap and drain the mempool even on a silent peer.
+                // Private-chain tests have no external gossip to wake this loop.
+                _ = tokio::time::sleep(Duration::from_millis(100)), if cfg!(feature="devnet-fast") => { continue; }
+                // The persistent private network has no external gossip to
+                // drive idle relays. Wake at its bounded configured interval,
+                // so a1s tip deadline is not delayed until a10s keepalive.
+                _ = tokio::time::sleep(self.local_poll_interval.unwrap_or(Duration::from_secs(60))),
+                    if self.local_poll_interval.is_some() => { continue; }
                 r = tokio::time::timeout(Duration::from_secs(60), conn.next_frame()) => r,
             };
             let frame = match read {
@@ -3970,6 +4395,7 @@ impl SyncDriver {
                             // poison leader preemption.
                             if block_num <= head + SANE_TIP_AHEAD {
                                 my_peer_tip = my_peer_tip.max(block_num);
+                                ahead_peer.note_advertised(block_num);
                                 if let Some(l) = &self.leadership {
                                     l.observe_network_tip(block_num);
                                 }
@@ -4224,6 +4650,9 @@ impl SyncDriver {
                                 let mut id = [0u8; 32];
                                 id.copy_from_slice(&b.hash);
                                 my_window.push((b.number, id));
+                                if BlockId::from_raw(id).num() as i64 == b.number {
+                                    ahead_peer.note_advertised(b.number);
+                                }
                             }
                         }
                         if am_leader {
@@ -4263,6 +4692,11 @@ impl SyncDriver {
                         }
                     } else {
                         for b in chain_inv.ids.iter().skip(1) {
+                            if let Ok(raw) = <[u8; 32]>::try_from(b.hash.as_slice()) {
+                                if BlockId::from_raw(raw).num() as i64 == b.number {
+                                    ahead_peer.note_advertised(b.number);
+                                }
+                            }
                             pending_fetch_queue.push_back(b.hash.clone());
                         }
                         appended = pending_fetch_queue.len();
@@ -4302,7 +4736,11 @@ impl SyncDriver {
                         // are retained and feed us new blocks via adverts.
                         let behind_ms =
                             crate::node_statistics::unix_now_ms() as i64 - last_block_ts;
-                        if am_leader && last_block_ts > 0 && behind_ms > DEAD_END_LAG_MS {
+                        if am_leader
+                            && last_block_ts > 0
+                            && behind_ms > DEAD_END_LAG_MS
+                            && !ahead_peer.should_retain(self.head_number(), Instant::now())
+                        {
                             info!(
                                 peer,
                                 behind_s = behind_ms / 1000,
@@ -4326,7 +4764,7 @@ impl SyncDriver {
                         // the next SyncBlockChain re-poll; new tip blocks arrive
                         // via Inventory(BLOCK) adverts (the READ branch keeps
                         // running) and our tx adverts are accepted in the meantime.
-                        tip_repoll_after = Some(Instant::now() + self.config.tail_interval * 4);
+                        tip_repoll_after = Some(Instant::now() + self.tip_repoll_interval());
                     }
                 }
                 MessageType::Block => {
@@ -4474,6 +4912,9 @@ impl SyncDriver {
                     if multi_peer {
                         if let Ok(id) = block_id_from_block(&block) {
                             if fetched_ids.contains_key(id.as_bytes()) {
+                                ahead_peer.note_requested_block(
+                                    block_num, self.head_number(), Instant::now(),
+                                );
                                 blocks_in_flight = blocks_in_flight.saturating_sub(1);
                             }
                             if let Some(pool) = &self.fetch_pool {
@@ -4507,6 +4948,7 @@ impl SyncDriver {
                         );
                         continue;
                     }
+                    let head_before_apply = self.head_number();
                     // Single-block apply (steady-state near-tip path).
                     // Same offload rationale as `drain_pool`: keep the
                     // synchronous apply off the async worker so it can't
@@ -4529,6 +4971,13 @@ impl SyncDriver {
                             &mut last_block_ts,
                         );
                     });
+                    if let Ok(id) = block_id_from_block(&block) {
+                        if self.already_have_canonical(block_num, id.as_bytes()) {
+                            ahead_peer.note_requested_block(
+                                block_num, head_before_apply, Instant::now(),
+                            );
+                        }
+                    }
                     // Count *every* Block frame received (including
                     // rejected ones), not just accepted ones — a peer
                     // that sent us a bad block still consumed one of
@@ -5039,6 +5488,20 @@ impl SyncDriver {
     /// single-applier contexts only (offline replay, the SR runtime's own
     /// tree, tests).
     pub fn accept_block(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
+        if let Some(assist) = &self.assisted_sync {
+            if assist.is_assisted() {
+                self.pending_raw_block = None;
+                self.ready_orphans.clear();
+                return block_id_from_block(block).map(AcceptOutcome::AlreadyKnown)
+                    .unwrap_or_else(|e|AcceptOutcome::RejectedValidation(format!("{e:?}")));
+            }
+            let generation = assist.generation.load(std::sync::atomic::Ordering::Acquire);
+            if generation != self.assist_generation {
+                self.assist_generation = generation;
+                self.ready_orphans.clear();
+                self.khaos_started = false;
+            }
+        }
         let outcome = self.accept_block_inner(block, prev_id);
         self.refeed_ready_orphans();
         outcome
@@ -5050,22 +5513,29 @@ impl SyncDriver {
     /// size against the original encoding, not a prost re-encode). A re-accept
     /// that links can queue its own waiters, so a stashed chain cascades in
     /// ascending order. An orphan that fails re-acceptance is dropped — like a
-    /// failed network delivery, the sync flow re-fetches it. Bounded by the
-    /// khaos capacity as a runaway backstop. Runs under the caller's apply
-    /// lock (same scope as the primary accept), so no linked-but-unstored
-    /// block is ever exposed to another driver.
-    fn refeed_ready_orphans(&mut self) {
-        const MAX_REFEED: usize = 1024;
+    /// failed network delivery, the sync flow re-fetches it. Runs under the
+    /// caller's apply lock (same scope as the primary accept), so no
+    /// linked-but-unstored block is ever exposed to another driver.
+    ///
+    /// Bounded by wall-clock time, like a pool-drain batch: a long stashed
+    /// chain (a thousand blocks at catch-up speed is minutes of apply) must
+    /// not run inside ONE accept. That held the fleet apply lock and kept the
+    /// driver off its event loop the whole time — confirmed reads waited,
+    /// every peer dropped us with PING_TIMEOUT. What does not fit stays
+    /// queued and continues on the next accept or the next drain tick
+    /// ([`Self::drain_pool`]). Nothing linkable is ever discarded: these
+    /// blocks were already delivered, the fetch pool will not ask for them
+    /// again, and dropping one pinned the head right below it until the
+    /// stall watchdog reset the sync.
+    ///
+    /// Returns the number of orphans re-fed.
+    fn refeed_ready_orphans(&mut self) -> usize {
+        let started = Instant::now();
         let mut fed = 0usize;
-        while let Some((orphan, raw)) = self.ready_orphans.pop_front() {
-            if fed == MAX_REFEED {
-                warn!(
-                    dropped = self.ready_orphans.len() + 1,
-                    "orphan re-feed cap hit; dropping the rest (they will be re-fetched)"
-                );
-                self.ready_orphans.clear();
+        while fed == 0 || started.elapsed() < self.refeed_budget {
+            let Some((orphan, raw)) = self.ready_orphans.pop_front() else {
                 break;
-            }
+            };
             fed += 1;
             let num = orphan
                 .block_header
@@ -5077,9 +5547,26 @@ impl SyncDriver {
             let outcome = self.accept_block_inner(&orphan, None);
             debug!(block = num, ?outcome, "re-accepted stashed orphan after its parent linked");
         }
+        fed
+    }
+
+    fn refeed_ready_orphans_if_any(&mut self) -> usize {
+        if self.ready_orphans.is_empty() {
+            0
+        } else {
+            self.refeed_ready_orphans()
+        }
     }
 
     fn accept_block_inner(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
+        let outcome = self.try_accept_block(block, prev_id);
+        let height = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref())
+            .map(|raw| raw.number).unwrap_or(-1);
+        crate::execution_policy::enforce_outcome(height, &outcome);
+        outcome
+    }
+
+    fn try_accept_block(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
         // `txTrieRoot`: for blocks received from the network the peer loop
         // stashes the raw wire bytes, so we hash each transaction's original
         // bytes (M-20 — prost's `BTreeMap` map round-trip reorders `ret` map
@@ -5163,6 +5650,16 @@ impl SyncDriver {
             Ok(id) => id,
             Err(e) => return AcceptOutcome::RejectedValidation(format!("block id: {e:?}")),
         };
+
+        // A block committed by the private producer or another coordinated
+        // applier may never have passed through this driver's Khaos view.
+        // Identity-based dedup uses the executed canonical index, not height
+        // alone. Different hashes retain every normal fork/solidity check.
+        #[cfg(feature = "private-network")]
+        if id.num() as i64 <= self.head_number()
+            && self.already_have_canonical(id.num() as i64, id.as_bytes()) {
+            return AcceptOutcome::AlreadyKnown(id);
+        }
 
         // Per-tx ref_block / chain-id replay check. The check is
         // anchored at the PARENT (`block_num - 1`) — the current
@@ -5482,6 +5979,18 @@ impl SyncDriver {
             }
         }
 
+        // The state commit below is durable per block (fsynced manifest), so the
+        // block bytes and the index entry must be durable first: otherwise a
+        // power loss leaves the head pointer on a block the block store lost.
+        let durable = self.blocks_backend.sync_wal().and_then(|()| match &self.state.block_index {
+            Some(bi) => bi.sync_wal(),
+            None => Ok(()),
+        });
+        if let Err(e) = durable {
+            self.khaos.remove(&id);
+            return AcceptOutcome::RejectedExecution(format!("block store fsync: {e}"));
+        }
+
         // Catch-up fast path: while well behind wall-clock we're bulk-syncing,
         // so execute the block's transactions optimistically in parallel
         // (Block-STM — byte-identical to serial, see `ExecConfig::parallel_exec`
@@ -5543,6 +6052,10 @@ impl SyncDriver {
             (Some(pipeline), Some(_), Some(_)) => {
                 pipeline.apply(block, executed_head, &exec_config, original_wire.as_deref())
             }
+            (_, Some(undo), Some(cp)) if self.assisted_sync.is_some() =>
+                tron_executor::execute_block_with_observer(
+                    &self.state,block,executed_head,undo,cp,&self.exec_config,
+                    original_wire.as_deref(),self.assisted_sync.as_ref().unwrap().as_ref()),
             (_, Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                 &self.state,
                 block,
@@ -6721,6 +7234,9 @@ impl SyncDriver {
             // in-memory blocks) falls back to prost-derived values.
             let wire = kb.raw.as_deref().and_then(tx_wire_infos_from_block_bytes);
             let apply_res = match &self.checkpoint {
+                Some(cp) if self.assisted_sync.is_some() => tron_executor::execute_block_with_observer(
+                    &self.state,block_to_apply,None,&undo_store,cp,&self.exec_config,wire.as_deref(),
+                    self.assisted_sync.as_ref().unwrap().as_ref()),
                 Some(cp) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                     &self.state,
                     block_to_apply,
@@ -6797,6 +7313,9 @@ impl SyncDriver {
                         let wire =
                             old_kb.raw.as_deref().and_then(tx_wire_infos_from_block_bytes);
                         let reapply_res = match &self.checkpoint {
+                            Some(cp) if self.assisted_sync.is_some() => tron_executor::execute_block_with_observer(
+                                &self.state,&old_kb.block,None,&undo_store,cp,&self.exec_config,wire.as_deref(),
+                                self.assisted_sync.as_ref().unwrap().as_ref()),
                             Some(cp) => {
                                 tron_executor::execute_block_with_undo_checkpoint_and_config(
                                     &self.state,
@@ -9685,6 +10204,84 @@ mod pipelined_apply_tests {
         assert!(driver.khaos().contains_in_linked(&id3));
     }
 
+    /// A stashed chain longer than one re-feed pass is applied in pieces and
+    /// never dropped. Mainnet 2026-11-20: ~1000 stashed descendants were
+    /// re-fed inside ONE accept (7.5 minutes under the apply lock, every peer
+    /// gone with PING_TIMEOUT), then the old 1024-block cap discarded the
+    /// next one — a block the fetch pool had already delivered and never
+    /// asked for again, so the head sat right below it for 38 minutes.
+    #[test]
+    fn long_orphan_chain_is_refed_in_bounded_passes_without_dropping() {
+        use prost::Message as _;
+        let state = mem_state();
+        let mut driver = driver_with(state.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()));
+        // One orphan per pass.
+        driver.refeed_budget = Duration::ZERO;
+
+        let mut chain = vec![signed_block(1, [0u8; 32])];
+        for n in 2..=6 {
+            let parent = block_id_from_block(chain.last().unwrap()).unwrap();
+            chain.push(signed_block(n, *parent.as_bytes()));
+        }
+        assert!(matches!(driver.accept_block(&chain[0], None), AcceptOutcome::Accepted(_)));
+        // Blocks 3..=6 arrive before block 2.
+        for b in chain[2..].iter().rev() {
+            driver.pending_raw_block = Some(Bytes::from(b.encode_to_vec()));
+            assert!(matches!(driver.accept_block(b, None),
+                AcceptOutcome::RejectedValidation(ref r) if r.contains("unlinked")));
+        }
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        let head = || dp.latest_block_header_number().unwrap();
+
+        // Block 2 applies and the pass re-feeds exactly one descendant.
+        assert!(matches!(driver.accept_block(&chain[1], None), AcceptOutcome::Accepted(_)));
+        assert_eq!(head(), 3);
+        assert_eq!(driver.ready_orphans.len(), 1, "block 4 waits for the next pass");
+
+        // Each later pass (the leader's drain tick) continues the chain.
+        assert_eq!(driver.refeed_ready_orphans_if_any(), 1);
+        assert_eq!(head(), 4);
+        assert_eq!(driver.refeed_ready_orphans_if_any(), 1);
+        assert_eq!(driver.refeed_ready_orphans_if_any(), 1);
+        assert_eq!(head(), 6, "the whole stashed chain is applied, nothing dropped");
+        assert_eq!(driver.refeed_ready_orphans_if_any(), 0);
+    }
+
+    /// A confirmed-state read must get the apply lock promptly while an
+    /// applier releases and immediately retakes it, as bulk sync does batch
+    /// after batch. On mainnet catch-up `walletsolidity/getnowblock` waited
+    /// past 25 s on the unfair mutex and the indexer reported a lost node.
+    #[test]
+    fn a_reader_is_not_starved_by_a_back_to_back_applier() {
+        let leadership = Arc::new(SyncLeadership::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let applier = {
+            let (leadership, stop) = (leadership.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut batches = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _apply = leadership.lock_apply();
+                    std::thread::sleep(Duration::from_millis(5));
+                    batches += 1;
+                }
+                batches
+            })
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        let mut worst = Duration::ZERO;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(3));
+            let asked = Instant::now();
+            drop(leadership.lock_apply_for_read());
+            worst = worst.max(asked.elapsed());
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(applier.join().unwrap() >= 10, "the applier must keep making progress");
+        assert!(worst < Duration::from_millis(100), "a read waited {worst:?}");
+        assert!(!leadership.readers_waiting());
+    }
+
     /// Pins the PRODUCTION single-applier guard on the pool-drain path
     /// (`drain_pool`), not just the `accept_block_synced` test entry: while
     /// another holder owns the fleet apply lock, `drain_pool` must BLOCK
@@ -9692,6 +10289,159 @@ mod pipelined_apply_tests {
     /// the lock is released. Ablation: drop the `lock_apply()` acquisition in
     /// `drain_pool` and the block is applied while the lock is held (head
     /// advances inside the held window), tripping the mid-window assertion.
+    /// A leader that is displaced while it still holds a stashed block must
+    /// not take it out of the fleet: the pool has forgotten the id, so the
+    /// next leader's queue would start above a hole nobody refetches.
+    #[test]
+    fn displaced_leader_returns_stashed_blocks_to_the_pool() {
+        use prost::Message as _;
+        let state = mem_state();
+        let pool = Arc::new(SyncFetchPool::new());
+        let mut driver = driver_with(state.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_fetch_pool(pool.clone());
+        driver.refeed_budget = Duration::ZERO;
+
+        let mut chain = vec![signed_block(1, [0u8; 32])];
+        for n in 2..=5 {
+            let parent = block_id_from_block(chain.last().unwrap()).unwrap();
+            chain.push(signed_block(n, *parent.as_bytes()));
+        }
+        let ids: Vec<[u8; 32]> = chain
+            .iter()
+            .map(|b| *block_id_from_block(b).unwrap().as_bytes())
+            .collect();
+        assert!(matches!(driver.accept_block(&chain[0], None), AcceptOutcome::Accepted(_)));
+        for b in chain[2..].iter().rev() {
+            driver.pending_raw_block = Some(Bytes::from(b.encode_to_vec()));
+            driver.accept_block(b, None);
+        }
+        assert!(matches!(driver.accept_block(&chain[1], None), AcceptOutcome::Accepted(_)));
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        let head = || dp.latest_block_header_number().unwrap();
+        assert_eq!(head(), 3);
+        assert_eq!(driver.ready_orphans.len(), 1, "block 4 is held by this driver only");
+        assert_eq!(pool.locate(&ids[3]), "untracked");
+
+        // Displaced: the held body goes back where the next leader finds it.
+        assert_eq!(driver.return_orphans_to_pool(), 1);
+        assert!(driver.ready_orphans.is_empty());
+        assert_eq!(pool.locate(&ids[3]), "ready");
+
+        // The takeover rebuild inherits it and the chain continues.
+        let mut expected: std::collections::VecDeque<[u8; 32]> = pool
+            .ordered_ids_above(head() - 1)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(expected.front(), Some(&ids[3]));
+        let (mut prev, mut ts) = (None, 0i64);
+        driver.drain_pool(&pool, &mut expected, "next-leader", &mut prev, &mut ts);
+        driver.refeed_ready_orphans_if_any();
+        assert_eq!(head(), 5, "nothing was lost with the displaced leader");
+    }
+
+    /// A head-of-line block that fails to apply is fetched again from another
+    /// connection a bounded number of times instead of silently vanishing.
+    #[test]
+    fn failed_head_of_line_block_is_refetched_then_given_up() {
+        use prost::Message as _;
+        let state = mem_state();
+        let pool = Arc::new(SyncFetchPool::new());
+        let mut driver = driver_with(state.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_fetch_pool(pool.clone());
+        let g = signed_block(1, [0u8; 32]);
+        let gid = block_id_from_block(&g).unwrap();
+        assert!(matches!(driver.accept_block(&g, None), AcceptOutcome::Accepted(_)));
+
+        // Block 2 with a transaction root that does not match its body.
+        let mut bad = signed_block(2, *gid.as_bytes());
+        bad.block_header.as_mut().unwrap().raw_data.as_mut().unwrap().tx_trie_root = vec![0xAA; 32];
+        let bad_id = *block_id_from_block(&bad).unwrap().as_bytes();
+        let outcome = driver.try_accept_block(&bad, None);
+        assert!(
+            matches!(BlockDisposition::of(&outcome), BlockDisposition::Failed(_)),
+            "fixture must fail validation, got {outcome:?}"
+        );
+
+        pool.push_wants([(2i64, bad_id)]);
+        let mut expected: std::collections::VecDeque<[u8; 32]> = [bad_id].into();
+        let (mut prev, mut ts) = (None, 0i64);
+        for attempt in 1..=SyncDriver::MAX_REFETCH_ATTEMPTS as u64 {
+            let got = pool.claim(attempt, i64::MAX, 1, 100, Duration::from_secs(60), |_| false);
+            assert_eq!(got, vec![bad_id], "attempt {attempt}: offered to a fresh connection");
+            pool.deliver(bad_id, bad.encode_to_vec());
+            assert_eq!(driver.drain_pool(&pool, &mut expected, "p", &mut prev, &mut ts), 1);
+            assert_eq!(pool.locate(&bad_id), "want");
+            assert_eq!(expected.front(), Some(&bad_id), "still the head of the queue");
+        }
+        // Out of attempts: dropped, so it cannot block the queue forever.
+        let got = pool.claim(99, i64::MAX, 1, 100, Duration::from_secs(60), |_| false);
+        assert_eq!(got, vec![bad_id]);
+        pool.deliver(bad_id, bad.encode_to_vec());
+        driver.drain_pool(&pool, &mut expected, "p", &mut prev, &mut ts);
+        assert_eq!(pool.locate(&bad_id), "untracked");
+        assert!(expected.is_empty());
+    }
+
+    /// A queue that starts above a gap must not burn its blocks: they stay
+    /// pooled until the head reaches them, and entries the head has already
+    /// passed are dropped instead of blocking the front.
+    #[test]
+    fn drain_keeps_blocks_above_a_gap_and_drops_entries_already_applied() {
+        use prost::Message as _;
+        let state = mem_state();
+        let pool = Arc::new(SyncFetchPool::new());
+        let mut driver = driver_with(state.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_fetch_pool(pool.clone());
+        let mut chain = vec![signed_block(1, [0u8; 32])];
+        for n in 2..=6 {
+            let parent = block_id_from_block(chain.last().unwrap()).unwrap();
+            chain.push(signed_block(n, *parent.as_bytes()));
+        }
+        let ids: Vec<[u8; 32]> = chain
+            .iter()
+            .map(|b| *block_id_from_block(b).unwrap().as_bytes())
+            .collect();
+        assert!(matches!(driver.accept_block(&chain[0], None), AcceptOutcome::Accepted(_)));
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        let head = || dp.latest_block_header_number().unwrap();
+        let deliver = |n: usize| {
+            pool.push_wants([(n as i64 + 1, ids[n])]);
+            pool.claim(n as u64, i64::MAX, 8, 100, Duration::from_secs(60), |_| false);
+            pool.deliver(ids[n], chain[n].encode_to_vec());
+        };
+
+        // The queue holds 5 and 6 only; 2..4 are unknown to it (the gap).
+        deliver(4);
+        deliver(5);
+        let mut expected: std::collections::VecDeque<[u8; 32]> = [ids[4], ids[5]].into();
+        let (mut prev, mut ts) = (None, 0i64);
+        assert_eq!(driver.drain_pool(&pool, &mut expected, "p", &mut prev, &mut ts), 0);
+        assert_eq!(head(), 1);
+        assert_eq!(expected.len(), 2, "nothing consumed");
+        assert_eq!(pool.locate(&ids[4]), "ready");
+        assert_eq!(pool.locate(&ids[5]), "ready");
+
+        // The gap is learnt later and lands BEHIND the far blocks in the
+        // queue; block 2 is also applied out of band while still queued.
+        deliver(1);
+        deliver(2);
+        deliver(3);
+        expected.extend([ids[1], ids[2], ids[3]]);
+        assert!(matches!(driver.accept_block(&chain[1], None), AcceptOutcome::Accepted(_)));
+        assert_eq!(head(), 2);
+        let applied = driver.drain_pool(&pool, &mut expected, "p", &mut prev, &mut ts);
+        assert_eq!(applied, 4, "3, 4, 5 and 6 applied in order");
+        assert_eq!(head(), 6);
+        assert!(expected.is_empty());
+        for id in &ids[1..] {
+            assert_eq!(pool.locate(id), "untracked");
+        }
+    }
+
     #[test]
     fn drain_pool_blocks_on_the_fleet_apply_lock() {
         use prost::Message as _;

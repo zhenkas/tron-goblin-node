@@ -1,6 +1,8 @@
 [workspace]
+exclude = ["vendor/tidesdb"]
 resolver = "2"
 members = [
+    "crates/critical-notify",
     "crates/tron-crypto",
     "crates/tron-proto",
     "crates/tron-types",
@@ -162,3 +164,6 @@ jubjub = "0.10"
 # way to reclaim space — this just keeps the steady-state much smaller.
 [profile.dev]
 debug = "line-tables-only"
+
+[patch."https://github.com/tidesdb/tidesdb-rs"]
+tidesdb = { path = "vendor/tidesdb" }

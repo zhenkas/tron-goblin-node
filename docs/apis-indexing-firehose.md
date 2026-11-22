@@ -32,6 +32,15 @@ curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
 
 Addresses accept eth `0x…` (20-byte), TRON `41…`, or base58 `T…` form.
 
+Native voting in `eth_call`, `triggerConstantContract` and their trace/estimate paths uses
+the selected view's real accounts, witness registry and vote rows. Each request wraps
+these stores in disposable sessions, including the votes and reward-settlement
+writes made by `VOTEWITNESS`. A successful simulation can therefore validate a
+pool's `voteForSrs` call without casting votes on chain. Invalid witnesses,
+insufficient voting power and contract reverts still fail normally; neither success
+nor failure commits account, vote, delegation, storage or dynamic-property changes.
+Latest, solid and archive views retain their own underlying vote state.
+
 ### Developer and debug methods
 
 Beyond the standard `eth_*` reads, the JSON-RPC surface exposes three
@@ -348,6 +357,42 @@ grpcurl -plaintext \
   -d '{}' 127.0.0.1:50052 protocol.Wallet/GetNowBlock
 ```
 
+### Transaction permission queries
+
+POST /wallet/getsignweight and /wallet/getapprovedlist accept a TronWeb
+transaction object as well as the existing JSON string containing a
+0x-prefixed full protobuf Transaction. JSON-RPC getSignWeight and
+getApprovedList accept the same forms in params[0].
+
+For JSON input, the current raw_data is authoritative. These read-only
+queries canonically encode its supplied TAPOS, timestamp, expiration, fee limit,
+memo (data), typed contract and Permission_id, and recalculate txID and
+raw_data_hex. Cached versions of those two fields may be stale after TronWeb
+addUpdateData; they are not used to reconstruct the transaction. No current
+block reference, clock value, signature or transaction admission is generated.
+
+The bounded JSON decoder supports TransferContract, TransferAssetContract
+and TriggerSmartContract, one contract per transaction, canonical nonnegative
+int64 quantities, valid TRON addresses/hex fields, and up to 100 signatures
+within the 500,000-byte transaction bound. Unsupported fields/contracts and
+malformed signatures are rejected rather than dropped. Other contract types
+remain supported through the full-wire hex input.
+
+The response's transaction is a complete TransactionExtention: its nested
+transaction.transaction contains the normalized transaction and its
+transaction.txid identifies it. The legacy summary transaction.txID and
+signature_count are retained. Permission, approved addresses, current weight
+and permission result codes are computed from actual account permissions and
+signatures. An unsigned transaction normally has current_weight: 0 and
+NOT_ENOUGH_PERMISSION; successful normalization is not permission to broadcast.
+Expiry/TAPOS admission is not performed by these read-only queries.
+
+This normalization is **not** used by /wallet/broadcasttransaction. Signed
+broadcast still validates the submitted canonical raw_data_hex, matching
+txID, and nonempty 65-byte signatures, preserving the submitted signing bytes.
+The legacy full-wire query path retains original raw wire bytes and wire txID,
+including raw fields not represented in the JSON decoder.
+
 ## Built-In TronGrid-Compatible Index
 
 Enable:
@@ -462,6 +507,37 @@ enable = true
 The firehose is a durable append-only stream of applied blocks plus explicit
 `UNWIND` entries for reorgs and crash recovery. External consumers tail the
 `tronfirehose.Firehose/Tail` gRPC stream and resume by sequence number.
+
+### Final native TRX balances
+
+With `storage.snapshot_reorg = false` (BlockSession), enabling Firehose also
+captures the committed account write-set. It does not enable the historical
+state archive. Each APPLY adds `trx_balance_changes`: one 21-byte address,
+raw signed `balance_before` and `balance_after` (int64 sun), sorted by address.
+Canonical TRON accounts with negative balances exist; preserve their exact values.
+Unchanged negative accounts are omitted as net-zero changes.
+Only changed liquid TRX balances are included, after all transaction, fee,
+internal-call and block-level effects. Net-zero changes are omitted. Stake,
+TRC10 maps and TRC20 contract storage are not included.
+
+`trx_balances_complete = true` with an empty list means no liquid TRX changes.
+False means unavailable capture, including legacy segments, missing sidecars or
+the snapshot-stack execution path. Consumers requiring exact balances must stop
+before committing/ACKing that block; they must not interpret false as zero changes.
+The existing transaction order, log order and native from/to/amount facts remain
+available. The final balance list cannot identify an owner or transfer sender.
+
+For crash/gap repair, balance capture is persisted in transactionRetStore under
+`height_be || 0x42`, bound to the canonical blockID, before the receipt WAL sync.
+A former fork's capture is never reused for another block. The sidecar follows
+the same ACK/solid/reserve-gated history pruning floor as receipts; it does not
+create a separate unbounded state archive. The stream journal carries these
+fields during ordinary replay and emits explicit UNWIND on reorgs.
+
+Capture begins with newly executed blocks. Old blocks/receipts alone cannot
+reconstruct native state changes without re-execution; upgrading never silently
+marks legacy data complete. Do not roll back to a binary whose history pruner
+does not understand the new receipt sidecar keys while using this data directory.
 
 Reference consumers:
 

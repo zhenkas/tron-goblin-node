@@ -173,8 +173,15 @@ impl SessionBackend {
         }
         let mut undo = Vec::with_capacity(drained.len());
         let mut ops = Vec::with_capacity(drained.len());
-        for (key, op) in drained {
-            let before = self.parent.get(&key)?;
+        let drained: Vec<_> = drained.into_iter().collect();
+        let keys: Vec<&[u8]> = drained.iter().map(|(key, _)| key.as_slice()).collect();
+        let before = self.parent.multi_get(&keys)?;
+        if before.len() != drained.len() {
+            return Err(KvError::Backend(
+                "undo multi_get result count differs".into(),
+            ));
+        }
+        for ((key, op), before) in drained.into_iter().zip(before) {
             undo.push((key.clone(), before));
             ops.push(match op {
                 Op::Put(value) => WriteOp::Put(key, value),
@@ -232,8 +239,15 @@ impl SessionBackend {
         };
         let mut ops = Vec::with_capacity(drained.len());
         let mut undo = Vec::with_capacity(drained.len());
-        for (key, op) in drained {
-            let before = self.parent.get(&key)?;
+        let drained: Vec<_> = drained.into_iter().collect();
+        let keys: Vec<&[u8]> = drained.iter().map(|(key, _)| key.as_slice()).collect();
+        let before = self.parent.multi_get(&keys)?;
+        if before.len() != drained.len() {
+            return Err(KvError::Backend(
+                "undo multi_get result count differs".into(),
+            ));
+        }
+        for ((key, op), before) in drained.into_iter().zip(before) {
             undo.push((key.clone(), before));
             ops.push(match op {
                 Op::Put(value) => WriteOp::Put(key, value),
@@ -311,6 +325,24 @@ impl KvBackend for SessionBackend {
         }
     }
 
+    fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return self.parent.multi_get(keys);
+        }
+        let resolved = {
+            let guard = self.pending.read().expect("SessionBackend lock poisoned");
+            keys.iter()
+                .map(|key| {
+                    guard.get(*key).map(|op| match op {
+                        Op::Put(value) => Some(value.clone()),
+                        Op::Delete => None,
+                    })
+                })
+                .collect()
+        };
+        crate::backend::merge_multi_get(self.parent.as_ref(), keys, resolved)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
         self.dirty.store(true, Ordering::Relaxed);
         self.pending
@@ -332,9 +364,16 @@ impl KvBackend for SessionBackend {
     /// Snapshot: parent state with the pending overlay applied. Uses
     /// a `BTreeMap` to deduplicate and sort — pending writes shadow
     /// parent entries; pending deletes remove them.
+    fn sync_wal(&self) -> Result<(), crate::KvError> {
+        self.parent.sync_wal()
+    }
+
+    fn checkpoint(&self) -> Result<(), crate::KvError> {
+        self.parent.checkpoint()
+    }
+
     fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.parent.scan_all()?.into_iter().collect();
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = self.parent.scan_all()?.into_iter().collect();
         let g = self.pending.read().expect("SessionBackend lock poisoned");
         for (k, op) in g.iter() {
             match op {

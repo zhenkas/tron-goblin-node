@@ -30,6 +30,9 @@
 //! Returns a [`BlockExecutionReport`] with the new head BlockId and
 //! per-transaction outcomes.
 
+#[cfg(feature = "bench-profile")]
+pub mod bench_profile;
+
 pub mod adaptive;
 pub mod bandwidth;
 pub mod energy;
@@ -1392,6 +1395,53 @@ mod apply_timing {
     }
 }
 
+/// Optional durable recorder for a block's final write-set. Called after
+/// successful execution/drain and BEFORE the cross-store commit. An error
+/// rejects the block without publishing any consensus-store mutations.
+pub trait BlockCommitObserver: Send + Sync {
+    fn prepare(
+        &self,
+        block: &Block,
+        report: &BlockExecutionReport,
+        undo: &tron_chainbase::BlockUndoRecord,
+    ) -> Result<(), String>;
+}
+
+/// Execute with the ordinary checkpoint/undo contract and a pre-commit
+/// recorder. Keeps the recorder scoped to this caller (never a global hook,
+/// RPC simulation, or another in-process node). The observer always receives
+/// complete, sorted deltas, even when archive capture is otherwise disabled.
+pub fn execute_block_with_observer(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+    checkpoint: &tron_chainbase::CheckPointV2,
+    config: &ExecConfig,
+    original_wire: Option<&[TxWireInfo]>,
+    observer: &dyn BlockCommitObserver,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    let session = BlockSession::wrap(state);
+    let mut report = execute_block_logic(
+        &session.as_state_backends(), block, expected_parent, config, original_wire,
+    )?;
+    let drained = drain_block_session(session, state, true)
+        .map_err(|e| BlockExecError::Checkpoint(tron_chainbase::CheckpointError::Io(e.to_string())))?;
+    report.state_deltas = drained.deltas;
+    let mut record = drained.record;
+    record.entries.sort_by(|a,b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
+    observer.prepare(block, &report, &record)
+        .map_err(|e| BlockExecError::Checkpoint(tron_chainbase::CheckpointError::Io(
+            format!("block recorder refused commit: {e}"),
+        )))?;
+    commit_drained(&drained.stores, checkpoint, state, config.defer_store_fsync)
+        .map_err(BlockExecError::Checkpoint)?;
+    let height = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref())
+        .map(|r| r.number).unwrap_or(0);
+    undo_store.put(height, &record)?;
+    Ok(report)
+}
+
 fn execute_block_inner(
     state: &StateBackends,
     block: &Block,
@@ -1805,10 +1855,12 @@ pub(crate) fn split_drained_accounts(
             WriteOp::Put(k, _) | WriteOp::Delete(k) => k.as_slice(),
         })
         .collect();
-    let before = keys
-        .iter()
-        .map(|key| rows.get(key))
-        .collect::<Result<Vec<_>, _>>()?;
+    let before = rows.multi_get(&keys)?;
+    if before.len() != keys.len() {
+        return Err(tron_chainbase::KvError::Backend(
+            "account-asset undo multi_get result count differs".into(),
+        ));
+    }
     drop(keys);
     // An account is written back with every balance it was loaded with, and
     // a block usually moves one of them. Rows that already hold the value
@@ -2345,8 +2397,103 @@ pub fn rollback_block(
     Ok(n)
 }
 
+/// Crash repair for "state ahead of the block store".
+///
+/// The state commit is durable per block, while block bytes written by an
+/// older build were not fsynced, so a power loss could leave the head pointer
+/// on a block (and a few predecessors) the block store or the canonical index
+/// no longer holds. Nothing can sync from there: peers resend those heights
+/// and each one fails the parent check against the head. Roll the state back,
+/// through the undo records, to the highest height whose block and index entry
+/// both survived; normal sync then re-executes the gap.
+///
+/// A hole below a head that kept its own block is repaired the same way.
+/// Refuses ([`RollbackError::RepairRefused`]) without touching anything when
+/// an undo record in the range is missing. Returns `Some((old_head, new_head))` when it rolled back.
+pub fn repair_head_ahead_of_blocks(
+    state: &StateBackends,
+    blocks: &Arc<dyn tron_chainbase::KvBackend>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+) -> Result<Option<(i64, i64)>, RollbackError> {
+    use tron_chainbase::{BlockIndexStore, DynamicPropertiesStore};
+    const MAX_DEPTH: i64 = 4096;
+    let Some(index_backend) = &state.block_index else { return Ok(None) };
+    let index = BlockIndexStore::new(index_backend.clone());
+    let head_of = || -> Result<(i64, Option<[u8; 32]>), RollbackError> {
+        let props = DynamicPropertiesStore::new(state.dyn_props.clone());
+        Ok((props.latest_block_header_number().unwrap_or(0), props.latest_block_header_hash()?))
+    };
+    let stored = |num: i64| -> Result<Option<tron_types::BlockId>, RollbackError> {
+        match index.get(num) {
+            Ok(id) => Ok(blocks.get(id.as_bytes())?.map(|_| id)),
+            Err(tron_chainbase::StoreError::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let (head, head_hash) = head_of()?;
+    let Some(head_hash) = head_hash else { return Ok(None) };
+    if head <= 0 {
+        return Ok(None);
+    }
+    let has_undo = |num: i64| -> Result<bool, RollbackError> {
+        Ok(undo_store.get(num).map_err(|e| RollbackError::Decode(format!("{e:?}")))?.is_some())
+    };
+    // Only heights this node executed itself (they have undo records) can
+    // have lost their block; below that the block store may legitimately be
+    // empty (pruned history, a lite snapshot).
+    let mut lowest_hole = match stored(head)? {
+        Some(id) if *id.as_bytes() == head_hash => None,
+        _ => Some(head),
+    };
+    let mut num = head - 1;
+    while num > 0 && head - num < MAX_DEPTH && has_undo(num)? {
+        if stored(num)?.is_none() {
+            lowest_hole = Some(num);
+        }
+        num -= 1;
+    }
+    let Some(lowest_hole) = lowest_hole else { return Ok(None) };
+    let target = lowest_hole - 1;
+    if stored(target)?.is_none() {
+        return Err(RollbackError::RepairRefused(format!(
+            "block {target} below the lowest missing block {lowest_hole} is not stored either"
+        )));
+    }
+    for num in target + 1..=head {
+        if !has_undo(num)? {
+            return Err(RollbackError::RepairRefused(format!("no undo record for block {num}")));
+        }
+    }
+    for num in (target + 1..=head).rev() {
+        rollback_block(state, num, undo_store)?;
+    }
+    // Blocks that survived above the hole are now ahead of the head and must
+    // be fetched and executed again; left in the index they would count as
+    // already known and sync would stop right below them.
+    for num in target + 1..=head {
+        if let Ok(id) = index.get(num) {
+            blocks.delete(id.as_bytes())?;
+            index.delete(num)?;
+        }
+    }
+    blocks.sync_wal()?;
+    sync_all_state_wals(state)?;
+    let (now, now_hash) = head_of()?;
+    let expected = stored(target)?.map(|id| *id.as_bytes());
+    if now != target || now_hash != expected {
+        return Err(RollbackError::Repair(format!(
+            "after rollback the head is {now}, expected stored block {target}"
+        )));
+    }
+    Ok(Some((head, target)))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackError {
+    #[error("crash repair failed: {0}")]
+    Repair(String),
+    #[error("crash repair not possible, state untouched: {0}")]
+    RepairRefused(String),
     #[error("no undo record stored for block {0}")]
     MissingUndoRecord(i64),
     #[error("undo record decode failed: {0}")]
@@ -3019,6 +3166,9 @@ fn execute_block_logic(
             })
             .unwrap_or_default();
         let genesis_ts = dp.genesis_block_timestamp().unwrap_or(0);
+        // Slots that passed without a block before this one; they are
+        // recorded as empty in the filled-slots ring below.
+        let mut missed_slots = 0u64;
         // Block 1 is special: java-tron's StatisticManager hard-codes
         // `slot = 1` for it (no miss attribution because there is no
         // previous-producer baseline). Mirror that.
@@ -3061,6 +3211,7 @@ fn execute_block_logic(
             // `(slot − 1) % N` (the previous formula here) attributed
             // every miss to the witness one schedule position early.
             let prev_abs = (prev_ts - genesis_ts) / BLOCK_INTERVAL_MS;
+            missed_slots = (slot - 1).max(0) as u64;
             for i in 1..slot {
                 let idx =
                     (prev_abs + i).rem_euclid(active_witnesses.len() as i64) as usize;
@@ -3071,6 +3222,9 @@ fn execute_block_logic(
                 }
             }
         }
+        // java `StatisticManager.applyBlock`: `applyBlock(false)` per
+        // missed slot, then `applyBlock(true)` for this block.
+        dp.apply_block_filled_slots(missed_slots);
     }
 
     // === 5c. Per-block reward distribution ===
@@ -4389,6 +4543,8 @@ fn execute_vm_tx(
                 out_of_time_energy = Some(energy_limit);
                 (caller, contract_addr, None, Vec::new(), 0)
             } else {
+                #[cfg(feature = "bench-profile")]
+                let vm_timer = bench_profile::start(tx_id);
                 let (outcome, traces, energy_penalty) =
                     tron_tvm::execute::execute_trigger_with_trace_tx_id(
                         &vm_stores,
@@ -4397,6 +4553,8 @@ fn execute_vm_tx(
                         energy_limit,
                         tx_id,
                     );
+                #[cfg(feature = "bench-profile")]
+                bench_profile::finish(vm_timer);
                 (caller, contract_addr, Some(outcome), traces, energy_penalty)
             }
         }
@@ -4444,6 +4602,8 @@ fn execute_vm_tx(
                 out_of_time_energy = Some(energy_limit);
                 (caller, None, None, Vec::new(), 0)
             } else {
+                #[cfg(feature = "bench-profile")]
+                let vm_timer = bench_profile::start(tx_id);
                 let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_create_with_trace(
                     &vm_stores,
                     block_env,
@@ -4451,6 +4611,8 @@ fn execute_vm_tx(
                     &tx_id,
                     energy_limit,
                 );
+                #[cfg(feature = "bench-profile")]
+                bench_profile::finish(vm_timer);
                 // CreateSmartContract: caller IS the origin, so no origin
                 // split applies. Pass `None` for the contract address so
                 // the energy-charge path takes the caller-pays-all branch.

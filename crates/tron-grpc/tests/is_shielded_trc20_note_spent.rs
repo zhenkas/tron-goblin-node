@@ -61,6 +61,7 @@ fn fresh_state_with_contract(addr: [u8; 21], bytecode: Vec<u8>) -> RpcState {
         code: code.clone(),
         storage: storage.clone(),
         witnesses,
+        votes: mem(),
         contract_state,
         dyn_props: dyn_props.clone(),
         delegated_resources,

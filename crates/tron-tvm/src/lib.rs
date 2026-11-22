@@ -96,3 +96,43 @@ pub use precompiles::{
     PrecompileError, PrecompileImpl, PrecompileResult, ALL_PRECOMPILES,
 };
 pub use proposals::ProposalSet;
+
+/// Private test builds shorten native V2 unfreeze days; ordinary builds retain
+/// the protocol's 86,400,000 ms. Never use devnet-fast on a public network.
+pub const fn unfreeze_day_ms() -> i64 {
+    if cfg!(feature = "devnet-fast") { 30_000 } else { 86_400_000 }
+}
+
+/// Actual V2 unfreeze delay. The isolated private binary alone recognizes this
+/// immutable genesis property; ordinary public builds retain protocol behavior.
+pub fn unfreeze_delay_ms(properties: &tron_chainbase::DynamicPropertiesStore) -> i64 {
+    #[cfg(feature = "private-network")]
+    if let Some(delay) = properties.get_long(b"PRIVATE_UNFREEZE_DELAY_MS") {
+        if (60_000..=86_400_000).contains(&delay) {
+            return delay;
+        }
+    }
+    properties.get_long(b"UNFREEZE_DELAY_DAYS").unwrap_or(14).max(0)
+        .saturating_mul(unfreeze_day_ms())
+}
+
+#[cfg(test)]
+mod unfreeze_period_tests {
+    #[test]
+    fn public_build_ignores_private_timing_and_protocol_properties() {
+        #[cfg(not(feature = "private-network"))]
+        {
+            let dp = tron_chainbase::DynamicPropertiesStore::new(
+                std::sync::Arc::new(tron_chainbase::MemBackend::new()));
+            dp.put_long(b"UNFREEZE_DELAY_DAYS", 14);
+            dp.put_long(b"PRIVATE_UNFREEZE_DELAY_MS", 300_000);
+            dp.put_long(b"PRIVATE_PROTOCOL_VERSION", tron_chainbase::BLOCK_VERSION as i64);
+            assert_eq!(super::unfreeze_delay_ms(&dp), 14 * super::unfreeze_day_ms());
+            assert!(!tron_chainbase::energy_limit_hard_fork_active(&dp));
+        }
+    }
+    #[test]
+    fn native_day_is_protocol_default_except_explicit_devnet_feature() {
+        assert_eq!(super::unfreeze_day_ms(), if cfg!(feature="devnet-fast") {30_000} else {86_400_000});
+    }
+}

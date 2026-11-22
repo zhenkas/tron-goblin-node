@@ -1,0 +1,96 @@
+// Authenticated, role-independent node-to-node state and event replication.
+syntax = "proto3";
+package tronassist.v1;
+service AssistedSync {
+  // Both ends send Hello first. Either end may have initiated the transport.
+  rpc Link(stream Frame) returns (stream Frame);
+}
+message Frame {
+  oneof message {
+    Hello hello = 1;
+    Status status = 2;
+    Fetch fetch = 3;
+    BlockBundle block = 4;
+    Ack ack = 5;
+    Failure failure = 6; Probe probe = 7; Anchor anchor = 8;
+    SnapshotOpen snapshot_open = 9;
+    SnapshotState snapshot_state = 10;
+    SnapshotRead snapshot_read = 11;
+    SnapshotChunk snapshot_chunk = 12;
+    SnapshotInstalled snapshot_installed = 13;
+    SnapshotAccepted snapshot_accepted = 14;
+    SnapshotRelease snapshot_release = 15;
+  }
+}
+message Hello {
+  string node_id = 1;
+  bytes network = 2;
+  bytes profile = 3;
+  bool wants_donor = 4;
+  bool trusted_cluster = 5;
+}
+message Status {
+  int64 head = 1;
+  bytes head_id = 2;
+  int64 solid = 3;
+  bytes solid_id = 4;
+  int64 retained_from = 5;
+  string mode = 6;
+}
+message Fetch {
+  int64 after_height = 1;
+  bytes after_id = 2;
+  bytes after_digest = 3;
+  bytes after_semantic_digest = 4;
+}
+message Delta {
+  uint32 store = 1;
+  bytes key = 2;
+  optional bytes before = 3;
+  optional bytes after = 4;
+}
+message Rotation {
+  repeated bytes before = 1;
+  repeated bytes current = 2;
+  int64 before_maintenance_time_ms = 3;
+}
+message BlockBundle {
+  uint32 format = 1;
+  bytes network = 2;
+  bytes profile = 3;
+  int64 height = 4;
+  bytes block_id = 5;
+  bytes parent_id = 6;
+  bytes previous_digest = 7;
+  repeated Delta deltas = 8;
+  bytes raw_block = 9;
+  bytes transaction_ret = 10;
+  // BlockApplied payload; seq belongs to the receiver's own journal.
+  // solidified_height is zero in the hashed payload: finality travels in Status.
+  bytes firehose_apply = 11;
+  bytes undo = 12;
+  optional Rotation rotation = 13;
+  bytes digest = 14;
+}
+message Ack {
+  int64 height = 1;
+  bytes block_id = 2;
+  bytes digest = 3;
+  bytes semantic_digest = 4;
+}
+message Failure {
+  string code = 1;
+  string detail = 2;
+}
+
+message Probe { int64 height = 1; }
+message Anchor { int64 height = 1; bytes block_id = 2; }
+
+message SnapshotOpen { string request_id = 1; string replace_snapshot_id = 2; }
+message SnapshotState { bytes manifest_json = 1; bool ready = 2; }
+message SnapshotRead { string snapshot_id = 1; uint32 file = 2; uint64 offset = 3; }
+message SnapshotChunk { string snapshot_id = 1; uint32 file = 2; uint64 offset = 3; bytes data = 4; bytes sha256 = 5; }
+message SnapshotInstalled { string snapshot_id = 1; bytes manifest_sha256 = 2; }
+message SnapshotAccepted { string snapshot_id = 1; }
+
+message SnapshotRelease { string snapshot_id = 1; }

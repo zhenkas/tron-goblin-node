@@ -8,8 +8,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Local persistent sandbox identity; contains paths only, never raw signing keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateNetworkConfig {
+    pub manifest: PathBuf,
+    #[serde(default)]
+    pub witness_keys: Option<PathBuf>,
+    /// Private peer idle/relay and tip refresh interval; public defaults unchanged.
+    #[serde(default = "default_private_tip_poll_interval_ms")]
+    pub tip_poll_interval_ms: u64,
+}
+fn default_private_tip_poll_interval_ms() -> u64 { 1000 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
+    /// Immutable, explicitly isolated private-chain profile. Public builds reject it.
+    #[serde(default)]
+    pub private_network: Option<PrivateNetworkConfig>,
     /// Directory holding `db/`, the writable on-disk state.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -30,6 +46,10 @@ pub struct NodeConfig {
     /// TronWeb / Java SDK / TronGrid clients can connect.
     #[serde(default)]
     pub grpc: GrpcConfig,
+
+    /// Authenticated state + event replication between explicitly trusted nodes.
+    #[serde(default)]
+    pub assist: crate::assisted_sync::AssistConfig,
 
     /// HTTP REST API (port 8091 by default) — the surface that TronWeb,
     /// TronGrid, and the reference wallet-cli speak.
@@ -52,7 +72,7 @@ pub struct NodeConfig {
     #[serde(default, alias = "openHistoryQueryWhenLiteFN")]
     pub open_history_query_when_lite_fn: bool,
 
-    /// RocksDB tuning + DB-lifecycle settings.
+    /// KV provider, engine tuning and DB-lifecycle settings.
     #[serde(default)]
     pub storage: StorageConfig,
 
@@ -179,6 +199,13 @@ fn default_pending_transaction_timeout_ms() -> i64 {
 /// 16 or 32.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
+    /// KV provider selected once at store open. Existing configs use RocksDB.
+    #[serde(default)]
+    pub backend: tron_chainbase::KvEngine,
+    /// Independent per-store TidesDB settings.
+    #[serde(default)]
+    pub tidesdb: tron_chainbase::TidesDbOptions,
+
     /// Per-CF write-buffer size in MiB. RocksDB flushes when this
     /// fills. Bigger = fewer flushes (faster write throughput) at
     /// the cost of memory.
@@ -251,6 +278,8 @@ fn default_block_cache_mb() -> usize {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            backend: tron_chainbase::KvEngine::Rocksdb,
+            tidesdb: tron_chainbase::TidesDbOptions::default(),
             write_buffer_size_mb: default_write_buffer_mb(),
             max_open_files: default_max_open_files(),
             compact_on_start: false,
@@ -260,6 +289,18 @@ impl Default for StorageConfig {
             snapshot_horizon: default_snapshot_horizon(),
             block_cache_mb: default_block_cache_mb(),
         }
+    }
+}
+
+impl StorageConfig {
+    pub fn provider(&self) -> Result<tron_chainbase::KvProvider, tron_chainbase::KvError> {
+        let provider = tron_chainbase::KvProvider {
+            engine: self.backend,
+            rocks_tuning: Some((self.write_buffer_size_mb, self.max_open_files)),
+            tidesdb: self.tidesdb.clone(),
+        };
+        provider.validate()?;
+        Ok(provider)
     }
 }
 
@@ -1250,11 +1291,13 @@ fn default_max_peers() -> usize {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            private_network: None,
             data_dir: default_data_dir(),
             rpc: RpcConfig::default(),
             p2p: P2pConfig::default(),
             metrics: MetricsConfig::default(),
             grpc: GrpcConfig::default(),
+            assist: crate::assisted_sync::AssistConfig::default(),
             http: HttpRestConfig::default(),
             witness: None,
             bundler: None,
@@ -2192,14 +2235,45 @@ pub struct IndexFirehoseConfig {
     /// retained entry (visible as a seq jump). Default 32 GiB.
     #[serde(default = "default_firehose_retain_mb", alias = "retainMb")]
     pub retain_mb: u64,
+    /// Online block/receipt/journal retention, authorized by a memory-only REST ACK.
+    #[serde(default)]
+    pub history: HistoryPruningConfig,
 }
 
 impl Default for IndexFirehoseConfig {
     fn default() -> Self {
-        Self { enable: false, retain_mb: default_firehose_retain_mb() }
+        Self { enable: false, retain_mb: default_firehose_retain_mb(), history: HistoryPruningConfig::default() }
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryPruningConfig {
+    pub enable: bool,
+    pub retain_blocks: u64,
+    /// Independent finalized undo horizon; never gates Firehose replay.
+    pub undo_retain_blocks: u64,
+    pub batch_blocks: usize,
+    pub interval_seconds: u64,
+    pub ack_port: u16,
+}
+impl Default for HistoryPruningConfig {
+    fn default() -> Self { Self { enable: false, retain_blocks: 1_000_000, undo_retain_blocks: 10_000, batch_blocks: 128, interval_seconds: 3600, ack_port: 28092 } }
+}
+impl HistoryPruningConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retain_blocks < 65_536 || self.retain_blocks > i64::MAX as u64 {
+            return Err("history.retain_blocks must be at least 65536 (TAPOS) and fit i64".into());
+        }
+        if self.undo_retain_blocks == 0 || self.undo_retain_blocks > i64::MAX as u64 {
+            return Err("history.undo_retain_blocks must be positive and fit i64".into());
+        }
+        if !(1..=4096).contains(&self.batch_blocks) { return Err("history.batch_blocks must be 1..4096".into()); }
+        if !(1..=31_536_000).contains(&self.interval_seconds) { return Err("history.interval_seconds must be 1..31536000".into()); }
+        if self.ack_port == 0 { return Err("history.ack_port must be nonzero".into()); }
+        Ok(())
+    }
+}
 fn default_firehose_retain_mb() -> u64 {
     32 * 1024
 }
@@ -3003,5 +3077,39 @@ mod tests {
             cfg.resolve_committee(),
             Err(ConfigError::Committee(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod kv_provider_config_tests {
+    use super::*;
+    use tron_chainbase::KvEngine;
+    #[test]
+    fn legacy_storage_config_keeps_rocksdb() {
+        let config: NodeConfig =
+            toml::from_str("[storage]\nwrite_buffer_size_mb = 4\nmax_open_files = 64\n").unwrap();
+        assert_eq!(config.storage.backend, KvEngine::Rocksdb);
+        assert_eq!(
+            config.storage.provider().unwrap().rocks_tuning,
+            Some((4, 64))
+        );
+    }
+    #[test]
+    fn tidesdb_section_round_trips_and_rejects_invalid_options() {
+        let text = "[storage]\nbackend = 'tidesdb'\n[storage.tidesdb]\nwrite_buffer_size_mb = 2\nblock_cache_mb = 0\nwal_sync = 'full'\n";
+        let config: NodeConfig = toml::from_str(text).unwrap();
+        let provider = config.storage.provider().unwrap();
+        assert_eq!(provider.engine, KvEngine::Tidesdb);
+        assert_eq!(provider.tidesdb.write_buffer_size_mb, 2);
+        let round: NodeConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(round.storage.backend, KvEngine::Tidesdb);
+        let mut invalid = config.storage;
+        invalid.tidesdb.flush_threads = 0;
+        assert!(invalid.provider().is_err());
+        invalid.tidesdb.flush_threads = 1;
+        invalid.tidesdb.bloom_fpr = f64::NAN;
+        assert!(invalid.provider().is_err());
+        assert!(toml::from_str::<NodeConfig>("[storage]\nbackend = 'unknown'").is_err());
+        assert!(toml::from_str::<NodeConfig>("[storage.tidesdb]\nmisspelled_option = 1").is_err());
     }
 }

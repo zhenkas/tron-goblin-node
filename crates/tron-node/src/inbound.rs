@@ -64,6 +64,7 @@ pub struct InboundServer {
     mempool: Option<Arc<TxMempool>>,
     genesis: BlockId,
     advertise_port: i32,
+    network_id: i32,
     metrics: Option<Arc<tron_rpc::Metrics>>,
     max_inbound: usize,
     inbound: AtomicUsize,
@@ -92,11 +93,18 @@ impl InboundServer {
             mempool,
             genesis,
             advertise_port,
+            network_id: MAINNET_P2P_VERSION,
             metrics,
             max_inbound: max_inbound.max(1),
             inbound: AtomicUsize::new(0),
             inbound_budget: None,
         }
+    }
+
+    #[cfg(feature = "private-network")]
+    pub(crate) fn with_private_network(mut self, network_id: i32) -> Self {
+        self.network_id = network_id;
+        self
     }
 
     /// Attach the shared process-wide inbound-bytes budget (N-3). Use the
@@ -271,7 +279,7 @@ where
     };
     conn.libp2p_handshake(Libp2pHelloInputs {
         from: from.clone(),
-        network_id: NETWORK_ID_MAINNET,
+        network_id: server.network_id,
         version: LIBP2P_VERSION,
         timestamp_ms: ts,
     })
@@ -283,7 +291,7 @@ where
     let head = server.head_id();
     conn.handshake(HelloInputs {
         from,
-        version: MAINNET_P2P_VERSION,
+        version: server.network_id,
         timestamp_ms: ts,
         genesis: server.genesis,
         solid: server.solid_id(),
@@ -308,7 +316,60 @@ where
     // always wakes to tick keepalive even when the peer is quiet.
     let mut last_inbound = Instant::now();
     let mut last_ping = Instant::now();
+    // FETCH_INV_DATA is limited to 3 requests/s by ordinary peers. Queue
+    // bursts of advertisements and pace requests instead of losing a request
+    // to the peer's silent rate-limit drop.
+    const TX_FETCH_INTERVAL: Duration = Duration::from_millis(400);
+    const TX_FETCH_QUEUE_CAP: usize = 1000;
+    let mut tx_fetch_queue = std::collections::VecDeque::<[u8; 32]>::new();
+    let mut tx_fetch_queued = std::collections::HashSet::<[u8; 32]>::new();
+    let mut last_tx_fetch: Option<Instant> = None;
+    #[cfg(feature="devnet-fast")]
+    let mut announced_head=server.head_number();
     loop {
+        #[cfg(feature="devnet-fast")]
+        {
+            let head=server.head_number();
+            if head!=announced_head {
+                if let Some(index)=server.block_index.as_ref() {
+                    if let Ok(id)=BlockIndexStore::new(index.clone()).get(head) {
+                        conn.send_frame(Frame {ty:MessageType::Inventory,
+                            payload:Bytes::from(tron_proto::Inventory {
+                                r#type:tron_proto::inventory::InventoryType::Block as i32,
+                                ids:vec![id.as_bytes().to_vec()],
+                            }.encode_to_vec())}).await.map_err(|e|format!("private head announcement: {e}"))?;
+                        announced_head=head;
+                    }
+                }
+            }
+        }
+
+        if !tx_fetch_queue.is_empty()
+            && last_tx_fetch.map_or(true, |t| t.elapsed() >= TX_FETCH_INTERVAL)
+        {
+            let mut ids = Vec::new();
+            while ids.len() < 100 {
+                let Some(id) = tx_fetch_queue.pop_front() else { break; };
+                tx_fetch_queued.remove(&id);
+                if server.mempool.as_ref().map_or(false, |mp| mp.get(&id).is_some()) {
+                    continue;
+                }
+                ids.push(id.to_vec());
+            }
+            if !ids.is_empty() {
+                let count = ids.len();
+                conn.send_frame(Frame {
+                    ty: MessageType::FetchInvData,
+                    payload: Bytes::from(tron_proto::Inventory {
+                        r#type: tron_proto::inventory::InventoryType::Trx as i32,
+                        ids,
+                    }.encode_to_vec()),
+                }).await.map_err(|e| format!("request inbound tx bodies: {e}"))?;
+                last_tx_fetch = Some(Instant::now());
+                debug!(count, "requested inbound transaction bodies");
+            }
+        }
+
         if last_inbound.elapsed() > KEEPALIVE_INBOUND_DEADLINE {
             debug!(%peer_addr, "inbound peer silent past keepalive deadline; dropping");
             return Ok(());
@@ -324,7 +385,17 @@ where
             last_ping = Instant::now();
         }
 
-        let frame = match tokio::time::timeout(KEEPALIVE_INTERVAL, conn.next_frame()).await {
+        let mut read_timeout = if cfg!(feature="devnet-fast") {
+            Duration::from_millis(100)
+        } else {
+            KEEPALIVE_INTERVAL
+        };
+        if !tx_fetch_queue.is_empty() {
+            let remaining = last_tx_fetch.map_or(Duration::ZERO,
+                |t| TX_FETCH_INTERVAL.saturating_sub(t.elapsed()));
+            read_timeout = read_timeout.min(remaining);
+        }
+        let frame = match tokio::time::timeout(read_timeout, conn.next_frame()).await {
             Ok(Ok(Some(f))) => f,
             Ok(Ok(None)) => {
                 debug!(%peer_addr, "inbound peer closed connection");
@@ -384,6 +455,40 @@ where
                 server.note_served();
                 debug!(%peer_addr, served = ids.len(), remain, "served SyncBlockChain");
             }
+            MessageType::Inventory => {
+                // An inbound peer can submit transactions even if it only
+                // downloads blocks from us. A producer may have no other
+                // outbound connection to that peer.
+                if let (Some(mp), Ok(inv)) = (
+                    server.mempool.as_ref(),
+                    tron_proto::Inventory::decode(frame.payload.as_ref()),
+                ) {
+                    if inv.r#type == tron_proto::inventory::InventoryType::Trx as i32 {
+                        for raw in inv.ids {
+                            let Ok(id) = <[u8; 32]>::try_from(raw.as_slice()) else { continue; };
+                            if tx_fetch_queue.len() >= TX_FETCH_QUEUE_CAP { break; }
+                            if mp.get(&id).is_none() && tx_fetch_queued.insert(id) {
+                                tx_fetch_queue.push_back(id);
+                            }
+                        }
+                    }
+                }
+            }
+            MessageType::Trx => {
+                if let Some(mp)=server.mempool.as_ref() {
+                    let outcome=mp.submit(&frame.payload);
+                    debug!(?outcome, "inbound transaction admission");
+                }
+            }
+            MessageType::Trxs => {
+                if let (Some(mp),Ok(batch))=(server.mempool.as_ref(),
+                    tron_proto::Transactions::decode(frame.payload.as_ref())) {
+                    for tx in batch.transactions.into_iter().take(100) {
+                        let outcome=mp.submit(&tx.encode_to_vec());
+                        debug!(?outcome, "inbound transaction admission");
+                    }
+                }
+            }
             MessageType::FetchInvData => {
                 // The peer asks for the actual block (or tx) bodies. Served from
                 // the BlockStore / mempool, shared with the outbound path.
@@ -402,7 +507,7 @@ where
                 debug!(%peer_addr, "inbound peer disconnected");
                 return Ok(());
             }
-            // Inventory / Block / Trx announcements etc. from a peer we serve are
+            // Block announcements from a peer we serve are
             // not needed for the sync-from-us role — our outbound dialers handle
             // pulling new data. Ignore them (don't drop the peer).
             other => {
@@ -644,4 +749,63 @@ mod tests {
         drop(conn);
         let _ = server_task.await;
     }
+    #[cfg(feature="devnet-fast")]
+    #[tokio::test]
+    async fn private_peer_receives_new_head_after_initial_sync() {
+        let server=test_server();
+        let (client_io,server_io)=tokio::io::duplex(1<<16);
+        let srv=server.clone();
+        let task=tokio::spawn(async move {serve_inbound_peer(&srv,server_io,"live-private").await});
+        let mut conn=PeerConnection::new(client_io);
+        drive_client(&mut conn).await;
+        let next=block_id(HEAD+1);
+        BlockStore::new(server.blocks.clone()).put(&next,&mk_block(HEAD+1)).unwrap();
+        BlockIndexStore::new(server.block_index.as_ref().unwrap().clone()).put(&next).unwrap();
+        DynamicPropertiesStore::new(server.dyn_props.clone()).save_latest_block_header_number(HEAD+1);
+        let frame=tokio::time::timeout(Duration::from_secs(2),conn.next_frame()).await.unwrap().unwrap().unwrap();
+        assert_eq!(frame.ty,MessageType::Inventory);
+        let inv=tron_proto::Inventory::decode(frame.payload).unwrap();
+        assert_eq!(inv.r#type,tron_proto::inventory::InventoryType::Block as i32);
+        assert_eq!(inv.ids,vec![next.as_bytes().to_vec()]);
+        drop(conn);task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_transaction_fetches_batch_bursts_under_peer_rate_limit() {
+        let mut server = Arc::try_unwrap(test_server()).ok().unwrap();
+        server.mempool = Some(TxMempool::new_arc(Default::default()));
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(async move {
+            serve_inbound_peer(&server, server_io, "tx-burst-peer").await
+        });
+        let mut conn = PeerConnection::new(client_io);
+        drive_client(&mut conn).await;
+        let limiter = crate::p2p_rate_limiter::P2pRateLimiter::new();
+        limiter.register(MessageType::FetchInvData.as_byte(), 3.0);
+        let advertise = |ids| Frame {
+            ty: MessageType::Inventory,
+            payload: Bytes::from(tron_proto::Inventory {
+                r#type: tron_proto::inventory::InventoryType::Trx as i32, ids,
+            }.encode_to_vec()),
+        };
+        conn.send_frame(advertise(vec![vec![1; 32]])).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), conn.next_frame())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(first.ty, MessageType::FetchInvData);
+        assert!(limiter.try_acquire(first.ty.as_byte()));
+        assert_eq!(tron_proto::Inventory::decode(first.payload).unwrap().ids, vec![vec![1;32]]);
+        // Distinct advertisements arrive together after the first permit was
+        // consumed. The next request must wait, batch, and deduplicate them.
+        conn.send_frame(advertise(vec![vec![2;32]])).await.unwrap();
+        conn.send_frame(advertise(vec![vec![2;32], vec![3;32]])).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), conn.next_frame())
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(second.ty, MessageType::FetchInvData);
+        assert!(limiter.try_acquire(second.ty.as_byte()), "peer must accept the second fetch");
+        assert_eq!(tron_proto::Inventory::decode(second.payload).unwrap().ids,
+            vec![vec![2;32], vec![3;32]]);
+        drop(conn);
+        task.await.unwrap().unwrap();
+    }
+
 }

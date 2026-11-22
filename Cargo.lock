@@ -1446,6 +1446,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1592,6 +1601,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "critical-notify"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.6.3",
+ "tempfile",
 ]
 
 [[package]]
@@ -4515,6 +4535,7 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5440,6 +5461,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidesdb"
+version = "1.0.0"
+dependencies = [
+ "cc",
+ "cmake",
+ "libc",
+ "pkg-config",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5716,8 +5748,10 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
@@ -5891,12 +5925,19 @@ name = "tron-chainbase"
 version = "1.4.0"
 dependencies = [
  "flate2",
+ "hashbrown 0.15.5",
  "hex",
  "hex-literal",
+ "libc",
  "prost",
  "prost-types",
  "rocksdb",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 1.0.69",
+ "tidesdb",
  "tracing",
  "tron-crypto",
  "tron-proto",
@@ -6130,7 +6171,9 @@ version = "1.4.0"
 dependencies = [
  "axum",
  "bytes",
+ "critical-notify",
  "flate2",
+ "futures",
  "hex",
  "hex-literal",
  "libc",
@@ -6138,14 +6181,19 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.8.6",
+ "rocksdb",
  "serde",
  "serde_json",
  "serial_test",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
+ "tidesdb",
  "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber 0.3.23",

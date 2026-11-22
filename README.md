@@ -862,3 +862,21 @@ LGPL-3.0-or-later. See [`LICENSE`](LICENSE).
 This matches java-tron's license. If you redistribute a modified
 version, the LGPL's source-availability terms apply to the modified
 crates.
+
+---
+
+## Additions in this fork
+
+This fork continues from upstream v1.4.0. It adds, on top of the upstream node:
+
+| Area | Description |
+|---|---|
+| java-tron 4.8.2.4 | Proposal 102 and TVM storage-key protection; state fixes found by comparing mainnet state with java-tron snapshots store by store |
+| Indexer feed | Whole-block ACK over loopback REST, history pruning driven by ACK / reserve / timer, gRPC replay from a height followed by live events: [history pruning](docs/local/history-pruning.md) |
+| Trusted cluster | Authenticated state and event catch-up between nodes of one operator: [assisted sync](docs/assisted-sync.md) |
+| Execution policy | Optional stop on a block whose execution cannot be reproduced (`TRON_STOP_ON_EXECUTION_ERROR=1`): [fail-closed](docs/local/fail-closed.md) |
+| Private network | Producer / observer entry point for a private chain built from captured mainnet parameters: [private network](docs/PRIVATE-NETWORK.md) |
+| Wallet gateway | TronLink / TronWeb compatible gateway for a private network: [wallet gateway](docs/WALLET-GATEWAY.md) |
+| Storage | RocksDB or TidesDB provider selected per data directory: [KV providers](docs/local/kv-providers.md) |
+| Peers | Peers that advertise newer blocks are kept through short stalls: [peer retention](docs/local/peer-retention.md) |
+| Critical notifications | Conditions that need an operator are posted to a local webhook; any receiver implementing it can be plugged in: [critical-notify](crates/critical-notify/README.md). Without its environment variables reporting is disabled |

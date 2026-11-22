@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Storage layer: per-store key/value codecs over a pluggable KV backend. Mirrors java-tron's chainbase module."
 
+[features]
+private-network = []
+
 [dependencies]
 tron-crypto = { path = "../tron-crypto" }
 tron-proto = { path = "../tron-proto" }
@@ -15,9 +18,18 @@ prost.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 rocksdb.workspace = true
+serde.workspace = true
+tidesdb = { git = "https://github.com/tidesdb/tidesdb-rs", rev = "0b4eca75a3f96799a8cd0c63fd12e62662ffbaa4", default-features = false }
 flate2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
+tempfile = "3"
 hex-literal.workspace = true
 prost-types.workspace = true
+
+# Standalone KV memory estimator only; production dependencies stay unchanged.
+hashbrown = "=0.15.5"
+serde_json.workspace = true
+libc = "0.2"

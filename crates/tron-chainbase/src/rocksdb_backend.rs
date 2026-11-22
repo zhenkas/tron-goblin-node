@@ -412,6 +412,7 @@ impl RocksDbBackend {
     /// inspect a live java-tron data dir without risking a write.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
         let opts = safety_baseline();
+        reject_tidesdb(path.as_ref())?;
         let db = DB::open_for_read_only(&opts, path, /* error_if_log_file_exist */ false)?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -436,6 +437,7 @@ impl RocksDbBackend {
         let opts = safety_baseline();
         // `DB::open_as_secondary` requires both paths to share one `P`
         // type parameter; convert both to `&Path` first.
+        reject_tidesdb(primary_path.as_ref())?;
         let db = DB::open_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref())?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -453,6 +455,7 @@ impl RocksDbBackend {
     ) -> Result<Self, RocksDbError> {
         let mut opts = safety_baseline();
         opts.set_comparator(comparator_name, Box::new(compare_fn));
+        reject_tidesdb(primary_path.as_ref())?;
         let db = DB::open_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref())?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -480,6 +483,7 @@ impl RocksDbBackend {
     /// Open with a custom [`Options`] block. Use for byte-for-byte parity
     /// with a specific java-tron `dbSettings`.
     pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<Self, RocksDbError> {
+        reject_tidesdb(path.as_ref())?;
         let db = DB::open(&opts, path)?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -622,15 +626,29 @@ impl RocksDbBackend {
             f(k, v)?;
             iter.next();
         }
-        iter.status().map_err(|e| Box::new(RocksDbError::from(e)) as _)
+        iter.status()
+            .map_err(|e| Box::new(RocksDbError::from(e)) as _)
     }
 }
 
 impl KvBackend for RocksDbBackend {
+    fn checkpoint_to(&self, destination: &std::path::Path) -> Result<(), crate::KvError> {
+        RocksDbBackend::checkpoint(self, destination)
+            .map_err(|e| crate::KvError::Backend(e.to_string()))
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         // Propagate RocksDB errors as `KvError::Backend` — no more
         // silent error-as-None. Real "key not found" is `Ok(None)`.
         self.db.get(key).map_err(Into::into)
+    }
+
+    fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        self.db
+            .multi_get(keys.iter().copied())
+            .into_iter()
+            .map(|result| result.map_err(KvError::from))
+            .collect()
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
@@ -708,6 +726,11 @@ impl KvBackend for RocksDbBackend {
         self.db.write_opt(batch, &wopts).map_err(Into::into)
     }
 
+    fn checkpoint(&self) -> Result<(), KvError> {
+        self.db.flush().map_err(KvError::from)?;
+        self.db.flush_wal(true).map_err(KvError::from)
+    }
+
     fn sync_wal(&self) -> Result<(), KvError> {
         // Flush RocksDB's WAL writer to the OS and fsync it, making every
         // prior non-sync `write_batch` durable. This is the per-store half
@@ -730,8 +753,17 @@ fn build_batch(ops: &[WriteOp]) -> WriteBatch {
     batch
 }
 
+fn reject_tidesdb(path: &Path) -> Result<(), RocksDbError> {
+    if path.join("MANIFEST").exists() {
+        return Err(RocksDbError::EngineMismatch(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RocksDbError {
+    #[error("TidesDB directory {0:?} cannot be opened as RocksDB")]
+    EngineMismatch(std::path::PathBuf),
     #[error("rocksdb: {0}")]
     Inner(#[from] rocksdb::Error),
 }

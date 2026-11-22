@@ -481,3 +481,149 @@ fn apply_account_creating_block_then_rollback_removes_the_account() {
     );
     let _ = Account::default(); // silence import.
 }
+
+#[test]
+fn strict_result_mismatch_does_not_commit_state_undo_or_checkpoint() {
+    let state = fresh_state();
+    let undo = BlockUndoStore::new(mem());
+    let ws = WitnessStore::new(state.witnesses.clone());
+    let witness_addr = addr(0xaa);
+    ws.put(&Address::from_raw(witness_addr), &Witness {
+        address: witness_addr.to_vec(), ..Default::default()
+    }).unwrap();
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    dp.save_latest_block_header_number(0);
+    let before_accounts = state.accounts.scan_all().unwrap();
+    let before_properties = state.dyn_props.scan_all().unwrap();
+    let before_witnesses = state.witnesses.scan_all().unwrap();
+    // An absent sender cannot execute this transfer, while the canonical ret
+    // claims success. The strict guard must reject the entire block session.
+    let mut block = transfer_block(1, [0u8; 32], addr(1), addr(2), 1);
+    block.transactions[0].ret.push(tron_proto::transaction::Result {
+        ret: 0, ..Default::default()
+    });
+    block.block_header.as_mut().unwrap().raw_data.as_mut().unwrap().tx_trie_root =
+        tron_types::calc_tx_trie_root(&block.transactions).unwrap().to_vec();
+    let cfg = ExecConfig { verify_contract_ret: true, ..ExecConfig::unsigned() };
+    let dir = std::env::temp_dir().join(format!("tron-strict-rollback-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let checkpoint = tron_chainbase::CheckPointV2::new(&dir);
+    let error = tron_executor::execute_block_with_undo_checkpoint_and_config(
+        &state, &block, None, &undo, &checkpoint, &cfg, None
+    ).unwrap_err();
+    assert!(matches!(error, BlockExecError::ContractRetMismatch { .. }), "{error:?}");
+    assert_eq!(state.accounts.scan_all().unwrap(), before_accounts);
+    assert_eq!(state.dyn_props.scan_all().unwrap(), before_properties);
+    assert_eq!(state.witnesses.scan_all().unwrap(), before_witnesses);
+    assert!(undo.get(1).unwrap().is_none());
+    assert!(checkpoint.list().unwrap().is_empty(), "rejected block must not leave a recoverable manifest");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A power loss left the durable state two blocks ahead of the block store:
+/// the repair rolls back to the last block that is both stored and indexed.
+#[test]
+fn crash_repair_rolls_state_back_to_last_stored_block() {
+    use tron_chainbase::{BlockIndexStore, BlockStore};
+    let mut state = fresh_state();
+    state.block_index = Some(mem());
+    let blocks = mem();
+    let undo = BlockUndoStore::new(mem());
+    let witness_addr = addr(0xaa);
+    WitnessStore::new(state.witnesses.clone())
+        .put(
+            &Address::from_raw(witness_addr),
+            &Witness { address: witness_addr.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+
+    let b1 = empty_block(1, [0u8; 32]);
+    apply_unsigned_with_undo(&state, &b1, None, &undo).unwrap();
+    let id1 = tron_types::block_id_from_block(&b1).unwrap();
+    BlockStore::new(blocks.clone()).put(&id1, &b1).unwrap();
+    BlockIndexStore::new(state.block_index.clone().unwrap()).put(&id1).unwrap();
+    // Consistent head: nothing to repair.
+    assert_eq!(tron_executor::repair_head_ahead_of_blocks(&state, &blocks, &undo).unwrap(), None);
+
+    let b2 = empty_block(2, *id1.as_bytes());
+    apply_unsigned_with_undo(&state, &b2, None, &undo).unwrap();
+    let id2 = tron_types::block_id_from_block(&b2).unwrap();
+    // Block 2 kept its bytes but lost its index entry; block 3 lost both.
+    BlockStore::new(blocks.clone()).put(&id2, &b2).unwrap();
+    let b3 = empty_block(3, *id2.as_bytes());
+    apply_unsigned_with_undo(&state, &b3, None, &undo).unwrap();
+
+    assert_eq!(
+        tron_executor::repair_head_ahead_of_blocks(&state, &blocks, &undo).unwrap(),
+        Some((3, 1))
+    );
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    assert_eq!(dp.latest_block_header_number(), Some(1));
+    assert_eq!(dp.latest_block_header_hash().unwrap(), Some(*id1.as_bytes()));
+    assert_eq!(tron_executor::repair_head_ahead_of_blocks(&state, &blocks, &undo).unwrap(), None);
+    // The gap re-executes on top of the repaired head.
+    apply_unsigned_with_undo(&state, &b2, None, &undo).unwrap();
+    assert_eq!(dp.latest_block_header_number(), Some(2));
+}
+
+/// Without full undo coverage the repair refuses and leaves the state alone.
+#[test]
+fn crash_repair_refuses_without_undo_coverage() {
+    use tron_chainbase::{BlockIndexStore, BlockStore};
+    let mut state = fresh_state();
+    state.block_index = Some(mem());
+    let blocks = mem();
+    let undo = BlockUndoStore::new(mem());
+    let b1 = empty_block(1, [0u8; 32]);
+    apply_unsigned_with_undo(&state, &b1, None, &undo).unwrap();
+    let id1 = tron_types::block_id_from_block(&b1).unwrap();
+    BlockStore::new(blocks.clone()).put(&id1, &b1).unwrap();
+    BlockIndexStore::new(state.block_index.clone().unwrap()).put(&id1).unwrap();
+    let b2 = empty_block(2, *id1.as_bytes());
+    apply_unsigned_with_undo(&state, &b2, None, &undo).unwrap();
+    let id2 = tron_types::block_id_from_block(&b2).unwrap();
+    let b3 = empty_block(3, *id2.as_bytes());
+    apply_unsigned_with_undo(&state, &b3, None, &undo).unwrap();
+    undo.delete(2).unwrap();
+
+    assert!(matches!(
+        tron_executor::repair_head_ahead_of_blocks(&state, &blocks, &undo),
+        Err(tron_executor::RollbackError::RepairRefused(_))
+    ));
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    assert_eq!(dp.latest_block_header_number(), Some(3));
+}
+
+/// The head kept its block but a block below it was lost: roll back below the hole.
+#[test]
+fn crash_repair_rolls_back_below_a_hole_under_a_stored_head() {
+    use tron_chainbase::{BlockIndexStore, BlockStore};
+    let mut state = fresh_state();
+    state.block_index = Some(mem());
+    let blocks = mem();
+    let undo = BlockUndoStore::new(mem());
+    let index = BlockIndexStore::new(state.block_index.clone().unwrap());
+    let mut parent = [0u8; 32];
+    let mut ids = Vec::new();
+    for num in 1..=4 {
+        let block = empty_block(num, parent);
+        apply_unsigned_with_undo(&state, &block, None, &undo).unwrap();
+        let id = tron_types::block_id_from_block(&block).unwrap();
+        parent = *id.as_bytes();
+        if num != 3 {
+            BlockStore::new(blocks.clone()).put(&id, &block).unwrap();
+            index.put(&id).unwrap();
+        }
+        ids.push(id);
+    }
+    assert_eq!(
+        tron_executor::repair_head_ahead_of_blocks(&state, &blocks, &undo).unwrap(),
+        Some((4, 2))
+    );
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    assert_eq!(dp.latest_block_header_hash().unwrap(), Some(*ids[1].as_bytes()));
+    // The surviving block 4 is ahead of the head now and must not look known.
+    assert!(index.get(4).is_err());
+    assert!(blocks.get(ids[3].as_bytes()).unwrap().is_none());
+    assert_eq!(index.get(2).unwrap(), ids[1]);
+}

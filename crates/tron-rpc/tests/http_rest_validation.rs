@@ -506,26 +506,20 @@ async fn getbandwidthprices_returns_prices_string() {
 }
 
 // ============================================================
-// /walletsolidity alias — same handler as /wallet
+// /walletsolidity must refuse unavailable confirmed account state
 // ============================================================
 
 #[tokio::test]
-async fn walletsolidity_routes_to_same_handler_as_wallet() {
+async fn walletsolidity_refuses_live_account_without_archive() {
     let addr = spawn_server().await;
     let alice_b58 = tron_crypto::base58check::encode_address(&Address::from_raw(ALICE));
-    let resp_a = http_post(
-        addr,
-        "/wallet/getaccount",
-        json!({ "address": alice_b58, "visible": true }),
-    )
-    .await;
-    let resp_b = http_post(
-        addr,
-        "/walletsolidity/getaccount",
-        json!({ "address": alice_b58, "visible": true }),
-    )
-    .await;
-    assert_eq!(resp_a["balance"], resp_b["balance"]);
+    let latest = http_post(addr, "/wallet/getaccount",
+        json!({ "address": alice_b58, "visible": true })).await;
+    assert_eq!(latest["balance"],100_000_000_000i64);
+    let confirmed = http_post(addr, "/walletsolidity/getaccount",
+        json!({ "address": alice_b58, "visible": true })).await;
+    assert!(confirmed["Error"].as_str().unwrap().contains("capture_state_deltas"));
+    assert!(confirmed.get("balance").is_none());
 }
 
 // ============================================================

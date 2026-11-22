@@ -1,0 +1,664 @@
+/**
+ *
+ * Copyright (c) 2022-2026 TidesDB Corp. and/or its affiliates.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+#include "txn.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "base/encoding/serialization.h" /* tdb_encode_be64 for the abort record */
+#include "base/log.h"
+#include "range_tombstone/range_tombstone.h" /* the successor the prefix form of a range delete is expressed with */
+#include "txn_internal.h"
+
+/* initial savepoint-array capacity, grown by doubling */
+#define TDB_TXN_INITIAL_SAVEPOINT_CAP 4
+
+/* copy a nul-terminated name into a fresh allocation */
+static char *dup_name(const char *s)
+{
+    const size_t n = strlen(s) + 1;
+    char *c = malloc(n);
+    if (c) memcpy(c, s, n);
+    return c;
+}
+
+tdb_txn_t *tdb_txn_begin(tidesdb_mvcc_t *clock, tidesdb_isolation_level_t isolation,
+                         const _Atomic(int64_t) *now, int64_t timeout_seconds,
+                         tidesdb_txn_registry_t *registry)
+{
+    if (!clock || isolation < TDB_ISOLATION_READ_UNCOMMITTED ||
+        isolation > TDB_ISOLATION_SERIALIZABLE)
+        return NULL;
+
+    tdb_txn_t *txn = calloc(1, sizeof(*txn));
+    if (!txn) return NULL;
+    txn->writeset = tidesdb_writeset_create();
+    if (!txn->writeset)
+    {
+        free(txn);
+        return NULL;
+    }
+
+    txn->clock = clock;
+    txn->isolation = isolation;
+    txn->state = TDB_TXN_ACTIVE;
+    txn->registry_shard = -1;
+    txn->registry_index = -1;
+    atomic_init(&txn->read_ceiling, UINT64_MAX);
+    txn->read_holds = 0;
+
+    /* repeatable-read and stronger record their reads so commit can validate them; lower levels
+     * never conflict on reads, so they carry no read set */
+    if (isolation >= TDB_ISOLATION_REPEATABLE_READ)
+    {
+        txn->readset = tidesdb_readset_create();
+        if (!txn->readset)
+        {
+            tidesdb_writeset_free(txn->writeset);
+            free(txn);
+            return NULL;
+        }
+    }
+
+    /* set the expiry deadline from the current cached time plus the timeout; 0 means unbounded */
+    txn->now = now;
+    if (now && timeout_seconds > 0)
+        txn->deadline = atomic_load_explicit(now, memory_order_relaxed) + timeout_seconds;
+
+    /* draw the snapshot. read-uncommitted sees everything, read-committed refreshes per read (0
+     * here), and repeatable-read and stronger freeze the watermark at begin -- the highest sequence
+     * below which everything is decided, so nothing in flight can land inside the snapshot later */
+    if (isolation == TDB_ISOLATION_READ_UNCOMMITTED)
+        atomic_store_explicit(&txn->snapshot_seq, UINT64_MAX, memory_order_relaxed);
+    else if (isolation == TDB_ISOLATION_READ_COMMITTED)
+        atomic_store_explicit(&txn->snapshot_seq, 0, memory_order_relaxed);
+    else
+        atomic_store_explicit(&txn->snapshot_seq, tidesdb_mvcc_visible_seq(clock),
+                              memory_order_relaxed);
+
+    /* join the live-transaction registry, done last so the snapshot is already set before a peer's
+     * gc-floor scan can observe this txn. repeatable-read and stronger hold the floor at their
+     * frozen snapshot for their whole life; read-committed holds it at the ceiling of a read only
+     * while that read is in flight, and joins so the floor scan can see the ceiling at all.
+     * read-uncommitted resolves to the newest version, which no collection drops, so it stays out.
+     * a failed join is not fatal -- the txn still runs correctly, only the gc floor loses it */
+    if (registry && isolation >= TDB_ISOLATION_READ_COMMITTED &&
+        tidesdb_txn_registry_add(registry, txn) == TDB_SUCCESS)
+        txn->registry = registry;
+
+    return txn;
+}
+
+void tdb_txn_set_registry_slot(tdb_txn_t *txn, int shard, int index)
+{
+    if (!txn) return;
+    txn->registry_shard = shard;
+    txn->registry_index = index;
+}
+
+int tdb_txn_registry_shard(const tdb_txn_t *txn)
+{
+    return txn ? txn->registry_shard : -1;
+}
+
+int tdb_txn_registry_index(const tdb_txn_t *txn)
+{
+    return txn ? txn->registry_index : -1;
+}
+
+/* leave the live-transaction registry once, when the txn reaches a terminal state or is freed, so
+ * the registry never holds a pointer to a finished or freed transaction */
+void txn_leave_registry(tdb_txn_t *txn)
+{
+    if (txn->registry)
+    {
+        tidesdb_txn_registry_remove(txn->registry, txn);
+        txn->registry = NULL;
+    }
+}
+
+void tdb_txn_free(tdb_txn_t *txn)
+{
+    if (!txn) return;
+    txn_leave_registry(txn); /* never leave a freed pointer in the registry */
+
+    /* an in-doubt transaction freed without a decision is abandoned -- nothing in this process can
+     * resolve it any more, but its record is durable and a later open may still commit it, so its
+     * keys and intervals stay held: the clock takes over its claims. a claim chained from the set
+     * cannot outlive the memory that holds it, which is why they are copied rather than left */
+    if (txn->state == TDB_TXN_PREPARED && tidesdb_mvcc_holds(&txn->commit))
+    {
+        if (!tidesdb_mvcc_orphan_claims(txn->clock, &txn->commit))
+            TDB_DEBUG_LOG(TDB_LOG_WARN, "abandoned prepare seq %llu could not keep its keys held",
+                          (unsigned long long)txn->commit_seq);
+        free(txn->claims);
+        txn->claims = NULL;
+    }
+    else if (tidesdb_mvcc_holds(&txn->commit))
+        txn_release_claims(txn);
+    free(txn->scans); /* the orphan copied them, and a release has already set this NULL */
+
+    free(txn->prepared_entries); /* an abandoned in-doubt txn still owns these */
+    free(txn->xid);
+    tidesdb_writeset_free(txn->writeset);
+    tidesdb_readset_free(txn->readset);
+    for (int i = 0; i < txn->num_sp; i++) free(txn->sp_names[i]);
+    free(txn->sp_names);
+    free(txn->sp_counts);
+    free(txn);
+}
+
+int tdb_txn_set_timeout(tdb_txn_t *txn, int64_t seconds)
+{
+    if (!txn || txn->state != TDB_TXN_ACTIVE) return TDB_ERR_INVALID_ARGS;
+    /* the deadline is an absolute second on the clock the transaction was given, so without one
+     * there is nothing to age against and a timeout would silently never fire */
+    if (!txn->now) return TDB_ERR_INVALID_DB;
+
+    txn->deadline =
+        seconds > 0 ? atomic_load_explicit(txn->now, memory_order_relaxed) + seconds : 0;
+    return TDB_SUCCESS;
+}
+
+int tdb_txn_expired(const tdb_txn_t *txn)
+{
+    if (!txn || !txn->now || txn->deadline == 0) return 0;
+    return atomic_load_explicit(txn->now, memory_order_relaxed) > txn->deadline;
+}
+
+void tdb_txn_request_abort(tdb_txn_t *txn)
+{
+    if (!txn) return;
+    atomic_store_explicit(&txn->abort_requested, 1, memory_order_release);
+}
+
+/* require an active txn for a mutating operation, and resolve lazily on the way through what other
+ * parties have decided about it -- an abort another thread asked for, or a deadline that has since
+ * passed -- so an abandoned or overruled txn settles the moment it is next touched. returns
+ * TDB_SUCCESS, TDB_ERR_TXN_ABORTED once another thread has asked for one, TDB_ERR_TXN_EXPIRED past
+ * a deadline, or TDB_ERR_INVALID_ARGS for a txn that is simply finished */
+int txn_require_active(tdb_txn_t *txn)
+{
+    if (!txn) return TDB_ERR_INVALID_ARGS;
+
+    /* an abort asked for by another thread, taken effect here rather than where it was asked for.
+     * the requester only stores a flag, so this thread is still the only one that moves the state
+     * and the transaction stays owned by one thread throughout. a request landing just after this
+     * read lets the current operation finish and stops the next one, which is the same window the
+     * deadline below has and is for the caller above to sequence if it needs more.
+     *
+     * it is answered ahead of the resolved-transaction check, and goes on being answered, because
+     * the caller that asked for it has to hear the same thing from every operation afterwards. the
+     * first one aborts the transaction, and a plain resolved-transaction reply from the ones after
+     * would lose exactly the fact the caller needs -- a victim whose last read happened to notice
+     * first would then have its commit report nothing more than a finished transaction, and the
+     * ruling that ended it would be invisible at the point it most needs reporting */
+    if (atomic_load_explicit(&txn->abort_requested, memory_order_acquire) &&
+        txn->state != TDB_TXN_COMMITTED)
+    {
+        if (txn->state == TDB_TXN_ACTIVE)
+        {
+            txn->state = TDB_TXN_ABORTED;
+            txn_leave_registry(txn);
+        }
+        return TDB_ERR_TXN_ABORTED;
+    }
+
+    if (txn->state != TDB_TXN_ACTIVE) return TDB_ERR_INVALID_ARGS;
+
+    if (tdb_txn_expired(txn))
+    {
+        txn->state = TDB_TXN_ABORTED;
+        txn_leave_registry(txn);
+        return TDB_ERR_TXN_EXPIRED;
+    }
+    return TDB_SUCCESS;
+}
+
+/* buffer one write op after confirming the txn may still take writes */
+static int txn_buffer(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                      const uint8_t *value, size_t value_size, int64_t ttl, uint8_t flags)
+{
+    const int rc = txn_require_active(txn);
+    if (rc != TDB_SUCCESS) return rc;
+    return tidesdb_writeset_put(txn->writeset, cf_index, key, key_size, value, value_size, ttl,
+                                flags);
+}
+
+int tdb_txn_put(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                const uint8_t *value, size_t value_size, int64_t ttl)
+{
+    return txn_buffer(txn, cf_index, key, key_size, value, value_size, ttl, 0);
+}
+
+int tdb_txn_delete(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size)
+{
+    return txn_buffer(txn, cf_index, key, key_size, NULL, 0, -1, TDB_WAL_ENTRY_TOMBSTONE);
+}
+
+int tdb_txn_single_delete(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size)
+{
+    return txn_buffer(txn, cf_index, key, key_size, NULL, 0, -1,
+                      TDB_WAL_ENTRY_TOMBSTONE | TDB_WAL_ENTRY_SINGLE_DELETE);
+}
+
+int tdb_txn_delete_range(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                         const uint8_t *hi, size_t hi_size)
+{
+    if (hi_size > 0 && !hi) return TDB_ERR_INVALID_ARGS;
+    /* keys are never empty, so an empty lower bound names no key the caller could have meant; a
+     * bound below every key there can be is spelled as a single zero byte */
+    if (!lo || lo_size == 0) return TDB_ERR_INVALID_ARGS;
+    /* the interval reservation table holds a bound in a fixed slot, and it is what stands between
+     * this delete and a concurrent write inside it. refused here rather than at the commit, where
+     * a slot too small to hold the bound has nothing to report but a conflict that would never
+     * clear however many times the caller retried */
+    if (lo_size > TDB_MVCC_MAX_RANGE_BYTES || hi_size > TDB_MVCC_MAX_RANGE_BYTES)
+        return TDB_ERR_INVALID_ARGS;
+
+    /* an interval ending at or before it starts covers no key and fragments into nothing, which the
+     * tombstone set refuses. it is caught here for the same reason an oversized bound is: the apply
+     * that would meet it runs after the batch is durable, where every failure is taken for a
+     * transient one and retried, so a bound the caller can still fix would instead burn the retries
+     * and cancel the whole batch with an error naming the disk */
+    if (!range_tombstone_interval_valid(lo, lo_size, hi, hi_size)) return TDB_ERR_INVALID_ARGS;
+
+    /* the upper bound rides in the value. an interval delete names no value of its own, so the
+     * field is free, and using it keeps the record exactly the shape a delete already had */
+    return txn_buffer(txn, cf_index, lo, lo_size, hi, hi_size, -1,
+                      TDB_WAL_ENTRY_TOMBSTONE | TDB_WAL_ENTRY_RANGE_DELETE);
+}
+
+int tdb_txn_delete_prefix(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *prefix,
+                          size_t prefix_size)
+{
+    if (!prefix || prefix_size == 0) return TDB_ERR_INVALID_ARGS;
+
+    /* a prefix is the interval from it to its successor, so this is the general call with the one
+     * bound a prefix implies. a prefix of nothing but max bytes has no successor to name and runs
+     * to the end of the family instead */
+    uint8_t *hi = NULL;
+    size_t hi_size = 0;
+    const int rc = range_tombstone_prefix_successor(prefix, prefix_size, &hi, &hi_size);
+    if (rc != TDB_SUCCESS) return rc;
+
+    const int buffered = tdb_txn_delete_range(txn, cf_index, prefix, prefix_size, hi, hi_size);
+    free(hi);
+    return buffered;
+}
+
+/* the snapshot a read filters at -- read-uncommitted sees everything, read-committed reads the
+ * watermark afresh per read, and repeatable-read and stronger use the snapshot frozen at begin */
+static uint64_t txn_read_snapshot(const tdb_txn_t *txn)
+{
+    if (txn->isolation == TDB_ISOLATION_READ_UNCOMMITTED) return UINT64_MAX;
+    if (txn->isolation == TDB_ISOLATION_READ_COMMITTED) return tidesdb_mvcc_visible_seq(txn->clock);
+    return atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
+}
+
+/* how many times a read committed read takes its ceiling again because a collection published a
+ * floor above it meanwhile. each retake reads the watermark afresh, which stands at or above every
+ * floor published before it, so one settles it unless another collection lands in between */
+#define TDB_TXN_READ_HOLD_MAX_RETAKES 16
+
+int tdb_txn_read_hold(tdb_txn_t *txn, uint64_t *ceiling)
+{
+    if (!txn || !ceiling) return -1;
+    if (txn->isolation != TDB_ISOLATION_READ_COMMITTED || !txn->registry)
+    {
+        *ceiling = txn_read_snapshot(txn);
+        return 0;
+    }
+    /* an outer hold, an open iterator, already publishes a ceiling at or below this read's, and
+     * lower protects more; the read itself still filters at the watermark of its own moment */
+    if (txn->read_holds > 0)
+    {
+        txn->read_holds++;
+        *ceiling = txn_read_snapshot(txn);
+        return 0;
+    }
+    for (int retake = 0; retake < TDB_TXN_READ_HOLD_MAX_RETAKES; retake++)
+    {
+        const uint64_t c = tidesdb_mvcc_visible_seq(txn->clock);
+        atomic_store_explicit(&txn->read_ceiling, c, memory_order_release);
+        /* the store above and the load below are one half of a pair with the collection's -- it
+         * publishes its high-water mark, fences, and scans the ceilings. with both sides fenced,
+         * either the scan sees this ceiling and the floor stays at or below it, or this load sees
+         * a mark at or above the floor it missed and the ceiling is taken again above it */
+        atomic_thread_fence(memory_order_seq_cst);
+        if (tidesdb_txn_registry_floor_high_water(txn->registry) <= c)
+        {
+            txn->read_holds = 1;
+            *ceiling = c;
+            return 0;
+        }
+    }
+    atomic_store_explicit(&txn->read_ceiling, UINT64_MAX, memory_order_release);
+    return -1;
+}
+
+void tdb_txn_read_release(tdb_txn_t *txn)
+{
+    if (!txn || txn->isolation != TDB_ISOLATION_READ_COMMITTED || !txn->registry) return;
+    if (txn->read_holds > 0 && --txn->read_holds == 0)
+        atomic_store_explicit(&txn->read_ceiling, UINT64_MAX, memory_order_release);
+}
+
+uint64_t tdb_txn_snapshot_floor(const tdb_txn_t *txn)
+{
+    if (!txn || txn->isolation < TDB_ISOLATION_REPEATABLE_READ) return UINT64_MAX;
+    return atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire);
+}
+
+uint64_t tdb_txn_read_floor(const tdb_txn_t *txn)
+{
+    if (!txn) return UINT64_MAX;
+    if (txn->isolation == TDB_ISOLATION_READ_COMMITTED)
+        return atomic_load_explicit(&txn->read_ceiling, memory_order_acquire);
+    return tdb_txn_snapshot_floor(txn);
+}
+
+/* the store half of a get, at a ceiling the caller holds -- the external source stack at that
+ * snapshot, absorbing a transient busy internally, with the read recorded for validation when the
+ * level keeps a read set */
+static int txn_get_store(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                         const tidesdb_source_t *sources, int num_sources, const uint64_t snapshot,
+                         uint8_t **value, size_t *value_size, int64_t *ttl, int record_read)
+{
+    for (int attempt = 0; attempt < TDB_TXN_BUSY_RETRY_MAX; attempt++)
+    {
+        tidesdb_source_version_t v;
+        const tidesdb_source_result_t r =
+            tidesdb_source_stack_get(sources, num_sources, cf_index, key, key_size, snapshot, &v);
+
+        /* record the read for conflict validation. an absent read is recorded at the snapshot so a
+         * later insert is caught; a hit is recorded at the version's seq. only when tracking and
+         * only for the levels that keep a read set. a failed record cannot guarantee isolation */
+        const int track = record_read && txn->readset;
+
+        if (r == TDB_SOURCE_NOT_FOUND)
+        {
+            if (track && tidesdb_readset_record(txn->readset, cf_index, key, key_size, snapshot) !=
+                             TDB_SUCCESS)
+                return TDB_ERR_MEMORY;
+            return TDB_ERR_NOT_FOUND;
+        }
+        if (r == TDB_SOURCE_FOUND)
+        {
+            if (track &&
+                tidesdb_readset_record(txn->readset, cf_index, key, key_size, v.seq) != TDB_SUCCESS)
+            {
+                free(v.value);
+                return TDB_ERR_MEMORY;
+            }
+            if (v.deleted)
+            {
+                free(v.value);
+                return TDB_ERR_NOT_FOUND; /* a visible tombstone reads as not-found */
+            }
+            if (value)
+            {
+                *value = v.value; /* ownership transfers to the caller */
+                *value_size = v.value_size;
+            }
+            else
+                free(v.value);
+            if (ttl) *ttl = v.ttl > 0 ? v.ttl : -1;
+            return TDB_SUCCESS;
+        }
+        /* TDB_SOURCE_BUSY -- back off and retry; never surface it */
+        if (attempt < TDB_TXN_BUSY_SPIN_THRESHOLD)
+            cpu_pause();
+        else
+            cpu_yield();
+    }
+    return TDB_ERR_IO; /* transient contention never cleared -- internal failure, not a public busy
+                        */
+}
+
+static int txn_get_impl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
+                        size_t *value_size, int64_t *ttl, int record_read)
+{
+    if (!key || (!ttl && (!value || !value_size))) return TDB_ERR_INVALID_ARGS;
+    const int active = txn_require_active(txn);
+    if (active != TDB_SUCCESS) return active;
+
+    /* read-your-own-writes, so the txn's own buffered write wins and a buffered delete reads as
+     * not-found */
+    tidesdb_writeset_op_t own;
+    if (tidesdb_writeset_lookup(txn->writeset, cf_index, key, key_size, &own))
+    {
+        if (own.flags & TDB_WAL_ENTRY_TOMBSTONE) return TDB_ERR_NOT_FOUND;
+        if (ttl && own.ttl > 0)
+        {
+            const int64_t now = txn->now ? atomic_load_explicit(txn->now, memory_order_relaxed)
+                                         : (int64_t)time(NULL);
+            if (own.ttl <= now) return TDB_ERR_NOT_FOUND;
+        }
+        if (value)
+        {
+            uint8_t *copy = NULL;
+            if (own.value_size)
+            {
+                copy = malloc(own.value_size);
+                if (!copy) return TDB_ERR_MEMORY;
+                memcpy(copy, own.value, own.value_size);
+            }
+            *value = copy;
+            *value_size = own.value_size;
+        }
+        if (ttl) *ttl = own.ttl > 0 ? own.ttl : -1;
+        return TDB_SUCCESS;
+    }
+
+    /* the ceiling is held against the reclamation floor for as long as the store is being read */
+    uint64_t snapshot = 0;
+    if (tdb_txn_read_hold(txn, &snapshot) != 0) return TDB_ERR_IO;
+    const int rc = txn_get_store(txn, cf_index, key, key_size, sources, num_sources, snapshot,
+                                 value, value_size, ttl, record_read);
+    tdb_txn_read_release(txn);
+    return rc;
+}
+
+int tdb_txn_get(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                const tidesdb_source_t *sources, int num_sources, uint8_t **value,
+                size_t *value_size)
+{
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, value, value_size, NULL,
+                        1);
+}
+
+int tdb_txn_get_ttl(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                    const tidesdb_source_t *sources, int num_sources, int64_t *ttl)
+{
+    if (!ttl || key_size == 0) return TDB_ERR_INVALID_ARGS;
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, NULL, NULL, ttl, 1);
+}
+
+int tdb_txn_record_scan(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *lo, size_t lo_size,
+                        const uint8_t *hi, size_t hi_size)
+{
+    if (!txn || !lo || lo_size == 0) return TDB_ERR_INVALID_ARGS;
+    /* only the levels that validate their reads keep a footprint; snapshot isolation keeps a read
+     * set for the version its writes are validated against and validates no read, so a scan of its
+     * is not recorded. a transaction no longer active commits nothing, so nothing is recorded for
+     * it
+     */
+    const int validates = txn->isolation == TDB_ISOLATION_REPEATABLE_READ ||
+                          txn->isolation == TDB_ISOLATION_SERIALIZABLE;
+    if (!validates || !txn->readset || txn->state != TDB_TXN_ACTIVE) return TDB_SUCCESS;
+    return tidesdb_readset_record_range(
+        txn->readset, cf_index, lo, lo_size, hi, hi_size,
+        atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire));
+}
+
+int tdb_txn_get_notrack(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                        const tidesdb_source_t *sources, int num_sources, uint8_t **value,
+                        size_t *value_size)
+{
+    return txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, value, value_size, NULL,
+                        0);
+}
+
+int tdb_txn_contains(tdb_txn_t *txn, uint32_t cf_index, const uint8_t *key, size_t key_size,
+                     const tidesdb_source_t *sources, int num_sources)
+{
+    uint8_t *value = NULL;
+    size_t value_size = 0;
+    const int rc = txn_get_impl(txn, cf_index, key, key_size, sources, num_sources, &value,
+                                &value_size, NULL, 0);
+    if (rc == TDB_SUCCESS) free(value);
+    return rc;
+}
+
+uint64_t tdb_txn_commit_seq(const tdb_txn_t *txn)
+{
+    return txn ? txn->commit_seq : 0;
+}
+
+int tdb_txn_rollback(tdb_txn_t *txn)
+{
+    /* a prepared txn is durable and must be resolved through rollback-prepared, not discarded here
+     */
+    if (!txn || txn->state == TDB_TXN_COMMITTED || txn->state == TDB_TXN_PREPARED)
+        return TDB_ERR_INVALID_ARGS;
+    txn->state = TDB_TXN_ABORTED;
+    txn_leave_registry(txn);
+    return TDB_SUCCESS;
+}
+
+/* index of a savepoint by name, or -1 */
+static int txn_savepoint_index(const tdb_txn_t *txn, const char *name)
+{
+    for (int i = 0; i < txn->num_sp; i++)
+        if (strcmp(txn->sp_names[i], name) == 0) return i;
+    return -1;
+}
+
+int tdb_txn_savepoint(tdb_txn_t *txn, const char *name)
+{
+    if (!name) return TDB_ERR_INVALID_ARGS;
+    const int active = txn_require_active(txn);
+    if (active != TDB_SUCCESS) return active;
+
+    const int count = tidesdb_writeset_count(txn->writeset);
+
+    /* an existing name re-marks its position at the current write-set count */
+    const int existing = txn_savepoint_index(txn, name);
+    if (existing >= 0)
+    {
+        txn->sp_counts[existing] = count;
+        return TDB_SUCCESS;
+    }
+
+    if (txn->num_sp == txn->sp_cap)
+    {
+        const int new_cap = txn->sp_cap ? txn->sp_cap * 2 : TDB_TXN_INITIAL_SAVEPOINT_CAP;
+        char **grown_names = realloc(txn->sp_names, (size_t)new_cap * sizeof(*grown_names));
+        if (!grown_names) return TDB_ERR_MEMORY;
+        txn->sp_names = grown_names;
+        int *grown_counts = realloc(txn->sp_counts, (size_t)new_cap * sizeof(*grown_counts));
+        if (!grown_counts) return TDB_ERR_MEMORY;
+        txn->sp_counts = grown_counts;
+        txn->sp_cap = new_cap;
+    }
+
+    char *copy = dup_name(name);
+    if (!copy) return TDB_ERR_MEMORY;
+    txn->sp_names[txn->num_sp] = copy;
+    txn->sp_counts[txn->num_sp] = count;
+    txn->num_sp++;
+    return TDB_SUCCESS;
+}
+
+int tdb_txn_rollback_to_savepoint(tdb_txn_t *txn, const char *name)
+{
+    if (!name) return TDB_ERR_INVALID_ARGS;
+    const int active = txn_require_active(txn);
+    if (active != TDB_SUCCESS) return active;
+
+    const int idx = txn_savepoint_index(txn, name);
+    if (idx < 0) return TDB_ERR_NOT_FOUND;
+
+    /* a set that could not be rebuilt whole after the truncation is not one this transaction may go
+     * on reading through, so the transaction ends here rather than read past its own writes */
+    if (tidesdb_writeset_truncate(txn->writeset, txn->sp_counts[idx]) != TDB_SUCCESS)
+    {
+        txn->state = TDB_TXN_ABORTED;
+        txn_leave_registry(txn);
+        return TDB_ERR_MEMORY;
+    }
+
+    /* keep the target savepoint so it can be rolled back to again (standard sql), dropping only the
+     * savepoints taken after it */
+    for (int i = idx + 1; i < txn->num_sp; i++) free(txn->sp_names[i]);
+    txn->num_sp = idx + 1;
+    return TDB_SUCCESS;
+}
+
+int tdb_txn_release_savepoint(tdb_txn_t *txn, const char *name)
+{
+    if (!name) return TDB_ERR_INVALID_ARGS;
+    const int active = txn_require_active(txn);
+    if (active != TDB_SUCCESS) return active;
+
+    const int idx = txn_savepoint_index(txn, name);
+    if (idx < 0) return TDB_ERR_NOT_FOUND;
+
+    free(txn->sp_names[idx]);
+    for (int i = idx; i < txn->num_sp - 1; i++)
+    {
+        txn->sp_names[i] = txn->sp_names[i + 1];
+        txn->sp_counts[i] = txn->sp_counts[i + 1];
+    }
+    txn->num_sp--;
+    return TDB_SUCCESS;
+}
+
+uint64_t tdb_txn_snapshot(const tdb_txn_t *txn)
+{
+    return txn ? atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire) : 0;
+}
+
+uint64_t tdb_txn_read_snapshot(const tdb_txn_t *txn)
+{
+    return txn ? txn_read_snapshot(txn) : 0;
+}
+
+int tdb_txn_pin_snapshot(tdb_txn_t *txn, const uint64_t seq)
+{
+    if (!txn || txn->isolation < TDB_ISOLATION_REPEATABLE_READ) return TDB_ERR_INVALID_ARGS;
+
+    if (seq < atomic_load_explicit(&txn->snapshot_seq, memory_order_acquire))
+        atomic_store_explicit(&txn->snapshot_seq, seq, memory_order_release);
+    return TDB_SUCCESS;
+}
+
+tidesdb_isolation_level_t tdb_txn_isolation(const tdb_txn_t *txn)
+{
+    return txn ? txn->isolation : TDB_ISOLATION_READ_COMMITTED;
+}
+
+tdb_txn_state_t tdb_txn_state(const tdb_txn_t *txn)
+{
+    return txn ? txn->state : TDB_TXN_ABORTED;
+}
+
+tidesdb_writeset_t *tdb_txn_writeset(tdb_txn_t *txn)
+{
+    return txn ? txn->writeset : NULL;
+}
+
+int64_t tdb_txn_mem_bytes(const tdb_txn_t *txn)
+{
+    if (!txn) return 0;
+    return tidesdb_writeset_mem_bytes(txn->writeset) + tidesdb_readset_mem_bytes(txn->readset);
+}

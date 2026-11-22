@@ -61,7 +61,11 @@ impl SnapshotKvBackend {
 
     /// Number of active layers. `0` means writes go straight to root.
     pub fn depth(&self) -> usize {
-        self.state.read().expect("snapshot lock poisoned").layers.len()
+        self.state
+            .read()
+            .expect("snapshot lock poisoned")
+            .layers
+            .len()
     }
 
     /// Push a new empty tentative layer. Subsequent writes land here.
@@ -140,10 +144,7 @@ impl SnapshotKvBackend {
         let Some(bottom) = g.layers.first() else {
             return Vec::new();
         };
-        bottom
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        bottom.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
     /// Read a key. Walks layers top→bottom; first hit wins. A
@@ -215,6 +216,26 @@ impl KvBackend for SnapshotKvBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, crate::KvError> {
         SnapshotKvBackend::get(self, key)
     }
+    fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, crate::KvError> {
+        let guard = self.state.read().expect("snapshot lock poisoned");
+        if guard.layers.is_empty() {
+            drop(guard);
+            return self.root.multi_get(keys);
+        }
+        let resolved = keys
+            .iter()
+            .map(|key| {
+                guard
+                    .layers
+                    .iter()
+                    .rev()
+                    .find_map(|layer| layer.get(*key).cloned())
+            })
+            .collect();
+        drop(guard);
+        crate::backend::merge_multi_get(self.root.as_ref(), keys, resolved)
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), crate::KvError> {
         SnapshotKvBackend::put(self, key, value)
     }
@@ -272,14 +293,55 @@ impl KvBackend for SnapshotKvBackend {
         self.root.write_batch_sync(ops)
     }
 
+    fn sync_wal(&self) -> Result<(), crate::KvError> {
+        self.root.sync_wal()
+    }
+
+    fn checkpoint_to(&self, destination: &std::path::Path) -> Result<(), crate::KvError> {
+        if self.depth() != 0 {
+            return Err(crate::KvError::Backend(
+                "cannot export tentative snapshot layers".into(),
+            ));
+        }
+        self.root.checkpoint_to(destination)
+    }
+
+    fn checkpoint(&self) -> Result<(), crate::KvError> {
+        self.root.checkpoint()
+    }
+    fn scan_back_from(
+        &self,
+        before: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KvError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        if self
+            .state
+            .read()
+            .expect("snapshot lock poisoned")
+            .layers
+            .is_empty()
+        {
+            return self.root.scan_back_from(before, limit);
+        }
+        Ok(self
+            .scan_all()?
+            .into_iter()
+            .rev()
+            .filter(|(k, _)| k.as_slice() < before)
+            .take(limit)
+            .collect())
+    }
+
     fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KvError> {
         // Start from the root's full key set, then overlay tentative
         // writes (puts/deletes) from each layer in order. We use a
         // BTreeMap to keep ascending byte-lexicographic iteration
         // order matching every other `KvBackend::scan_all` impl.
         use std::collections::BTreeMap;
-        let mut overlay: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.root.scan_all()?.into_iter().collect();
+        let mut overlay: BTreeMap<Vec<u8>, Vec<u8>> = self.root.scan_all()?.into_iter().collect();
         let g = self.state.read().expect("snapshot lock poisoned");
         for layer in g.layers.iter() {
             for (k, slot) in layer.iter() {
@@ -296,7 +358,21 @@ impl KvBackend for SnapshotKvBackend {
         Ok(overlay.into_iter().collect())
     }
 
-    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KvError> {
+    fn scan_from(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KvError> {
+        let empty = self
+            .state
+            .read()
+            .expect("snapshot lock poisoned")
+            .layers
+            .is_empty();
+        if empty {
+            return self.root.scan_from(start, limit);
+        }
+
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -309,6 +385,16 @@ impl KvBackend for SnapshotKvBackend {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, crate::KvError> {
+        let empty = self
+            .state
+            .read()
+            .expect("snapshot lock poisoned")
+            .layers
+            .is_empty();
+        if empty {
+            return self.root.scan_prefix(prefix);
+        }
+
         Ok(self
             .scan_all()?
             .into_iter()
@@ -379,8 +465,14 @@ mod tests {
         snap.put(b"k2", b"layerB").unwrap();
         snap.merge().unwrap(); // collapse B into A
         assert_eq!(snap.depth(), 1);
-        assert_eq!(snap.get(b"k1").unwrap().as_deref(), Some(b"layerA".as_ref()));
-        assert_eq!(snap.get(b"k2").unwrap().as_deref(), Some(b"layerB".as_ref()));
+        assert_eq!(
+            snap.get(b"k1").unwrap().as_deref(),
+            Some(b"layerA".as_ref())
+        );
+        assert_eq!(
+            snap.get(b"k2").unwrap().as_deref(),
+            Some(b"layerB".as_ref())
+        );
     }
 
     #[test]
@@ -459,13 +551,22 @@ mod tests {
         snap.put(b"a", b"layer-a").unwrap(); // overwrite
         snap.put(b"c", b"layer-c").unwrap(); // insert
         snap.delete(b"b").unwrap(); // tombstone
-        // scan_all reads through the bridge
+                                    // scan_all reads through the bridge
         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
             <SnapshotKvBackend as KvBackend>::scan_all(&snap).unwrap();
         let map: HashMap<Vec<u8>, Vec<u8>> = pairs.into_iter().collect();
-        assert_eq!(map.get(b"a".as_ref()).map(|v| v.as_slice()), Some(b"layer-a".as_ref()));
-        assert_eq!(map.get(b"c".as_ref()).map(|v| v.as_slice()), Some(b"layer-c".as_ref()));
-        assert!(map.get(b"b".as_ref()).is_none(), "tombstone must hide root value");
+        assert_eq!(
+            map.get(b"a".as_ref()).map(|v| v.as_slice()),
+            Some(b"layer-a".as_ref())
+        );
+        assert_eq!(
+            map.get(b"c".as_ref()).map(|v| v.as_slice()),
+            Some(b"layer-c".as_ref())
+        );
+        assert!(
+            map.get(b"b".as_ref()).is_none(),
+            "tombstone must hide root value"
+        );
     }
 
     #[test]
@@ -477,7 +578,10 @@ mod tests {
         snap.put(b"mmm", b"2").unwrap();
         let pairs = <SnapshotKvBackend as KvBackend>::scan_all(&snap).unwrap();
         let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(keys, vec![b"aaa".as_ref(), b"mmm".as_ref(), b"zzz".as_ref()]);
+        assert_eq!(
+            keys,
+            vec![b"aaa".as_ref(), b"mmm".as_ref(), b"zzz".as_ref()]
+        );
     }
 
     #[test]
@@ -486,8 +590,7 @@ mod tests {
         for byte in [0xa0u8, 0xb0, 0xc0, 0xd0] {
             snap.put(&[byte], &[byte ^ 0xff]).unwrap();
         }
-        let pairs =
-            <SnapshotKvBackend as KvBackend>::scan_from(&snap, &[0xb5], 5).unwrap();
+        let pairs = <SnapshotKvBackend as KvBackend>::scan_from(&snap, &[0xb5], 5).unwrap();
         let keys: Vec<u8> = pairs.iter().map(|(k, _)| k[0]).collect();
         assert_eq!(keys, vec![0xc0, 0xd0]);
     }
@@ -501,8 +604,7 @@ mod tests {
         snap.advance();
         snap.put(b"foo:3", b"4").unwrap(); // layer-only
         snap.delete(b"foo:1").unwrap(); // tombstone
-        let pairs =
-            <SnapshotKvBackend as KvBackend>::scan_prefix(&snap, b"foo:").unwrap();
+        let pairs = <SnapshotKvBackend as KvBackend>::scan_prefix(&snap, b"foo:").unwrap();
         let keys: HashSet<String> = pairs
             .iter()
             .map(|(k, _)| String::from_utf8_lossy(k).to_string())
@@ -522,7 +624,10 @@ mod tests {
         snap.advance();
         snap.put(b"k", b"layered").unwrap();
         let dyn_ref: Arc<dyn KvBackend> = snap.clone();
-        assert_eq!(dyn_ref.get(b"k").unwrap().as_deref(), Some(b"layered".as_ref()));
+        assert_eq!(
+            dyn_ref.get(b"k").unwrap().as_deref(),
+            Some(b"layered".as_ref())
+        );
         // Revoke through the typed handle; the dyn-ref sees the same
         // underlying state.
         snap.revoke();
@@ -537,8 +642,8 @@ mod tests {
     /// path inherits RocksDB's WriteBatch + WAL atomicity.
     #[test]
     fn bottom_layer_flush_routes_through_root_write_batch() {
-        use std::sync::Mutex;
         use crate::backend::WriteOp;
+        use std::sync::Mutex;
 
         struct RecordingRoot {
             inner: MemBackend,
@@ -582,7 +687,12 @@ mod tests {
         snap.merge().unwrap(); // bottom → flushed to root
 
         let batches = root.batches.lock().unwrap();
-        assert_eq!(batches.len(), 1, "expected one batch flush, got {}", batches.len());
+        assert_eq!(
+            batches.len(),
+            1,
+            "expected one batch flush, got {}",
+            batches.len()
+        );
         assert_eq!(
             batches[0].len(),
             3,
@@ -606,8 +716,8 @@ mod tests {
     /// the hot path.
     #[test]
     fn bottom_layer_flush_with_no_writes_is_noop() {
-        use std::sync::Mutex;
         use crate::backend::WriteOp;
+        use std::sync::Mutex;
 
         struct CountingRoot {
             inner: MemBackend,

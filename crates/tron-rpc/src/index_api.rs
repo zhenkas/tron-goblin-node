@@ -828,6 +828,11 @@ impl ArchiveApiState {
         self.backends.iter().find(|(i, _)| *i == id).map(|(_, b)| b.clone())
     }
 
+    /// Whether a store is captured, so confirmed reads cannot silently fall through.
+    pub(crate) fn has_store(&self, id: UndoStoreId) -> bool {
+        self.backends.iter().any(|(store, _)| *store == id)
+    }
+
     /// An at-height `KvBackend` view of one store.
     fn at(&self, id: UndoStoreId, height: i64) -> Option<Arc<dyn KvBackend>> {
         let live = self.live(id)?;
@@ -855,8 +860,8 @@ impl ArchiveApiState {
     /// Assemble Chronos [`ForkBackends`](tron_sim::ForkBackends) from the
     /// archive's **live** raw backends. `ForkOverlay::new` wraps these in
     /// at-height views itself when forking historically, so this always
-    /// hands over the live stores (including `votes` and `abi`, which the
-    /// read-only `eth_call` backends omit). Returns `None` only if a core
+    /// hands over the live stores, including the ABI store omitted from
+    /// read-only `eth_call` backends. Returns `None` only if a core
     /// store is missing from the archive's backend set.
     pub fn fork_backends(&self) -> Option<tron_sim::ForkBackends> {
         use UndoStoreId as Id;
@@ -969,6 +974,7 @@ pub(crate) fn state_at_height(s: &RpcState, arch: &ArchiveApiState, h: i64) -> R
             code: swap(Id::Code, &live.code),
             storage: swap(Id::StorageRow, &live.storage),
             witnesses: swap(Id::Witnesses, &live.witnesses),
+            votes: swap(Id::Votes, &live.votes),
             contract_state: swap(Id::ContractState, &live.contract_state),
             dyn_props: swap(Id::DynProps, &live.dyn_props),
             delegated_resources: swap(Id::DelegatedResources, &live.delegated_resources),

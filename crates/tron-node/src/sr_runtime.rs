@@ -91,6 +91,18 @@ impl std::fmt::Debug for SrIdentity {
 }
 
 impl SrIdentity {
+    pub(crate) fn from_runtime_config(
+        config: &crate::NodeConfig,
+        witness: &WitnessConfig,
+    ) -> Result<Self, SrRuntimeError> {
+        #[cfg(feature = "private-network")]
+        if config.private_network.is_some() {
+            return crate::private_network::witness_identities(config)
+                .map_err(|e| SrRuntimeError::Config(e.to_string()))?
+                .into_iter().next().ok_or_else(|| SrRuntimeError::Config("private keyring empty".into()));
+        }
+        Self::from_node_config(&config.local_witness, witness)
+    }
     /// Resolve a witness identity from both config trees, mirroring
     /// java-tron's `WitnessInitializer.init` precedence:
     ///
@@ -233,6 +245,10 @@ pub struct SrRuntime {
     undo_store: BlockUndoStore,
     mempool: Arc<tron_mempool::TxMempool>,
     identity: SrIdentity,
+    #[cfg(feature = "private-network")]
+    private_identities: Vec<SrIdentity>,
+    #[cfg(feature = "private-network")]
+    private_leadership: Option<Arc<crate::sync::SyncLeadership>>,
     /// Outbound channel — per-peer drivers subscribe and forward.
     produced_tx: broadcast::Sender<ProducedBlockNotice>,
     max_txs_per_block: usize,
@@ -265,6 +281,22 @@ pub struct SrRuntime {
 }
 
 impl SrRuntime {
+    /// Private-only keyring: one scheduler, one mempool and one serial writer.
+    /// Real scheduled witness selection and DPoS solidification remain unchanged.
+    #[cfg(feature = "private-network")]
+    pub(crate) fn with_private_identities(mut self, identities: Vec<SrIdentity>) -> Self {
+        self.private_identities = identities;
+        self
+    }
+    #[cfg(feature = "private-network")]
+    pub(crate) fn with_private_apply_lock(
+        mut self,
+        leadership: Arc<crate::sync::SyncLeadership>,
+    ) -> Self {
+        self.private_leadership = Some(leadership);
+        self
+    }
+
     /// Attach the witness-HA election handle — production is skipped
     /// while this node isn't the backup-group MASTER.
     pub fn with_backup(mut self, backup: crate::backup::BackupHandle) -> Self {
@@ -294,6 +326,10 @@ impl SrRuntime {
             undo_store,
             mempool,
             identity,
+            #[cfg(feature = "private-network")]
+            private_identities: Vec::new(),
+            #[cfg(feature = "private-network")]
+            private_leadership: None,
             produced_tx,
             max_txs_per_block,
             metrics: None,
@@ -452,6 +488,25 @@ impl SrRuntime {
         &self,
         last_produced_slot: i64,
     ) -> Result<Option<ProducedBlockNotice>, SrRuntimeError> {
+        self.try_produce_at(last_produced_slot, current_time_ms())
+    }
+
+    // Deterministic time injection for consensus tests. Production always
+    // passes the actual clock above and never advances virtual timestamps.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_produce_at(
+        &self,
+        last_produced_slot: i64,
+        now_ms: i64,
+    ) -> Result<Option<ProducedBlockNotice>, SrRuntimeError> {
+        // Private production and ordinary peer drivers mutate one ledger.
+        // Share their writer fence across head selection, Khaos update,
+        // execution, finality and the committed index hook.
+        #[cfg(feature = "private-network")]
+        let private_leadership = self.private_leadership.clone();
+        #[cfg(feature = "private-network")]
+        let _private_apply_guard = private_leadership.as_ref().map(|l| l.lock_apply());
+
         // Witness HA: only the backup-group MASTER may produce (java
         // checks BackupManager status before every attempt).
         if let Some(backup) = &self.backup {
@@ -477,6 +532,44 @@ impl SrRuntime {
             return Ok(None);
         };
         let genesis_time = dp.genesis_block_timestamp().unwrap_or(0);
+        #[cfg(feature = "private-network")]
+        if !self.private_identities.is_empty() && self.khaos.head().is_none() {
+            // On restart the producer can run before any peer driver seeds the
+            // shared tree. Load the same bounded canonical ancestry window,
+            // rather than starting an isolated tree at the next new block.
+            let backend = self.state.block_index.as_ref()
+                .ok_or_else(|| SrRuntimeError::Storage("private producer block index missing".into()))?;
+            let index = BlockIndexStore::new(backend.clone());
+            let blocks = BlockStore::new(self.blocks_backend.clone());
+            let lowest = index.lowest()?.unwrap_or(head_num);
+            let start = head_num.saturating_sub(256).max(lowest);
+            let mut chain = Vec::new();
+            let mut previous = None;
+            for number in start..=head_num {
+                let id = index.get(number)?;
+                let block = blocks.get(&id)?;
+                let raw = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref())
+                    .ok_or_else(|| SrRuntimeError::Storage("private ancestry header missing".into()))?;
+                let actual = tron_types::block_id_from_block(&block)
+                    .map_err(|e| SrRuntimeError::Storage(format!("private ancestry identity: {e:?}")))?;
+                if actual != id || raw.number != number
+                    || previous.is_some_and(|p: tron_types::BlockId| raw.parent_hash.as_slice() != p.as_bytes()) {
+                    return Err(SrRuntimeError::Storage("private canonical ancestry is inconsistent".into()));
+                }
+                previous = Some(id);
+                chain.push(block);
+            }
+            // A read/hash/link error above leaves the shared tree untouched,
+            // so the next attempt can retry the complete canonical window.
+            if let Some((first, rest)) = chain.split_first() {
+                self.khaos.start(first.clone())
+                    .map_err(|e| SrRuntimeError::Storage(format!("seed private fork tree: {e:?}")))?;
+                for block in rest {
+                    self.khaos.push(block.clone())
+                        .map_err(|e| SrRuntimeError::Storage(format!("seed private ancestry: {e:?}")))?;
+                }
+            }
+        }
         // java `consensusDelegate.lastHeadBlockIsMaintenance()` =
         // `getStateFlag() == 1`. When the head block crossed a maintenance
         // boundary `DposSlot.getTime` adds `MAINTENANCE_SKIP_SLOTS`, so both
@@ -486,7 +579,6 @@ impl SrRuntime {
         let head_was_maintenance = dp.state_flag() == 1;
 
         // Compute the relative slot since the head (java `getSlot`).
-        let now_ms = current_time_ms();
         let slots_since = slot_from_head(
             now_ms,
             head_time,
@@ -523,9 +615,18 @@ impl SrRuntime {
 
         // Whose slot is it?
         let scheduled = scheduled_witness(target_slot, &active);
-        if scheduled != self.identity.witness_address {
-            return Ok(None);
-        }
+        #[cfg(feature = "private-network")]
+        let identity = if self.private_identities.is_empty() {
+            &self.identity
+        } else {
+            let Some(identity) = self.private_identities.iter().find(|i| i.witness_address == scheduled) else {
+                return Ok(None);
+            };
+            identity
+        };
+        #[cfg(not(feature = "private-network"))]
+        let identity = &self.identity;
+        if scheduled != identity.witness_address { return Ok(None); }
 
         // The block's timestamp is java's `dposSlot.getTime(slot)`: the
         // head timestamp aligned DOWN to the 3s grid, plus
@@ -560,7 +661,7 @@ impl SrRuntime {
             &head_id,
             head_num + 1,
             block_time,
-            &self.identity.witness_address,
+            &identity.witness_address,
             Vec::new(),
             BLOCK_VERSION,
         )
@@ -602,7 +703,7 @@ impl SrRuntime {
                 &head_id,
                 head_num + 1,
                 block_time,
-                &self.identity.witness_address,
+                &identity.witness_address,
                 txs.clone(),
                 BLOCK_VERSION,
             )
@@ -625,8 +726,8 @@ impl SrRuntime {
             &head_id,
             head_num + 1,
             block_time,
-            &self.identity.witness_address,
-            &self.identity.witness_priv_key,
+            &identity.witness_address,
+            &identity.witness_priv_key,
             txs,
             BLOCK_VERSION,
             account_state_root,
@@ -642,6 +743,11 @@ impl SrRuntime {
             // we're producing without any peers, start it manually.
             match e {
                 tron_consensus::KhaosPushError::Unlinked => {
+                    #[cfg(feature = "private-network")]
+                    if !self.private_identities.is_empty() {
+                        return Err(SrRuntimeError::Storage(
+                            "private fork tree is missing the executed parent; refusing unlinked production".into()));
+                    }
                     // Try to seed.
                     if self.khaos.head().is_none() {
                         let _ = self.khaos.start(block.clone());
@@ -656,6 +762,12 @@ impl SrRuntime {
         if let Some(bi_be) = &self.state.block_index {
             BlockIndexStore::new(bi_be.clone()).put(&block_id)?;
         }
+        // Durable before the state commit, which is fsynced per block: a power
+        // loss must never leave the head pointer on a block the store lost.
+        self.blocks_backend
+            .sync_wal()
+            .and_then(|()| self.state.block_index.as_ref().map_or(Ok(()), |bi| bi.sync_wal()))
+            .map_err(|e| SrRuntimeError::Storage(format!("block store fsync: {e}")))?;
 
         // Apply state. When the snapshot coordinator is attached,
         // SR's produced block goes through the same layer stack as
@@ -701,6 +813,29 @@ impl SrRuntime {
                 .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
             },
         };
+
+        // The ordinary follower owns DPoS pointer advancement in SyncDriver.
+        // A standalone private producer has no follower applying its own blocks,
+        // so advance from the same persisted witness evidence before indexing.
+        #[cfg(feature = "private-network")]
+        if !self.private_identities.is_empty() {
+            let active = tron_chainbase::WitnessScheduleStore::new(
+                self.witness_schedule_backend.clone()).load_active()?.unwrap_or_default();
+            let witnesses = tron_chainbase::WitnessStore::new(self.state.witnesses.clone());
+            let latest = active.iter().map(|address| {
+                witnesses.get(address).map(|w| w.map(|w| w.latest_block_num).unwrap_or(0))
+            }).collect::<Result<Vec<_>, _>>()?;
+            if let Some(solid) = tron_consensus::solid_block_from_witnesses(&latest) {
+                let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+                if solid > dp.latest_solidified_block_num().unwrap_or(0) {
+                    dp.save_latest_solidified_block_num(solid);
+                    self.state.dyn_props.sync_wal()?;
+                    if let Some(metrics) = &self.metrics {
+                        metrics.set_solidified_block_number(solid);
+                    }
+                }
+            }
+        }
 
         // Remove the txs we just included from the mempool so they
         // don't get re-broadcast — by the pool ids we drained them under

@@ -292,8 +292,28 @@ impl SignWeightCode {
 /// surface as `SignWeightCode` variants.
 pub fn compute_sign_weight(
     accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    tx: &Transaction,
+) -> Result<SignWeight, PermissionError> {
+    compute_sign_weight_inner(accounts, dyn_props, tx, None)
+}
+
+/// Read-only RPC variant for a transaction's original submitted wire hash.
+/// Existing canonical-struct permission/admission callers keep their own path.
+pub fn compute_sign_weight_with_id(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    tx: &Transaction,
+    tx_id: &[u8; 32],
+) -> Result<SignWeight, PermissionError> {
+    compute_sign_weight_inner(accounts, dyn_props, tx, Some(tx_id))
+}
+
+fn compute_sign_weight_inner(
+    accounts: &AccountStore,
     _dyn_props: &DynamicPropertiesStore,
     tx: &Transaction,
+    submitted_id: Option<&[u8; 32]>,
 ) -> Result<SignWeight, PermissionError> {
     let raw = tx
         .raw_data
@@ -320,11 +340,15 @@ pub fn compute_sign_weight(
     for sig_bytes in &tx.signature {
         match tron_crypto::signature::RecoverableSignature::from_bytes(sig_bytes) {
             Ok(sig) => {
-                let id = match tron_types::tx_id(tx) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        compute_err = true;
-                        continue;
+                let id = if let Some(id) = submitted_id {
+                    *id
+                } else {
+                    match tron_types::tx_id(tx) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            compute_err = true;
+                            continue;
+                        }
                     }
                 };
                 match sig.recover_uncompressed_pubkey(&id) {
