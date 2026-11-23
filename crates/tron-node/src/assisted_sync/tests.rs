@@ -5,7 +5,8 @@ use crate::{
     storage::{OpenedStores, SnapshotStack},
 };
 use std::path::Path;
-use tron_chainbase::{BlockUndoRecord, MemBackend, UndoEntry};
+use super::super::Compression;
+use tron_chainbase::{BlockUndoRecord, MemBackend};
 use tron_grpc::assist_proto::Delta;
 
 fn stores() -> OpenedStores {
@@ -152,16 +153,6 @@ fn bundle(rt: &AssistRuntime) -> wire::BlockBundle {
         },
     ];
     deltas.sort_by(|a, b| (a.store, &a.key).cmp(&(b.store, &b.key)));
-    let undo = BlockUndoRecord {
-        entries: deltas
-            .iter()
-            .map(|d| UndoEntry {
-                store: UndoStoreId::from_u8(d.store as u8).unwrap(),
-                key: d.key.clone(),
-                before: d.before.clone(),
-            })
-            .collect(),
-    };
     let previous_digest = rt
         .journal
         .lock()
@@ -187,11 +178,45 @@ fn bundle(rt: &AssistRuntime) -> wire::BlockBundle {
             ..Default::default()
         }
         .encode_to_vec(),
-        undo: undo.encode(),
+        preimages: true,
         ..Default::default()
     };
+    out.before_digest = journal::before_digest_of(&out);
     out.digest = journal::block_digest(&out);
     out
+}
+/// Wait for `done`, failing only when `progress` stops changing for
+/// `STALL`. Every import is a chain of fsyncs, so a wall-clock limit on a
+/// whole catch-up measures the disk; a limit on the gap between two steps
+/// measures whether the nodes are still working.
+const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+async fn settled(progress: impl Fn() -> i64, done: impl Fn() -> bool) -> bool {
+    let mut seen = progress();
+    let mut since = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        let now = progress();
+        if now != seen {
+            seen = now;
+            since = std::time::Instant::now();
+        } else if since.elapsed() > STALL {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+fn pending(block: &wire::BlockBundle) -> Vec<u8> {
+    journal::pack(block, Compression::Low).unwrap()
+}
+fn fetch_after_head(rt: &AssistRuntime) -> wire::Fetch {
+    let (after_height, after_id) = rt.head().unwrap();
+    wire::Fetch {
+        after_height,
+        after_id,
+        ..Default::default()
+    }
 }
 #[test]
 fn import_redo_duplicate_ack_and_independent_event_sequence() {
@@ -208,7 +233,7 @@ fn import_redo_duplicate_ack_and_independent_event_sequence() {
     assert_eq!(r.import(&first).unwrap(), ack);
     assert_eq!(r.cursor.lock().unwrap().imported_blocks, 1);
     let second = bundle(&r);
-    journal::atomic_write(&r.root.join("incoming.pb"), &second.encode_to_vec()).unwrap();
+    journal::atomic_write(&r.root.join("incoming.pb"), &pending(&second)).unwrap();
     // Simulate death after the head store committed but BEFORE other stores.
     let dp = DynamicPropertiesStore::new(r.stores.dyn_props.clone());
     dp.save_latest_block_header_number(2);
@@ -241,7 +266,7 @@ fn import_failure_never_advances_cursor_and_recovery_finishes_event() {
     assert_eq!(r.cursor.lock().unwrap().height, 0);
     assert!(!r.has_pending_import());
     let good = bundle(&r);
-    journal::atomic_write(&r.root.join("incoming.pb"), &good.encode_to_vec()).unwrap();
+    journal::atomic_write(&r.root.join("incoming.pb"), &pending(&good)).unwrap();
     r.recover().unwrap();
     assert_eq!(r.cursor.lock().unwrap().height, 1);
     assert_eq!(r.local_ack(1).unwrap().unwrap().digest, good.digest);
@@ -512,25 +537,24 @@ async fn encrypted_pair(donor_dials: bool) {
             .await
             .unwrap(),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if receiver.head().unwrap().0 == 3
-                && !receiver.is_assisted()
-                && donor
-                    .journal
-                    .lock()
-                    .unwrap()
-                    .acks
-                    .get("receiver")
-                    .is_some_and(|a| a.height == 3)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("authenticated pair must catch up and hand off in either dial direction");
+    let acked = || {
+        donor
+            .journal
+            .lock()
+            .unwrap()
+            .acks
+            .get("receiver")
+            .map_or(0, |a| a.height)
+    };
+    let moved =
+        || receiver.head().unwrap().0 * 1000 + acked() * 2 + receiver.is_assisted() as i64;
+    assert!(
+        settled(moved, || receiver.head().unwrap().0 == 3
+            && !receiver.is_assisted()
+            && acked() == 3)
+        .await,
+        "authenticated pair must catch up and hand off in either dial direction"
+    );
     assert_eq!(
         receiver.stores.storage_row.get(b"sample").unwrap(),
         donor.stores.storage_row.get(b"sample").unwrap()
@@ -556,25 +580,13 @@ async fn encrypted_pair(donor_dials: bool) {
         donor.import(&next).unwrap();
     }
     donor.switch_mode(false).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if receiver.head().unwrap().0 == 9
-                && !receiver.is_assisted()
-                && donor
-                    .journal
-                    .lock()
-                    .unwrap()
-                    .acks
-                    .get("receiver")
-                    .is_some_and(|a| a.height == 9)
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("automatic lag re-entry must resume fetching after handoff");
+    assert!(
+        settled(moved, || receiver.head().unwrap().0 == 9
+            && !receiver.is_assisted()
+            && acked() == 9)
+        .await,
+        "automatic lag re-entry must resume fetching after handoff"
+    );
     assert_eq!(receiver.cursor.lock().unwrap().imported_blocks, 9);
 
     // A CA-signed but unlisted client still cannot open the replication RPC.
@@ -611,7 +623,7 @@ async fn encrypted_pair(donor_dials: bool) {
     assert_eq!(error.code(), tonic::Code::PermissionDenied);
     stop.shutdown();
     for task in tasks {
-        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
             .unwrap()
             .unwrap();
@@ -1016,8 +1028,10 @@ async fn empty_bootstrap_network_mode(donor_dials: bool, cluster: bool) {
         !node.data_dir.exists(),
         "receiver starts with no state at all"
     );
+    // A whole snapshot transfer has no step to watch from here; the limit only
+    // guards against a hang.
     tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
         super::super::receive_bootstrap(&node, stop.clone()),
     )
     .await
@@ -1039,23 +1053,21 @@ async fn empty_bootstrap_network_mode(donor_dials: bool, cluster: bool) {
     if cluster {
         tasks.extend(super::super::start(r.clone(), stop.clone()).await.unwrap());
     }
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if r.head().unwrap().0 == 12 && !r.is_assisted() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("empty bootstrap must switch to ordinary catch-up and autonomous leadership");
+    assert!(
+        settled(
+            || r.head().unwrap().0 * 2 + r.is_assisted() as i64,
+            || r.head().unwrap().0 == 12 && !r.is_assisted()
+        )
+        .await,
+        "empty bootstrap must switch to ordinary catch-up and autonomous leadership"
+    );
     assert_eq!(
         r.stores.storage_row.get(b"sample").unwrap(),
         d.stores.storage_row.get(b"sample").unwrap()
     );
     stop.shutdown();
     for task in tasks {
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
             .unwrap()
             .unwrap();
@@ -1212,14 +1224,9 @@ fn independent_noop_captures_reenter_with_checked_logical_anchor() {
     source
         .deltas
         .sort_by(|a, b| (a.store, &a.key).cmp(&(b.store, &b.key)));
-    let mut undo = BlockUndoRecord::decode(&source.undo).unwrap();
-    undo.entries.push(UndoEntry {
-        store: UndoStoreId::Code,
-        key: b"cached-read".to_vec(),
-        before: None,
-    });
-    source.undo = undo.encode();
+    source.before_digest = journal::before_digest_of(&source);
     source.digest = journal::block_digest(&source);
+    assert_ne!(source.before_digest, local.before_digest);
     assert_ne!(source.digest, local.digest);
     assert_eq!(
         journal::semantic_digest(&source).unwrap(),
@@ -1255,7 +1262,14 @@ fn independent_noop_captures_reenter_with_checked_logical_anchor() {
         .contains("logical anchor writes differ"));
     let exported = donor.export_next(&fetch).unwrap().unwrap();
     // Preserve an independently produced candidate for the same future canonical block.
-    let mut candidate = exported.clone();
+    assert!(!exported.preimages);
+    let mut candidate = donor
+        .journal
+        .lock()
+        .unwrap()
+        .read(exported.height, &exported.block_id)
+        .unwrap()
+        .unwrap();
     candidate.previous_digest = local.digest.clone();
     candidate.digest = journal::block_digest(&candidate);
     receiver
@@ -1353,10 +1367,11 @@ fn trusted_cluster_selects_peer_rejects_stale_writer_and_falls_back() {
     assert!(!r.cluster_current(&b));
 }
 #[test]
-fn trusted_cluster_prunes_without_ack_or_snapshot_pin_and_rotates_bytes() {
+fn trusted_cluster_prunes_without_ack_or_snapshot_pin_in_whole_portions() {
     let t = tempfile::tempdir().unwrap();
     let mut cfg = cluster_config();
     cfg.retain_blocks = 3;
+    cfg.prune_batch_blocks = 1;
     let r = rig(&t.path().join("count"), cfg);
     r.switch_mode(true).unwrap();
     for _ in 0..9 {
@@ -1391,21 +1406,33 @@ fn trusted_cluster_prunes_without_ack_or_snapshot_pin_and_rotates_bytes() {
         .is_none());
     drop(j);
     let mut cfg = cluster_config();
+    // The window is counted in blocks and cut in whole portions; the byte
+    // budget of the acknowledged mode neither rotates nor refuses anything.
     cfg.max_block_bytes = 1024;
-    cfg.max_journal_bytes = 4096;
-    cfg.retain_blocks = 1000;
-    let r = rig(&t.path().join("bytes"), cfg.clone());
+    cfg.max_journal_bytes = 1024;
+    cfg.retain_blocks = 10;
+    cfg.prune_batch_blocks = 5;
+    let r = rig(&t.path().join("portions"), cfg.clone());
     r.switch_mode(true).unwrap();
+    let mut floors = Vec::new();
     for _ in 0..40 {
         let b = bundle(&r);
         r.import(&b).unwrap();
+        floors.push(r.journal.lock().unwrap().meta.floor);
     }
-    let bytes: u64 = fs::read_dir(t.path().join("bytes/assisted-sync/blocks"))
+    // Import of block h treats h-1 as the solid bound: at h=40 the window
+    // starts at 30, and the last whole portion ended at 26.
+    assert_eq!(*floors.last().unwrap(), 26);
+    assert!(floors.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 5));
+    let files = fs::read_dir(t.path().join("portions/assisted-sync/blocks"))
+        .unwrap()
+        .count();
+    assert_eq!(files, 15);
+    let bytes: u64 = fs::read_dir(t.path().join("portions/assisted-sync/blocks"))
         .unwrap()
         .map(|p| p.unwrap().metadata().unwrap().len())
         .sum();
-    assert!(bytes <= cfg.max_journal_bytes);
-    assert!(r.journal.lock().unwrap().meta.floor > 1);
+    assert!(bytes > cfg.max_journal_bytes);
     assert!(r.journal.lock().unwrap().acks.is_empty());
     let gone = wire::Fetch {
         after_height: 0,
@@ -1458,19 +1485,19 @@ async fn trusted_cluster_three_members_reverse_flow_on_same_topology() {
                     .unwrap(),
             );
         }
-        tokio::time::timeout(std::time::Duration::from_secs(40), async {
-            loop {
-                if nodes
+        assert!(
+            settled(
+                || nodes
+                    .iter()
+                    .map(|n| n.head().unwrap().0 * 2 + n.is_assisted() as i64)
+                    .sum(),
+                || nodes
                     .iter()
                     .all(|n| n.head().unwrap().0 == target && !n.is_assisted())
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-            }
-        })
-        .await
-        .expect("all trusted members must catch up in both logical directions");
+            )
+            .await,
+            "all trusted members must catch up in both logical directions"
+        );
         for node in &nodes {
             assert!(
                 node.journal.lock().unwrap().acks.is_empty(),
@@ -1483,7 +1510,7 @@ async fn trusted_cluster_three_members_reverse_flow_on_same_topology() {
         }
         stop.shutdown();
         for task in tasks {
-            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            tokio::time::timeout(std::time::Duration::from_secs(60), task)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1563,9 +1590,12 @@ async fn trusted_cluster_active_supplier_disconnect_fails_over_without_ack() {
         nodes.push(rig(&t.path().join(names[i]), c));
         stops.push(crate::ShutdownSignal::new());
     }
+    // Long enough that the supplier is stopped in the middle of a transfer,
+    // short enough that preparing two suppliers is not most of the test.
+    const BLOCKS: i64 = 160;
     nodes[0].switch_mode(true).unwrap();
     nodes[1].switch_mode(true).unwrap();
-    for _ in 0..512 {
+    for _ in 0..BLOCKS {
         let b = bundle(&nodes[0]);
         nodes[0].import(&b).unwrap();
         nodes[1].import(&b).unwrap();
@@ -1579,11 +1609,12 @@ async fn trusted_cluster_active_supplier_disconnect_fails_over_without_ack() {
                 .unwrap(),
         );
     }
-    let selected = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+    // Connection setup has no step to watch; the limit only guards against a hang.
+    let selected = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         loop {
             let head = nodes[2].head().unwrap().0;
             if head > 3 {
-                assert!(head < 512, "must interrupt an active transfer");
+                assert!(head < BLOCKS, "must interrupt an active transfer");
                 if let Some(peer) = nodes[2].processing.snapshot().source_peer {
                     break peer;
                 }
@@ -1596,17 +1627,24 @@ async fn trusted_cluster_active_supplier_disconnect_fails_over_without_ack() {
     let failed = names.iter().position(|n| *n == selected).unwrap();
     assert!(failed < 2);
     stops[failed].shutdown();
-    tokio::time::timeout(std::time::Duration::from_secs(40), async {
-        while nodes[2].head().unwrap().0 < 512 || nodes[2].is_assisted() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("a second trusted member must finish the in-flight catch-up");
+    let finished = settled(
+        || nodes[2].head().unwrap().0 * 2 + nodes[2].is_assisted() as i64,
+        || nodes[2].head().unwrap().0 == BLOCKS && !nodes[2].is_assisted(),
+    )
+    .await;
+    assert!(
+        finished,
+        "a second trusted member must finish the in-flight catch-up: head={:?} assisted={} pending={} failed={} stats={:?}",
+        nodes[2].head().map(|h| h.0),
+        nodes[2].is_assisted(),
+        nodes[2].has_pending_import(),
+        names[failed],
+        nodes[2].processing.snapshot(),
+    );
     assert!(nodes[2].processing.snapshot().source_switches >= 2);
     assert_eq!(
         nodes[2].stores.storage_row.get(b"sample").unwrap(),
-        Some(512i64.to_be_bytes().to_vec())
+        Some(BLOCKS.to_be_bytes().to_vec())
     );
     for node in &nodes {
         assert!(node.journal.lock().unwrap().acks.is_empty());
@@ -1615,9 +1653,248 @@ async fn trusted_cluster_active_supplier_disconnect_fails_over_without_ack() {
         stop.shutdown();
     }
     for task in tasks {
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
             .unwrap()
             .unwrap();
     }
+}
+
+#[test]
+fn prior_value_hash_separates_absence_boundaries_and_order() {
+    type Entry<'a> = (u32, &'a [u8], Option<&'a [u8]>);
+    fn e<'a>(store: u32, key: &'a str, before: Option<&'a str>) -> Entry<'a> {
+        (store, key.as_bytes(), before.map(str::as_bytes))
+    }
+    let hash = |entries: Vec<Entry>| journal::before_digest(entries.into_iter());
+    let base = hash(vec![e(1, "k", Some("v")), e(1, "l", None)]);
+    assert_eq!(base.len(), 8);
+    assert_eq!(base, hash(vec![e(1, "k", Some("v")), e(1, "l", None)]));
+    // A missing value is not an empty one.
+    assert_ne!(base, hash(vec![e(1, "k", Some("v")), e(1, "l", Some(""))]));
+    // Bytes cannot move between a key and its value, or between entries.
+    assert_ne!(
+        hash(vec![e(1, "ab", Some("c"))]),
+        hash(vec![e(1, "a", Some("bc"))])
+    );
+    assert_ne!(base, hash(vec![e(1, "l", None), e(1, "k", Some("v"))]));
+    assert_ne!(base, hash(vec![e(2, "k", Some("v")), e(1, "l", None)]));
+    assert_ne!(base, hash(vec![e(1, "k", Some("v"))]));
+    assert_ne!(hash(vec![]), hash(vec![e(0, "", None)]));
+}
+
+#[test]
+fn blocks_travel_without_prior_values_and_are_proved_by_their_hash() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.peers[0].allow_donate = true;
+    let donor = rig(a.path(), cfg.clone());
+    let receiver = rig(b.path(), cfg);
+    for _ in 0..3 {
+        let local = bundle(&donor);
+        donor.import(&local).unwrap();
+        let sent = donor
+            .export_next(&fetch_after_head(&receiver))
+            .unwrap()
+            .unwrap();
+        assert!(!sent.preimages && sent.undo.is_empty());
+        assert!(sent.deltas.iter().all(|d| d.before.is_none()));
+        assert_eq!(sent.digest, local.digest);
+        assert!(sent.encoded_len() < local.encoded_len());
+        receiver.import(&sent).unwrap();
+        // The receiver's undo record comes from its own state and is the donor's.
+        let height = sent.height.to_be_bytes();
+        let undo = receiver.stores.block_undo.get(&height).unwrap().unwrap();
+        assert_eq!(
+            Some(&undo),
+            donor.stores.block_undo.get(&height).unwrap().as_ref()
+        );
+        assert_eq!(
+            BlockUndoRecord::decode(&undo).unwrap().entries.len(),
+            sent.deltas.len()
+        );
+    }
+    let local = bundle(&donor);
+    donor.import(&local).unwrap();
+    let sent = donor
+        .export_next(&fetch_after_head(&receiver))
+        .unwrap()
+        .unwrap();
+    // Prior values that were smuggled in are refused, not trusted.
+    let mut forged = sent.clone();
+    forged.deltas[0].before = Some(vec![1]);
+    assert!(receiver.import(&forged).is_err());
+    // A receiver whose state differs cannot reproduce the donor's hash.
+    receiver
+        .stores
+        .storage_row
+        .put(b"sample", b"diverged")
+        .unwrap();
+    assert!(receiver
+        .import(&sent)
+        .unwrap_err()
+        .contains("STATE_PREIMAGE_MISMATCH"));
+    assert_eq!(receiver.head().unwrap().0, 3);
+    assert!(!receiver.has_pending_import());
+}
+
+#[test]
+fn receiver_only_member_records_nothing_and_takes_blocks() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.peers[0].allow_donate = true;
+    let donor = rig(a.path(), cfg);
+    let mut only = cluster_config();
+    only.retain_blocks = 0;
+    only.validate().unwrap();
+    let mut acknowledged = config();
+    acknowledged.retain_blocks = 0;
+    assert!(acknowledged.validate().is_err());
+    let receiver = rig(&b.path().join("taking"), only.clone());
+    assert!(!receiver.config.keeps_journal());
+    receiver.switch_mode(true).unwrap();
+    assert_eq!(receiver.status().unwrap().retained_from, i64::MAX);
+    for _ in 0..3 {
+        let local = bundle(&donor);
+        donor.import(&local).unwrap();
+        let fetch = receiver.fetch_cursor().unwrap();
+        let sent = donor.export_next(&fetch).unwrap().unwrap();
+        receiver.import(&sent).unwrap();
+    }
+    assert_eq!(receiver.head().unwrap().0, 3);
+    assert_eq!(
+        receiver.stores.storage_row.get(b"sample").unwrap(),
+        donor.stores.storage_row.get(b"sample").unwrap()
+    );
+    let recorded = |name: &str| {
+        fs::read_dir(b.path().join(name).join("assisted-sync/blocks"))
+            .unwrap()
+            .count()
+    };
+    assert_eq!(recorded("taking"), 0);
+    assert!(receiver
+        .export_next(&wire::Fetch {
+            after_height: 0,
+            after_id: receiver.network.clone(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("HISTORY_GAP"));
+    // Consecutive imports stay chained through the cursor.
+    let local = bundle(&donor);
+    donor.import(&local).unwrap();
+    let sent = donor
+        .export_next(&receiver.fetch_cursor().unwrap())
+        .unwrap()
+        .unwrap();
+    let mut detached = sent.clone();
+    detached.previous_digest = vec![9; 32];
+    detached.digest = journal::block_digest(&detached);
+    assert!(receiver
+        .import(&detached)
+        .unwrap_err()
+        .contains("does not continue"));
+    assert!(!receiver.has_pending_import());
+    // After a block executed here the head is named alone, without digests.
+    {
+        let mut cursor = receiver.cursor.lock().unwrap();
+        cursor.height = 2;
+        cursor.block_id = vec![5; 32];
+    }
+    let fetch = receiver.fetch_cursor().unwrap();
+    assert!(fetch.after_digest.is_empty() && fetch.after_semantic_digest.is_empty());
+    assert_eq!(
+        donor.export_next(&fetch).unwrap().unwrap().digest,
+        sent.digest
+    );
+
+    // Its own execution passes the commit boundary without recording anything.
+    let executing = rig(&b.path().join("executing"), only);
+    let (_, parent) = executing.head().unwrap();
+    let state = executing.stores.to_state_backends();
+    tron_executor::execute_block_with_observer(
+        &state,
+        &block(1, &parent),
+        None,
+        &tron_chainbase::BlockUndoStore::new(executing.stores.block_undo.clone()),
+        &tron_chainbase::CheckPointV2::new(&b.path().join("cp")),
+        &tron_executor::ExecConfig {
+            capture_state_deltas: true,
+            verify_tx_trie: false,
+            ..tron_executor::ExecConfig::unsigned()
+        },
+        None,
+        executing.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(executing.head().unwrap().0, 1);
+    assert_eq!(recorded("executing"), 0);
+}
+
+#[test]
+fn records_pack_at_every_level_and_a_foreign_window_is_restarted() {
+    let t = tempfile::tempdir().unwrap();
+    let r = rig(&t.path().join("source"), config());
+    let mut block = bundle(&r);
+    // Enough repetitive payload for compression to show.
+    block.transaction_ret = vec![7; 64 * 1024];
+    block.digest = journal::block_digest(&block);
+    let raw = journal::pack(&block, Compression::None).unwrap();
+    let low = journal::pack(&block, Compression::Low).unwrap();
+    let high = journal::pack(&block, Compression::High).unwrap();
+    assert!(low.len() < raw.len() / 10 && high.len() < raw.len() / 10);
+    for packed in [&raw, &low, &high] {
+        assert_eq!(journal::unpack(packed, 1 << 20).unwrap(), block);
+    }
+    assert!(journal::unpack(&low, 1024)
+        .unwrap_err()
+        .contains("oversized"));
+    assert!(journal::unpack(&block.encode_to_vec(), 1 << 20).is_err());
+    let level: Compression = serde_json::from_str("\"high\"").unwrap();
+    assert_eq!(level, Compression::High);
+    assert_eq!(AssistConfig::default().compression, Compression::Low);
+
+    // A window written by another format cannot continue: a trusted cluster
+    // drops it and records again from the current head.
+    let root = t.path().join("window");
+    fs::create_dir_all(root.join("blocks")).unwrap();
+    let head = vec![3; 32];
+    let stale = journal::Meta {
+        format: 1,
+        network: r.network.clone(),
+        profile: vec![1; 32],
+        anchor_height: 5,
+        anchor_id: vec![2; 32],
+        anchor_digest: vec![0; 32],
+        floor: 6,
+    };
+    fs::write(root.join("donor.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+    fs::write(root.join("blocks/00000000000000000006.old.pb"), b"old").unwrap();
+    let open = |cfg: AssistConfig, height: i64| {
+        Journal::open(
+            root.clone(),
+            cfg,
+            r.network.clone(),
+            r.profile.clone(),
+            height,
+            head.clone(),
+        )
+    };
+    assert!(open(config(), 9).is_err());
+    let journal = open(cluster_config(), 9).unwrap();
+    assert!(journal.reset);
+    assert_eq!(
+        (journal.meta.format, journal.meta.floor),
+        (journal::FORMAT, 10)
+    );
+    assert_eq!(journal.meta.anchor_id, head);
+    assert_eq!(fs::read_dir(root.join("blocks")).unwrap().count(), 0);
+    drop(journal);
+    assert!(!open(cluster_config(), 9).unwrap().reset);
+    // Blocks applied while nothing was recorded leave a hole: start again too.
+    let journal = open(cluster_config(), 12).unwrap();
+    assert!(journal.reset);
+    assert_eq!(journal.meta.floor, 13);
 }

@@ -491,7 +491,7 @@ impl FirehoseLogWriter {
         })
     }
 
-    /// Disable independent byte-budget eviction while ACK-based history retention owns it.
+    /// Disable independent byte-budget eviction while the block-window retention owns it.
     pub fn manage_history(&mut self, control: std::sync::Arc<crate::HistoryControl>) {
         self.history = Some(control);
     }

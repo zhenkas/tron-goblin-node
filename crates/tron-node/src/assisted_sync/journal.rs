@@ -1,46 +1,181 @@
 //! Durable candidates and independent replication acknowledgements.
 //! A candidate is fsynced BEFORE consensus commit, but is exportable only
 //! after the caller proves its block ID canonical and solid.
-use super::AssistConfig;
+use super::{AssistConfig, Compression};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    hash::Hasher,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tron_grpc::assist_proto::{Ack, BlockBundle};
+use tron_grpc::assist_proto::{Ack, BlockBundle, Delta};
 
 pub type Result<T> = std::result::Result<T, String>;
-pub const FORMAT: u32 = 1;
+/// Format 2: prior values are not transmitted. A block carries one hash of
+/// them and the undo record is derived from the receiver's own state.
+pub const FORMAT: u32 = 2;
+/// Version this tag whenever canonical write/event semantics change.
+pub const PROFILE: &[u8] = b"tron-assist-v2/deltas-before-hash-ret-native-events";
 
+/// The transmitted form: the same block without the local prior values.
+pub fn bare(block: &BlockBundle) -> BlockBundle {
+    BlockBundle {
+        format: block.format,
+        network: block.network.clone(),
+        profile: block.profile.clone(),
+        height: block.height,
+        block_id: block.block_id.clone(),
+        parent_id: block.parent_id.clone(),
+        previous_digest: block.previous_digest.clone(),
+        deltas: block
+            .deltas
+            .iter()
+            .map(|d| Delta {
+                store: d.store,
+                key: d.key.clone(),
+                before: None,
+                after: d.after.clone(),
+            })
+            .collect(),
+        raw_block: block.raw_block.clone(),
+        transaction_ret: block.transaction_ret.clone(),
+        firehose_apply: block.firehose_apply.clone(),
+        undo: block.undo.clone(),
+        rotation: block.rotation.clone(),
+        digest: block.digest.clone(),
+        before_digest: block.before_digest.clone(),
+        preimages: false,
+    }
+}
+
+/// Identity of the transmitted form; prior values are covered through
+/// `before_digest`, so a record hashes the same with or without them.
 pub fn block_digest(block: &BlockBundle) -> Vec<u8> {
-    let mut payload = block.clone();
+    let mut payload = bare(block);
     payload.digest.clear();
     Sha256::digest(payload.encode_to_vec()).to_vec()
 }
 
+/// One reproducible hash of everything the block's writes replace. Entries
+/// are taken in delta order (sorted by store and key); each contributes its
+/// store, its length-prefixed key and either an "absent" flag or a "present"
+/// flag with the length-prefixed value. The entry count comes first.
+pub fn before_digest<'a>(
+    entries: impl ExactSizeIterator<Item = (u32, &'a [u8], Option<&'a [u8]>)>,
+) -> Vec<u8> {
+    let mut hash = twox_hash::XxHash64::with_seed(0);
+    hash.write(&(entries.len() as u64).to_be_bytes());
+    for (store, key, before) in entries {
+        hash.write(&store.to_be_bytes());
+        hash.write(&(key.len() as u64).to_be_bytes());
+        hash.write(key);
+        match before {
+            None => hash.write(&[0]),
+            Some(value) => {
+                hash.write(&[1]);
+                hash.write(&(value.len() as u64).to_be_bytes());
+                hash.write(value);
+            }
+        }
+    }
+    hash.finish().to_be_bytes().to_vec()
+}
+
+pub fn before_digest_of(block: &BlockBundle) -> Vec<u8> {
+    before_digest(
+        block
+            .deltas
+            .iter()
+            .map(|d| (d.store, d.key.as_slice(), d.before.as_deref())),
+    )
+}
+
+/// The undo record of a block that carries its prior values.
+pub fn undo_record(block: &BlockBundle) -> Result<Vec<u8>> {
+    if !block.preimages {
+        return Err("replication block carries no prior values".into());
+    }
+    let mut record = tron_chainbase::BlockUndoRecord::new();
+    for d in &block.deltas {
+        record.push(tron_chainbase::UndoEntry {
+            store: u8::try_from(d.store)
+                .ok()
+                .and_then(tron_chainbase::UndoStoreId::from_u8)
+                .ok_or("unknown replicated store")?,
+            key: d.key.clone(),
+            before: d.before.clone(),
+        });
+    }
+    Ok(record.encode())
+}
+
 /// Proof of the same logical block changes, independent of a prior local hash chain.
-/// Cache-dependent no-op captures and their undo entries do not change state.
+/// Cache-dependent no-op captures do not change state.
 pub fn semantic_digest(block: &BlockBundle) -> Result<Vec<u8>> {
+    if !block.preimages {
+        return Err("logical digest requires the block's prior values".into());
+    }
     let mut payload = block.clone();
     payload.digest.clear();
     payload.previous_digest.clear();
+    payload.before_digest.clear();
     payload.deltas.retain(|d| d.before != d.after);
-    let changed: std::collections::BTreeSet<_> = payload
-        .deltas
-        .iter()
-        .map(|d| (d.store, d.key.clone()))
-        .collect();
-    let mut undo =
-        tron_chainbase::BlockUndoRecord::decode(&payload.undo).map_err(|e| e.to_string())?;
-    undo.entries
-        .retain(|e| changed.contains(&(e.store as u32, e.key.clone())));
-    payload.undo = undo.encode();
     Ok(Sha256::digest(payload.encode_to_vec()).to_vec())
 }
+
+const PACKED: &[u8; 4] = b"TAJ2";
+
+/// File form of a record: marker, codec byte, then the encoded block.
+pub fn pack(block: &BlockBundle, compression: Compression) -> Result<Vec<u8>> {
+    let raw = block.encode_to_vec();
+    let mut out = Vec::with_capacity(raw.len() / 3 + 16);
+    out.extend_from_slice(PACKED);
+    let level = match compression {
+        Compression::None => {
+            out.push(0);
+            out.extend_from_slice(&raw);
+            return Ok(out);
+        }
+        Compression::Low => flate2::Compression::new(1),
+        Compression::High => flate2::Compression::best(),
+    };
+    out.push(1);
+    let mut encoder = flate2::write::ZlibEncoder::new(out, level);
+    encoder
+        .write_all(&raw)
+        .and_then(|_| encoder.finish())
+        .map_err(|e| format!("journal pack: {e}"))
+}
+
+pub fn unpack(bytes: &[u8], max: usize) -> Result<BlockBundle> {
+    let body = bytes
+        .strip_prefix(PACKED.as_slice())
+        .ok_or("journal record of another format")?;
+    let (codec, body) = body.split_first().ok_or("truncated journal record")?;
+    let raw;
+    let encoded = match codec {
+        0 => body,
+        1 => {
+            let mut out = Vec::new();
+            flate2::read::ZlibDecoder::new(body)
+                .take(max as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("journal unpack: {e}"))?;
+            raw = out;
+            raw.as_slice()
+        }
+        _ => return Err("unknown journal record codec".into()),
+    };
+    if encoded.len() > max {
+        return Err("oversized journal record".into());
+    }
+    BlockBundle::decode(encoded).map_err(|e| format!("journal decode: {e}"))
+}
+
 pub fn verify_block(block: &BlockBundle, network: &[u8], profile: &[u8], max: usize) -> Result<()> {
     if block.format != FORMAT || block.network != network || block.profile != profile {
         return Err("incompatible replication network/profile/format".into());
@@ -50,8 +185,17 @@ pub fn verify_block(block: &BlockBundle, network: &[u8], profile: &[u8], max: us
         || block.parent_id.len() != 32
         || block.digest.len() != 32
         || block.previous_digest.len() != 32
+        || block.before_digest.len() != 8
+        || !block.undo.is_empty()
     {
         return Err("malformed replication block identity".into());
+    }
+    if block.preimages {
+        if before_digest_of(block) != block.before_digest {
+            return Err("replication block prior values differ from their hash".into());
+        }
+    } else if block.deltas.iter().any(|d| d.before.is_some()) {
+        return Err("replication block carries unmarked prior values".into());
     }
     if u64::from_be_bytes(block.block_id[..8].try_into().unwrap()) != block.height as u64 {
         return Err("replication height differs from block ID".into());
@@ -124,6 +268,12 @@ pub struct Journal {
     pub acks: BTreeMap<String, Ack>,
     bytes: u64,
     config: AssistConfig,
+    /// Floor below which files were already removed in this process; lets the
+    /// per-block cluster check skip the directory walk.
+    swept_floor: i64,
+    /// The stored window did not continue to the current head (another
+    /// format, or blocks applied while nothing was recorded) and was dropped.
+    pub reset: bool,
 }
 
 impl Journal {
@@ -138,24 +288,59 @@ impl Journal {
         fs::create_dir_all(root.join("blocks")).map_err(|e| e.to_string())?;
         fs::create_dir_all(root.join("acks")).map_err(|e| e.to_string())?;
         let meta_path = root.join("donor.json");
-        let meta: Meta = if meta_path.exists() {
-            serde_json::from_slice(&fs::read(&meta_path).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("replication metadata: {e}"))?
+        let stored: Option<Meta> = if meta_path.exists() {
+            Some(
+                serde_json::from_slice(&fs::read(&meta_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("replication metadata: {e}"))?,
+            )
         } else {
-            let meta = Meta {
-                format: FORMAT,
-                network: network.clone(),
-                profile: profile.clone(),
-                anchor_height,
-                anchor_id,
-                anchor_digest: vec![0; 32],
-                floor: anchor_height + 1,
-            };
-            atomic_write(
-                &meta_path,
-                &serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
-            )?;
-            meta
+            None
+        };
+        // A trusted cluster's journal is a window cache, not a ledger. One
+        // that cannot continue from the current head is started again there.
+        let reset = config.trusted_cluster
+            && stored.as_ref().is_some_and(|m| {
+                m.network == network
+                    && (m.format != FORMAT
+                        || m.profile != profile
+                        || ((m.anchor_height, m.anchor_id.as_slice())
+                            != (anchor_height, anchor_id.as_slice())
+                            && !root
+                                .join("blocks")
+                                .join(format!("{anchor_height:020}.{}.pb", hex::encode(&anchor_id)))
+                                .exists()))
+            });
+        if reset {
+            // Files first: an interrupted reset is simply repeated.
+            for dir in ["blocks", "anchors"] {
+                let dir = root.join(dir);
+                if !dir.exists() {
+                    continue;
+                }
+                for item in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                    fs::remove_file(item.map_err(|e| e.to_string())?.path())
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        let meta = match stored {
+            Some(meta) if !reset => meta,
+            _ => {
+                let meta = Meta {
+                    format: FORMAT,
+                    network: network.clone(),
+                    profile: profile.clone(),
+                    anchor_height,
+                    anchor_id,
+                    anchor_digest: vec![0; 32],
+                    floor: anchor_height + 1,
+                };
+                atomic_write(
+                    &meta_path,
+                    &serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
+                )?;
+                meta
+            }
         };
         if meta.format != FORMAT
             || meta.network != network
@@ -197,6 +382,8 @@ impl Journal {
             acks,
             bytes,
             config,
+            swept_floor: 0,
+            reset,
         })
     }
 
@@ -283,8 +470,10 @@ impl Journal {
                 if bytes.len() > self.config.max_block_bytes {
                     return Err("oversized journal record".into());
                 }
-                let block = BlockBundle::decode(bytes.as_slice())
-                    .map_err(|e| format!("journal decode: {e}"))?;
+                let block = unpack(&bytes, self.config.max_block_bytes)?;
+                if !block.preimages {
+                    return Err("journal record carries no prior values".into());
+                }
                 verify_block(
                     &block,
                     &self.meta.network,
@@ -302,6 +491,9 @@ impl Journal {
     }
 
     pub fn stage(&mut self, block: &BlockBundle, imported: bool) -> Result<()> {
+        if !block.preimages {
+            return Err("write journal record requires the block's prior values".into());
+        }
         verify_block(
             block,
             &self.meta.network,
@@ -348,8 +540,12 @@ impl Journal {
                 return Err("write journal parent checksum differs".into());
             }
         }
-        let bytes = block.encode_to_vec();
-        if self.bytes.saturating_add(bytes.len() as u64) > self.config.max_journal_bytes {
+        let bytes = pack(block, self.config.compression)?;
+        // A trusted cluster is bounded by its block window. Blocks that are
+        // received but not yet solidified are outside it and are never refused.
+        if !self.config.trusted_cluster
+            && self.bytes.saturating_add(bytes.len() as u64) > self.config.max_journal_bytes
+        {
             return Err(
                 "replication journal budget exhausted; refusing an unrecorded commit".into(),
             );
@@ -403,54 +599,27 @@ impl Journal {
 
     // The caller supplies the current canonical solid bound. Closed records
     // only; required consumers hold their own independent retention cursor.
-    /// Rotate the oldest finalized heights to satisfy the fixed byte window.
-    /// Keep the latest solid parent and all reversible candidates. No peer can pin this cache.
-    pub fn cluster_reserve(&mut self, solid: i64, incoming: u64) -> Result<()> {
+    /// Keep the fixed block window of a trusted cluster. No peer can pin this
+    /// cache, and blocks above the solid bound are never counted or refused.
+    pub fn cluster_reserve(&mut self, solid: i64) -> Result<()> {
         if !self.config.trusted_cluster {
             return Ok(());
         }
-        let count_floor = (solid - self.config.retain_blocks.min(i64::MAX as u64) as i64 + 1)
-            .max(self.meta.floor);
-        if count_floor > self.meta.floor {
-            self.prune(solid)?;
-        }
-        if self.bytes.saturating_add(incoming) <= self.config.max_journal_bytes {
-            return Ok(());
-        }
-        let mut files = Vec::new();
-        for item in fs::read_dir(self.root.join("blocks")).map_err(|e| e.to_string())? {
-            let p = item.map_err(|e| e.to_string())?.path();
-            let height = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.split('.').next())
-                .and_then(|n| n.parse::<i64>().ok());
-            if p.extension().is_some_and(|e| e == "pb") {
-                if let Some(height) = height.filter(|h| *h < solid) {
-                    files.push((height, p));
-                }
-            }
-        }
-        files.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        for (height, path) in files {
-            if self.bytes.saturating_add(incoming) <= self.config.max_journal_bytes {
-                break;
-            }
-            self.meta.floor = self.meta.floor.max(height.saturating_add(1));
-            self.persist_meta()?;
-            let size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
-            fs::remove_file(path).map_err(|e| e.to_string())?;
-            self.bytes = self.bytes.saturating_sub(size);
-        }
-        if self.bytes.saturating_add(incoming) > self.config.max_journal_bytes {
-            return Err("cluster live/reversible history exceeds journal byte budget".into());
-        }
-        Ok(())
+        self.prune(solid).map(|_| ())
     }
 
     pub fn prune(&mut self, solid: i64) -> Result<usize> {
         let mut floor = (solid - self.config.retain_blocks.min(i64::MAX as u64) as i64 + 1)
             .max(self.meta.floor);
+        if self.config.trusted_cluster {
+            // Whole portions only: nothing moves until a full portion is due,
+            // so the directory is walked once per portion, not once per block.
+            let batch = self.config.prune_batch_blocks.clamp(1, i64::MAX as u64) as i64;
+            floor = self.meta.floor + (floor - self.meta.floor) / batch * batch;
+            if floor == self.meta.floor && self.swept_floor == floor {
+                return Ok(0);
+            }
+        }
         if !self.config.trusted_cluster {
             for peer in self
                 .config
@@ -489,6 +658,7 @@ impl Journal {
                 removed += 1;
             }
         }
+        self.swept_floor = floor;
         Ok(removed)
     }
 

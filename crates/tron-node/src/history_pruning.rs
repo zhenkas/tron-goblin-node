@@ -1,13 +1,13 @@
-//! Online history maintenance; deliberately absent from block execution and ACK.
+//! Online history maintenance; deliberately absent from block execution.
+//!
+//! One fixed window for every consumer of block history (peers, the event
+//! log, cluster partners): the newest `retain_blocks` applied blocks stay, and
+//! cleanup runs in whole portions of `batch_blocks`. Nothing a consumer says
+//! or fails to say moves the window; a consumer that asks for a block below
+//! it gets an explicit out-of-range answer.
 use crate::{config::HistoryPruningConfig, firehose::FirehoseWriter, storage::OpenedStores};
-use axum::{
-    extract::{DefaultBodyLimit, State},
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{extract::State, routing::get, Json, Router};
 use prost::Message;
-use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(test)]
 use tron_chainbase::RocksDbBackend;
@@ -21,9 +21,13 @@ use std::{
     time::Duration,
 };
 use tron_chainbase::{BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend, WriteOp};
-use tron_index::{HistoryAck, HistoryControl};
+use tron_index::HistoryControl;
 
 pub const CONSENSUS_MIN_BLOCKS: u64 = 65_536;
+/// How often the maintenance tasks look at the chain horizon. A portion of
+/// 1,000 blocks takes about 50 minutes to accumulate, so this only bounds how
+/// late a due portion starts.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct HistoryStores {
     blocks: Arc<dyn KvBackend>,
@@ -57,15 +61,30 @@ pub struct HistoryPruner {
     pub segments_removed: AtomicU64,
     pub undo_removed: AtomicU64,
     undo_prune_before: AtomicI64,
+    /// Period of both maintenance timers; shortened only by tests.
+    pub check_interval: Duration,
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
-pub fn prune_floor(head: i64, solid: i64, ack: i64, keep: u64) -> i64 {
+/// The retention boundary after one look at the chain: heights below the
+/// result may be deleted.
+///
+/// The window covers applied blocks only (`head` is the applied head), never
+/// drops below the consensus reserve, and never reaches past the solidified
+/// block, which doubles as the persisted chain anchor. The boundary moves in
+/// whole portions of `batch`: nothing happens until a full portion is due,
+/// so between `keep` and `keep + batch` blocks are stored.
+pub fn prune_floor(head: i64, solid: i64, floor: i64, keep: u64, batch: usize) -> i64 {
     let keep = keep.max(CONSENSUS_MIN_BLOCKS).min(i64::MAX as u64) as i64;
-    ack.min(solid.saturating_add(1))
-        .min(head.saturating_sub(keep).saturating_add(1))
-        .max(1)
+    let batch = (batch.max(1) as u64).min(i64::MAX as u64) as i64;
+    let floor = floor.max(1);
+    let target = head.saturating_sub(keep).saturating_add(1).min(solid);
+    let due = target.saturating_sub(floor);
+    if due < batch {
+        return floor;
+    }
+    floor.saturating_add(due / batch * batch)
 }
 /// Undo serves reorgs, not consumer replay. Keep every unfinalized block even
 /// if finalization temporarily falls behind the configured target window.
@@ -148,33 +167,35 @@ impl HistoryPruner {
             segments_removed: AtomicU64::new(0),
             undo_removed: AtomicU64::new(0),
             undo_prune_before: AtomicI64::new(1),
+            check_interval: CHECK_INTERVAL,
         })
     }
-    /// Validate off the ACK path. Publishing a floor never deletes its ACK anchor.
+    /// Move the boundary when a whole portion is due. The solidified block is
+    /// always above the boundary and is recorded as the chain anchor.
     pub fn begin_pass(&self) -> Result<i64, String> {
-        let Some(ack) = self.control.ack() else {
-            return Ok(self.control.floor());
-        };
         let props = DynamicPropertiesStore::new(self.stores.props.clone());
         let head = props.latest_block_header_number().ok_or("missing head")?;
         let solid = props
             .latest_solidified_block_num()
             .ok_or("missing solidified height")?;
-        if ack.height > solid {
-            return Err("ACK is not solidified yet; pruning held".into());
+        if head < 0 || solid < 0 || solid > head {
+            return Err("inconsistent chain horizon; pruning held".into());
         }
-        let canonical = BlockIndexStore::new(self.stores.index.clone())
-            .get(ack.height)
-            .map_err(err)?;
-        if canonical.as_bytes() != &ack.block_id {
-            return Err("ACK hash is not canonical; pruning held".into());
-        }
-        let floor = prune_floor(head, solid, ack.height, self.config.retain_blocks)
-            .max(self.control.floor());
-        if floor > self.control.floor() {
+        let current = self.control.floor();
+        let floor = prune_floor(
+            head,
+            solid,
+            current,
+            self.config.retain_blocks,
+            self.config.batch_blocks,
+        );
+        if floor > current {
+            let canonical = BlockIndexStore::new(self.stores.index.clone())
+                .get(solid)
+                .map_err(err)?;
             // Maintenance metadata only. Does not change node/apply fsync policy.
-            let mut anchor = ack.height.to_be_bytes().to_vec();
-            anchor.extend_from_slice(&ack.block_id);
+            let mut anchor = solid.to_be_bytes().to_vec();
+            anchor.extend_from_slice(canonical.as_bytes());
             self.meta
                 .write_batch_sync(&[
                     WriteOp::Put(b"floor".to_vec(), floor.to_be_bytes().to_vec()),
@@ -270,8 +291,8 @@ impl HistoryPruner {
             .fetch_add(bodies.len() as u64, Ordering::Relaxed);
         Ok(bodies.len() + auxiliary)
     }
-    /// No ACK dependency and no changes to block bodies, receipts or replay floors.
-    /// Peek before loading a batch: at the tip only a few new rows need deletion.
+    /// No changes to block bodies, receipts or replay floors. Deletes one whole
+    /// portion at a time and leaves a shorter overdue tail for a later pass.
     pub fn prune_undo_batch(&self) -> Result<usize, String> {
         let props = DynamicPropertiesStore::new(self.stores.props.clone());
         let head = props.latest_block_header_number().ok_or("missing head")?;
@@ -292,10 +313,10 @@ impl HistoryPruner {
             return Err("invalid undo height key".into());
         }
         let oldest = i64::from_be_bytes(key.as_slice().try_into().unwrap());
-        if oldest >= floor {
+        let limit = self.config.batch_blocks.max(1);
+        if floor.saturating_sub(oldest) < limit as i64 {
             return Ok(0);
         }
-        let limit = (floor - oldest).min(self.config.batch_blocks as i64) as usize;
         let mut ops = Vec::new();
         for (key, _) in self.stores.undo.scan_from(&start, limit).map_err(err)? {
             if key.len() != 8 {
@@ -320,57 +341,21 @@ impl HistoryPruner {
         Ok(removed)
     }
     pub fn status(&self) -> Value {
-        let ack = self
-            .control
-            .ack()
-            .map(|a| json!({"height":a.height,"block_id":hex::encode(a.block_id)}));
-        json!({"ack":ack,"ack_persistent":false,"prune_before":self.control.floor(),
+        json!({"prune_before":self.control.floor(),
             "retain_blocks":self.config.retain_blocks,"undo_retain_blocks":self.config.undo_retain_blocks,
             "undo_prune_before":self.undo_prune_before.load(Ordering::Relaxed),"undo_removed":self.undo_removed.load(Ordering::Relaxed),
-            "undo_interval_seconds":self.config.interval_seconds.min(30),"batch_blocks":self.config.batch_blocks,
-            "interval_seconds":self.config.interval_seconds,"blocks_removed":self.blocks_removed.load(Ordering::Relaxed),
+            "batch_blocks":self.config.batch_blocks,
+            "check_interval_seconds":self.check_interval.as_secs(),"blocks_removed":self.blocks_removed.load(Ordering::Relaxed),
             "segments_removed":self.segments_removed.load(Ordering::Relaxed)})
     }
-}
-#[derive(Deserialize)]
-struct AckRequest {
-    height: i64,
-    block_id: String,
-}
-async fn acknowledge(
-    State(p): State<Arc<HistoryPruner>>,
-    Json(body): Json<AckRequest>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let bytes = hex::decode(&body.block_id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid block_id hex".into()))?;
-    let block_id: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "block_id must be 32 bytes".into()))?;
-    if block_id[..8] != body.height.to_be_bytes() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "block_id height prefix does not match height".into(),
-        ));
-    }
-    let changed = p
-        .control
-        .accept(HistoryAck {
-            height: body.height,
-            block_id,
-        })
-        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
-    Ok(Json(
-        json!({"accepted":true,"changed":changed,"persistent":false,"prune_started":false}),
-    ))
 }
 async fn status(State(p): State<Arc<HistoryPruner>>) -> Json<Value> {
     Json(p.status())
 }
+/// Read-only status. The window is not controlled over the network.
 pub fn router(pruner: Arc<HistoryPruner>) -> Router {
     Router::new()
-        .route("/history/ack", post(acknowledge))
         .route("/history", get(status))
-        .layer(DefaultBodyLimit::max(4096))
         .with_state(pruner)
 }
 pub async fn run(pruner: Arc<HistoryPruner>, shutdown_signal: crate::ShutdownSignal) {
@@ -385,8 +370,7 @@ async fn run_undo(pruner: Arc<HistoryPruner>, shutdown_signal: crate::ShutdownSi
     if shutdown_signal.is_shutdown() {
         return;
     }
-    let period = Duration::from_secs(pruner.config.interval_seconds.min(30));
-    let mut timer = tokio::time::interval(period);
+    let mut timer = tokio::time::interval(pruner.check_interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! { _=shutdown.recv()=>return, _=timer.tick()=>{} }
@@ -409,10 +393,11 @@ async fn run_history(pruner: Arc<HistoryPruner>, shutdown_signal: crate::Shutdow
     if shutdown_signal.is_shutdown() {
         return;
     }
-    let period = Duration::from_secs(pruner.config.interval_seconds);
-    let startup_delay = period.min(Duration::from_secs(30));
-    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + startup_delay, period);
+    let period = pruner.check_interval;
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Cleanup below an already published boundary resumes after a restart.
+    let mut cleaned = 0i64;
     loop {
         tokio::select! { _=shutdown.recv()=>return, _=timer.tick()=>{} }
         let p = pruner.clone();
@@ -423,6 +408,10 @@ async fn run_history(pruner: Arc<HistoryPruner>, shutdown_signal: crate::Shutdow
                 continue;
             }
         };
+        if floor <= cleaned {
+            continue;
+        }
+        let mut complete = true;
         loop {
             let p = pruner.clone();
             match tokio::task::spawn_blocking(move || p.prune_batch(floor)).await {
@@ -430,6 +419,7 @@ async fn run_history(pruner: Arc<HistoryPruner>, shutdown_signal: crate::Shutdow
                 Ok(Ok(_)) => {}
                 other => {
                     tracing::error!(result=?other,"history batch failed; resume on next interval");
+                    complete = false;
                     break;
                 }
             }
@@ -442,10 +432,14 @@ async fn run_history(pruner: Arc<HistoryPruner>, shutdown_signal: crate::Shutdow
                 Ok(Ok(false)) => break,
                 other => {
                     tracing::warn!(result=?other,"history segment cleanup held");
+                    complete = false;
                     break;
                 }
             }
             tokio::select! {_=shutdown.recv()=>return,_=tokio::task::yield_now()=>{}}
+        }
+        if complete {
+            cleaned = floor;
         }
         tracing::info!(
             floor,
@@ -577,12 +571,6 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
         let floor = p.begin_pass().unwrap();
         assert_eq!(floor, 5);
         for _ in 0..4 {
@@ -603,39 +591,41 @@ mod tests {
     }
 
     #[test]
-    fn floor_respects_ack_solid_and_minimum_reserve() {
-        assert_eq!(prune_floor(100000, 99980, 90000, 70000), 30001);
-        assert_eq!(prune_floor(100000, 99980, 20000, 70000), 20000);
-        assert_eq!(prune_floor(100000, 99980, 90000, 0), 34465);
-        assert_eq!(prune_floor(20, 19, 18, 65536), 1);
+    fn floor_moves_in_whole_portions_within_window_solid_and_reserve() {
+        // Window 100k, portion 1k: nothing until a whole portion is due.
+        assert_eq!(prune_floor(100_999, 100_990, 1, 100_000, 1000), 1);
+        assert_eq!(prune_floor(101_000, 100_990, 1, 100_000, 1000), 1001);
+        assert_eq!(prune_floor(101_999, 101_990, 1001, 100_000, 1000), 1001);
+        assert_eq!(prune_floor(102_000, 101_990, 1001, 100_000, 1000), 2001);
+        // A long backlog (first start on an old database) is cut in one step,
+        // still in whole portions.
+        assert_eq!(prune_floor(350_500, 350_480, 1, 100_000, 1000), 250_001);
+        // The solidified block is never passed, even when finality stalls.
+        assert_eq!(prune_floor(500_000, 150_000, 1, 100_000, 1000), 149_001);
+        // The consensus reserve is a lower bound for the window.
+        assert_eq!(prune_floor(100_000, 99_980, 1, 0, 1), 34_465);
+        assert_eq!(prune_floor(20, 19, 1, 65_536, 1), 1);
+        // A published boundary never moves back.
+        assert_eq!(prune_floor(100_000, 99_980, 90_000, 70_000, 10), 90_000);
     }
     #[test]
-    fn no_ack_does_not_prune_and_bad_or_unfinalized_ack_is_held() {
+    fn partial_portion_is_left_alone_and_inconsistent_horizon_is_held() {
         let s = stores();
-        setup(&s, 65540, 65538);
+        setup(&s, 65537, 65535);
         add_block(&s, 1, 0, false);
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
+        // One block is past the window, the portion is two.
         assert_eq!(p.begin_pass().unwrap(), 1);
         assert_eq!(p.prune_batch(1).unwrap(), 0);
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: [9; 32],
-            })
-            .unwrap();
-        assert!(p.begin_pass().is_err());
-        assert_eq!(p.control.floor(), 1);
-        p.control
-            .accept(HistoryAck {
-                height: 65539,
-                block_id: id(65539),
-            })
-            .unwrap();
-        assert!(p.begin_pass().unwrap_err().contains("not solidified"));
+        setup(&s, 65538, 65536);
+        assert_eq!(p.begin_pass().unwrap(), 3);
+        setup(&s, 65540, 65541);
+        assert!(p.begin_pass().unwrap_err().contains("inconsistent"));
+        assert_eq!(p.control.floor(), 3);
     }
     #[test]
-    fn bounded_batches_remove_all_history_keep_current_and_ack_anchor() {
+    fn bounded_batches_remove_all_history_keep_current_and_anchor() {
         let s = stores();
         setup(&s, 65540, 65538);
         let (one, ids) = add_block(&s, 1, 0, true);
@@ -646,12 +636,6 @@ mod tests {
         s.props.put(b"state-sentinel", b"unchanged").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
         let floor = p.begin_pass().unwrap();
         assert_eq!(floor, 5);
         p.prune_batch(floor).unwrap();
@@ -693,12 +677,6 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
         let f = p.begin_pass().unwrap();
         p.prune_batch(f).unwrap();
         assert_eq!(
@@ -754,12 +732,6 @@ mod tests {
         let (old, ids) = add_block(&s, 1, 0, true);
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
         let f = p.begin_pass().unwrap();
         wrapper.fail.store(true, Ordering::SeqCst);
         assert!(p.prune_batch(f).is_err());
@@ -769,33 +741,32 @@ mod tests {
         assert!(!s.blocks.contains(old.as_bytes()).unwrap());
     }
     #[tokio::test]
-    async fn rest_ack_has_no_database_or_pruning_side_effect_and_restart_loses_it() {
+    async fn status_is_read_only_and_published_boundary_survives_restart() {
         let s = stores();
         setup(&s, 65540, 65538);
         add_block(&s, 1, 0, false);
         let meta = mem();
         let dir = tempfile::tempdir().unwrap();
         let p = Arc::new(pruner(s.clone(), meta.clone(), dir.path()));
-        let _ = acknowledge(
-            State(p.clone()),
-            Json(AckRequest {
-                height: 65538,
-                block_id: hex::encode(id(65538)),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(p.control.floor(), 1);
+        let Json(before) = status(State(p.clone())).await;
+        assert_eq!(before["prune_before"], 1);
+        assert_eq!(before["retain_blocks"], 65536);
+        assert_eq!(before["batch_blocks"], 2);
+        assert!(before.get("ack").is_none());
         assert_eq!(meta.get(b"floor").unwrap(), None);
         assert_eq!(p.blocks_removed.load(Ordering::Relaxed), 0);
-        assert_eq!(p.undo_removed.load(Ordering::Relaxed), 0);
         assert!(s.undo.contains(&1i64.to_be_bytes()).unwrap());
         let floor = p.begin_pass().unwrap();
         assert_eq!(floor, 5);
+        // The anchor is the solidified block, which stays above the boundary.
+        assert_eq!(
+            meta.get(b"anchor").unwrap().unwrap(),
+            [65538i64.to_be_bytes().as_slice(), &id(65538)].concat()
+        );
         let restarted =
             HistoryPruner::from_parts(p.config.clone(), s, meta, p.writer.clone()).unwrap();
         assert_eq!(restarted.control.floor(), 5);
-        assert_eq!(restarted.control.ack(), None);
+        assert_eq!(restarted.begin_pass().unwrap(), 5);
     }
 
     #[test]
@@ -840,25 +811,19 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), meta, dir.path());
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
         assert!(p.begin_pass().is_err());
         assert_eq!(p.control.floor(), 1);
         assert!(p.prune_batch(5).is_err());
         assert!(s.blocks.contains(old.as_bytes()).unwrap());
     }
     #[tokio::test]
-    async fn socket_ack_waits_for_independent_timer_and_shutdown_is_sticky() {
+    async fn socket_serves_status_only_while_timer_prunes_and_shutdown_is_sticky() {
         let s = stores();
         setup(&s, 65540, 65538);
         let (old, _) = add_block(&s, 1, 0, false);
         let dir = tempfile::tempdir().unwrap();
         let mut p = pruner(s.clone(), mem(), dir.path());
-        p.config.interval_seconds = 1;
+        p.check_interval = Duration::from_secs(1);
         let p = Arc::new(p);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -869,17 +834,23 @@ mod tests {
         let shutdown = crate::ShutdownSignal::new();
         let maintenance = tokio::spawn(run(p.clone(), shutdown.clone()));
         tokio::task::yield_now().await;
-        let body = json!({"height":65538,"block_id":hex::encode(id(65538))}).to_string();
-        let response=tokio::task::spawn_blocking(move||{
-            use std::io::{Read,Write};
-            let mut socket=std::net::TcpStream::connect(addr).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            write!(socket,"POST /history/ack HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
-            let mut result=String::new();socket.read_to_string(&mut result).unwrap();result
-        }).await.unwrap();
+        let request = |line: &'static str| {
+            tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut socket = std::net::TcpStream::connect(addr).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                write!(socket, "{line} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                let mut result = String::new();
+                socket.read_to_string(&mut result).unwrap();
+                result
+            })
+        };
+        let response = request("GET /history").await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("\"prune_started\":false"));
-        assert_eq!(p.control.floor(), 1);
+        assert!(response.contains("\"prune_before\":1"));
+        // The window cannot be moved from outside.
+        let removed = request("POST /history/ack").await.unwrap();
+        assert!(removed.starts_with("HTTP/1.1 404"));
         assert!(s.blocks.contains(old.as_bytes()).unwrap());
         tokio::time::timeout(Duration::from_secs(3), async {
             while s.blocks.contains(old.as_bytes()).unwrap() {
@@ -907,7 +878,7 @@ mod tests {
         assert_eq!(undo_floor(i64::MAX, i64::MAX - 18, 10000), i64::MAX - 9999);
     }
     #[test]
-    fn undo_prunes_without_ack_in_bounded_batches_and_preserves_replay_data() {
+    fn undo_prunes_in_whole_portions_and_preserves_replay_data() {
         let s = stores();
         setup(&s, 10010, 10008);
         let (body, ids) = add_block(&s, 1, 0, true);
@@ -917,7 +888,6 @@ mod tests {
         s.props.put(b"state-sentinel", b"unchanged").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        assert_eq!(p.control.ack(), None);
         assert_eq!(p.prune_undo_batch().unwrap(), 2);
         assert_eq!(p.prune_undo_batch().unwrap(), 2);
         assert_eq!(p.prune_undo_batch().unwrap(), 0);
@@ -933,27 +903,22 @@ mod tests {
             s.props.get(b"state-sentinel").unwrap(),
             Some(b"unchanged".to_vec())
         );
+        // Undo cleanup does not move the block-history boundary.
         assert_eq!(p.control.floor(), 1);
-        // An ACK that cannot authorize history deletion cannot block undo maintenance.
-        p.control
-            .accept(HistoryAck {
-                height: 10009,
-                block_id: id(10009),
-            })
-            .unwrap();
-        assert!(p.begin_pass().is_err());
+        assert_eq!(p.begin_pass().unwrap(), 1);
         assert_eq!(p.prune_undo_batch().unwrap(), 0);
     }
     #[test]
     fn stalled_finality_and_inconsistent_horizons_hold_required_undo() {
         let s = stores();
         setup(&s, 20000, 5);
-        for h in [5i64, 6, 10001, 20000] {
+        for h in [4i64, 5, 6, 10001, 20000] {
             s.undo.put(&h.to_be_bytes(), b"undo").unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
         let p = pruner(s.clone(), mem(), dir.path());
-        assert_eq!(p.prune_undo_batch().unwrap(), 1);
+        assert_eq!(p.prune_undo_batch().unwrap(), 2);
+        assert!(!s.undo.contains(&5i64.to_be_bytes()).unwrap());
         assert!(s.undo.contains(&6i64.to_be_bytes()).unwrap());
         setup(&s, 20000, 20001);
         assert!(p.prune_undo_batch().is_err());
@@ -982,10 +947,13 @@ mod tests {
         let restarted =
             HistoryPruner::from_parts(p.config.clone(), s.clone(), mem(), p.writer.clone())
                 .unwrap();
-        assert_eq!(restarted.prune_undo_batch().unwrap(), 1);
+        // One overdue row is less than a portion: it waits for the next one.
         assert_eq!(restarted.prune_undo_batch().unwrap(), 0);
+        assert!(s.undo.contains(&10i64.to_be_bytes()).unwrap());
         assert!(s.undo.contains(&11i64.to_be_bytes()).unwrap());
-        assert_eq!(restarted.control.ack(), None);
+        setup(&s, 10011, 10009);
+        assert_eq!(restarted.prune_undo_batch().unwrap(), 2);
+        assert!(!s.undo.contains(&11i64.to_be_bytes()).unwrap());
     }
     #[test]
     fn undo_rocksdb_deletion_survives_close_and_reopen() {
@@ -1000,22 +968,26 @@ mod tests {
             }
             let p = pruner(s.clone(), mem(), &dir.path().join("journal"));
             assert_eq!(p.prune_undo_batch().unwrap(), 2);
-            assert_eq!(p.prune_undo_batch().unwrap(), 1);
+            assert_eq!(p.prune_undo_batch().unwrap(), 0);
         }
         let backend = RocksDbBackend::open_tuned(&undo_path, 1, 8).unwrap();
         assert_eq!(
             backend.scan_from(&1i64.to_be_bytes(), 10).unwrap(),
-            vec![(4i64.to_be_bytes().to_vec(), b"undo".to_vec())]
+            vec![
+                (3i64.to_be_bytes().to_vec(), b"undo".to_vec()),
+                (4i64.to_be_bytes().to_vec(), b"undo".to_vec())
+            ]
         );
     }
     #[tokio::test]
-    async fn undo_startup_maintenance_is_independent_of_hourly_history_and_ack() {
+    async fn undo_startup_maintenance_is_independent_of_block_history() {
         let s = stores();
         setup(&s, 10010, 10008);
         let (body, _) = add_block(&s, 1, 0, false);
+        s.undo.put(&2i64.to_be_bytes(), b"undo").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut p = pruner(s.clone(), mem(), dir.path());
-        p.config.interval_seconds = 3600;
+        p.check_interval = Duration::from_secs(3600);
         let p = Arc::new(p);
         let shutdown = crate::ShutdownSignal::new();
         let maintenance = tokio::spawn(run(p.clone(), shutdown.clone()));
@@ -1063,13 +1035,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let mut p = pruner(s.clone(), mem(), dir.path());
-        p.config.interval_seconds = 1;
-        p.control
-            .accept(HistoryAck {
-                height: 65538,
-                block_id: id(65538),
-            })
-            .unwrap();
+        p.check_interval = Duration::from_secs(1);
         let p = Arc::new(p);
         let shutdown = crate::ShutdownSignal::new();
         let maintenance = tokio::spawn(run(p.clone(), shutdown.clone()));

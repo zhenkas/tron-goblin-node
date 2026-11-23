@@ -71,8 +71,7 @@ impl AssistRuntime {
             .map_err(|e| format!("assist requires initialized genesis: {e}"))?
             .as_bytes()
             .to_vec();
-        // Version this tag whenever canonical write/event semantics change.
-        let profile = Sha256::digest(b"tron-assist-v1/full-deltas-ret-native-events-undo").to_vec();
+        let profile = Sha256::digest(journal::PROFILE).to_vec();
         let (height, id) = read_head(&stores)?;
         let root = data_dir.join("assisted-sync");
         let journal = Journal::open(
@@ -85,8 +84,18 @@ impl AssistRuntime {
         )?;
         let cursor_path = root.join("receiver.json");
         let cursor: ReceiverCursor = if cursor_path.exists() {
-            serde_json::from_slice(&fs::read(&cursor_path).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("receiver cursor: {e}"))?
+            let mut cursor: ReceiverCursor =
+                serde_json::from_slice(&fs::read(&cursor_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("receiver cursor: {e}"))?;
+            if journal.reset && !cursor.digest.is_empty() {
+                // The old chain of record digests ended with the dropped window.
+                cursor.digest.clear();
+                journal::atomic_write(
+                    &cursor_path,
+                    &serde_json::to_vec(&cursor).map_err(|e| e.to_string())?,
+                )?;
+            }
+            cursor
         } else {
             ReceiverCursor {
                 height,
@@ -165,12 +174,15 @@ impl AssistRuntime {
             head_id,
             solid,
             solid_id,
-            retained_from: self
-                .journal
-                .lock()
-                .map_err(|_| "journal poisoned")?
-                .meta
-                .floor,
+            retained_from: if self.config.keeps_journal() {
+                self.journal
+                    .lock()
+                    .map_err(|_| "journal poisoned")?
+                    .meta
+                    .floor
+            } else {
+                i64::MAX // A receiver-only member has nothing to give.
+            },
             mode: if self.is_assisted() {
                 "assisted"
             } else {
@@ -196,6 +208,9 @@ impl AssistRuntime {
             return Ok(None);
         }
         let id = self.canonical_id(next)?;
+        if !self.config.keeps_journal() {
+            return Err("HISTORY_GAP: this member records no block changes".into());
+        }
         let journal = self.journal.lock().map_err(|_| "journal poisoned")?;
         if next < journal.meta.floor {
             return Err("HISTORY_GAP: receiver needs a newer consistent snapshot".into());
@@ -216,7 +231,8 @@ impl AssistRuntime {
         {
             return Err("STATE_DIGEST_MISMATCH: receiver anchor writes differ".into());
         }
-        Ok(Some(block))
+        // Prior values stay here; the partner proves them from its own state.
+        Ok(Some(journal::bare(&block)))
     }
 
     pub fn accept_ack(&self, peer: &str, mut ack: wire::Ack) -> Result<()> {
@@ -270,31 +286,38 @@ impl AssistRuntime {
     pub fn fetch_cursor(&self) -> Result<wire::Fetch> {
         let (height, id) = self.head()?;
         let cursor = self.cursor.lock().map_err(|_| "cursor poisoned")?;
-        let digest = if cursor.height == height && cursor.block_id == id {
-            cursor.digest.clone()
+        if cursor.height == height && cursor.block_id == id {
+            return Ok(wire::Fetch {
+                after_height: height,
+                after_id: id,
+                after_digest: cursor.digest.clone(),
+                after_semantic_digest: Vec::new(),
+            });
+        }
+        // The head was executed here. A member that records its own changes
+        // proves them; a receiver-only member names the block alone and every
+        // block it takes is checked against its state by the prior-value hash.
+        let local = if self.config.keeps_journal() {
+            let journal = self.journal.lock().map_err(|_| "journal poisoned")?;
+            match journal.read(height, &id)? {
+                Some(block) => Some(block),
+                // Recording starts above this block; it has no record yet.
+                None if journal.meta.anchor_height == height && journal.meta.anchor_id == id => {
+                    None
+                }
+                None => return Err("local anchor receipt missing".into()),
+            }
         } else {
-            self.journal
-                .lock()
-                .map_err(|_| "journal poisoned")?
-                .read(height, &id)?
-                .map(|b| b.digest)
-                .unwrap_or_default()
+            None
         };
         Ok(wire::Fetch {
             after_height: height,
-            after_id: id.clone(),
-            after_digest: digest,
-            after_semantic_digest: if cursor.height != height || cursor.block_id != id {
-                let block = self
-                    .journal
-                    .lock()
-                    .map_err(|_| "journal poisoned")?
-                    .read(height, &id)?
-                    .ok_or("local anchor receipt missing")?;
-                journal::semantic_digest(&block)?
-            } else {
-                Vec::new()
+            after_id: id,
+            after_semantic_digest: match &local {
+                Some(block) => journal::semantic_digest(block)?,
+                None => Vec::new(),
             },
+            after_digest: local.map(|b| b.digest).unwrap_or_default(),
         })
     }
 
@@ -377,7 +400,7 @@ impl AssistRuntime {
             if bytes.len() > self.config.max_block_bytes {
                 return Err("oversized pending import".into());
             }
-            let block = wire::BlockBundle::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+            let block = journal::unpack(&bytes, self.config.max_block_bytes)?;
             let _writer = self.leadership.lock_apply();
             self.apply_prepared(&block, true)?;
         }
@@ -474,17 +497,22 @@ impl AssistRuntime {
             return Err("import does not extend the local durable head".into());
         }
         self.validate_payload(block)?;
-        for delta in &block.deltas {
-            let store = UndoStoreId::from_u8(delta.store as u8).ok_or("unknown store")?;
-            if state_backend(&self.stores, store)
-                .get(&delta.key)
-                .map_err(|e| e.to_string())?
-                != delta.before
+        // The values these writes replace are read from this node's own state:
+        // their hash must be the donor's, and they become the undo record.
+        let block = &self.with_local_preimages(block)?;
+        if !self.config.keeps_journal() {
+            // No local records to chain to: consecutive imports are chained
+            // through the receiver cursor instead.
+            let cursor = self.cursor.lock().map_err(|_| "cursor poisoned")?;
+            if cursor.height == head
+                && cursor.block_id == id
+                && cursor.digest.len() == 32
+                && cursor.digest != [0; 32]
+                && cursor.digest != block.previous_digest
             {
-                return Err("STATE_PREIMAGE_MISMATCH: snapshot/writes differ from donor".into());
+                return Err("imported block does not continue the received chain".into());
             }
-        }
-        if let Some(proof) = proof {
+        } else if let Some(proof) = proof {
             let journal = self.journal.lock().map_err(|_| "journal poisoned")?;
             let local = journal
                 .read(head, &id)?
@@ -494,7 +522,10 @@ impl AssistRuntime {
             }
             journal.bind_parent(head, &id, &block.previous_digest)?;
         }
-        journal::atomic_write(&self.root.join("incoming.pb"), &block.encode_to_vec())?;
+        journal::atomic_write(
+            &self.root.join("incoming.pb"),
+            &journal::pack(block, self.config.compression)?,
+        )?;
         self.apply_prepared(block, false)?;
         Ok(wire::Ack {
             height: block.height,
@@ -502,6 +533,25 @@ impl AssistRuntime {
             digest: block.digest.clone(),
             semantic_digest: Vec::new(),
         })
+    }
+
+    fn with_local_preimages(&self, bundle: &wire::BlockBundle) -> Result<wire::BlockBundle> {
+        let mut local = bundle.clone();
+        for delta in &mut local.deltas {
+            let store = u8::try_from(delta.store)
+                .ok()
+                .and_then(UndoStoreId::from_u8)
+                .ok_or("unknown store")?;
+            delta.before = state_backend(&self.stores, store)
+                .get(&delta.key)
+                .map_err(|e| e.to_string())?;
+        }
+        if journal::before_digest_of(&local) != local.before_digest {
+            report_state_mismatch(local.height);
+            return Err("STATE_PREIMAGE_MISMATCH: snapshot/writes differ from donor".into());
+        }
+        local.preimages = true;
+        Ok(local)
     }
 
     fn validate_payload(&self, bundle: &wire::BlockBundle) -> Result<(Block, fh::BlockApplied)> {
@@ -531,7 +581,6 @@ impl AssistRuntime {
                 "replication bundle has incomplete or mismatched block events/receipts".into(),
             );
         }
-        tron_chainbase::BlockUndoRecord::decode(&bundle.undo).map_err(|e| e.to_string())?;
         Ok((block, event))
     }
 
@@ -572,7 +621,7 @@ impl AssistRuntime {
             .map_err(|e| e.to_string())?;
         self.stores
             .block_undo
-            .put(&bundle.height.to_be_bytes(), &bundle.undo)
+            .put(&bundle.height.to_be_bytes(), &journal::undo_record(bundle)?)
             .map_err(|e| e.to_string())?;
 
         for backend in [
@@ -614,9 +663,12 @@ impl AssistRuntime {
         if !parent && !partial {
             return Err("pending import head is neither parent nor partial committed block".into());
         }
-        {
+        if !bundle.preimages {
+            return Err("pending import carries no prior values".into());
+        }
+        if self.config.keeps_journal() {
             let mut journal = self.journal.lock().map_err(|_| "journal poisoned")?;
-            journal.cluster_reserve(bundle.height - 1, bundle.encoded_len() as u64)?;
+            journal.cluster_reserve(bundle.height - 1)?;
             journal.stage(bundle, true)?;
         }
         let mut batches: BTreeMap<u32, Vec<WriteOp>> = BTreeMap::new();
@@ -700,6 +752,31 @@ impl AssistRuntime {
     }
 }
 
+/// A partner's block replaces values this node does not have: the two states
+/// differ. The block is refused and the node keeps validating on its own, but
+/// the difference itself needs attention. Raised for the first such block and
+/// then at most once in ten minutes while the condition lasts.
+pub(super) fn report_state_mismatch(height: i64) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|at| at.elapsed().as_secs() < 600) {
+        return;
+    }
+    *last = Some(Instant::now());
+    tracing::error!(
+        height,
+        "cluster block refused: local state differs from the partner's"
+    );
+    crate::critical_notifications::report(
+        critical_notify::CriticalEvent::new(
+            "node_cluster_state_mismatch",
+            "Cluster partner's block does not match this node's state",
+        )
+        .context("block", height),
+        false,
+    );
+}
+
 pub fn read_head(stores: &crate::storage::OpenedStores) -> Result<(i64, Vec<u8>)> {
     let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
     let height = dp
@@ -751,10 +828,24 @@ impl BlockCommitObserver for AssistRuntime {
         report: &BlockExecutionReport,
         undo: &tron_chainbase::BlockUndoRecord,
     ) -> Result<()> {
+        if !self.config.keeps_journal() {
+            return Ok(()); // Receiver only: nothing is recorded for partners.
+        }
         let deltas = report
             .state_deltas
             .as_ref()
             .ok_or("replication requires complete state deltas")?;
+        // The undo record is rebuilt from these prior values on a partner and
+        // after a crash here, so both captures must describe the same writes.
+        if undo.entries.len() != deltas.len()
+            || undo
+                .entries
+                .iter()
+                .zip(deltas)
+                .any(|(u, d)| u.store != d.store || u.key != d.key || u.before != d.before)
+        {
+            return Err("captured state deltas and the undo record differ".into());
+        }
         let id = report.block_id.as_bytes().to_vec();
         let raw = block
             .block_header
@@ -822,15 +913,17 @@ impl BlockCommitObserver for AssistRuntime {
             raw_block,
             transaction_ret: ret.encode_to_vec(),
             firehose_apply: event.encode_to_vec(),
-            undo: undo.encode(),
+            undo: Vec::new(),
             rotation,
             digest: Vec::new(),
+            before_digest: Vec::new(),
+            preimages: true,
         };
-        bundle
-            .deltas
-            .sort_by(|a, b| (a.store, &a.key).cmp(&(b.store, &b.key)));
+        // The executor hands the changes over in their final order; the hash
+        // and every partner follow that order as it is.
+        bundle.before_digest = journal::before_digest_of(&bundle);
         bundle.digest = journal::block_digest(&bundle);
-        journal.cluster_reserve(solid, bundle.encoded_len() as u64)?;
+        journal.cluster_reserve(solid)?;
         journal.stage(&bundle, false)
     }
 }

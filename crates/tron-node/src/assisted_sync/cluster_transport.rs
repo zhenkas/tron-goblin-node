@@ -124,7 +124,11 @@ pub(super) async fn link(
                         send(&tx,M::SnapshotAccepted(work(move||r.snapshot_release(&id,&request)).await?)).await?;
                     },
                     M::SnapshotState(_)|M::SnapshotChunk(_)|M::SnapshotAccepted(_)=>return Err("snapshot response outside empty bootstrap".into()),
-                    M::Failure(e)=>return Err(format!("{}: {}",e.code,e.detail)),
+                    M::Failure(e)=>{
+                        // The partner compared this node's proof of its head with its own record.
+                        if e.code=="STATE_DIGEST_MISMATCH"{super::runtime::report_state_mismatch(rt.head().map(|h|h.0).unwrap_or(-1));}
+                        return Err(format!("{}: {}",e.code,e.detail))
+                    },
                 }
             }
         }

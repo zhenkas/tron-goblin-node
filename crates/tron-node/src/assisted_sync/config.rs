@@ -19,7 +19,18 @@ pub struct AssistConfig {
     pub enter_after_blocks: u64,
     pub enter_after_checks: u32,
     pub cooldown_seconds: u64,
+    /// Window of solidified blocks kept in the write journal for partners.
+    /// Zero in a trusted cluster makes this node a receiver only: it records
+    /// nothing for partners and can only take blocks from them.
     pub retain_blocks: u64,
+    /// Packing of the journal records on disk.
+    pub compression: Compression,
+    /// Cleanup portion in a trusted cluster. Not a key of this section: the
+    /// node fills it from the one shared `history.batch_blocks`.
+    #[serde(skip, default = "default_prune_batch_blocks")]
+    pub prune_batch_blocks: u64,
+    /// Byte budget of the acknowledged (non-cluster) journal. A trusted
+    /// cluster is bounded by `retain_blocks` alone.
     pub max_journal_bytes: u64,
     pub max_block_bytes: usize,
     /// Bootstrap an empty data directory before opening any ledger/RPC.
@@ -29,6 +40,21 @@ pub struct AssistConfig {
     /// Change only to explicitly replace an unfinished bootstrap session.
     pub bootstrap_reset_token: String,
     pub max_snapshot_bytes: u64,
+}
+
+fn default_prune_batch_blocks() -> u64 {
+    1_000
+}
+
+/// `none` writes records as they are, `low` is fast compression and `high`
+/// the strongest (slower) one. Records of any level stay readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    None,
+    #[default]
+    Low,
+    High,
 }
 
 impl Default for AssistConfig {
@@ -49,6 +75,8 @@ impl Default for AssistConfig {
             enter_after_checks: 3,
             cooldown_seconds: 30,
             retain_blocks: 10_000,
+            compression: Compression::Low,
+            prune_batch_blocks: default_prune_batch_blocks(),
             max_journal_bytes: 32 * 1024 * 1024 * 1024,
             max_block_bytes: 64 * 1024 * 1024,
             bootstrap: true,
@@ -75,6 +103,11 @@ pub struct AssistPeer {
 }
 
 impl AssistConfig {
+    /// False for a receiver-only member of a trusted cluster.
+    pub fn keeps_journal(&self) -> bool {
+        self.retain_blocks > 0
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !self.enable {
             return Ok(());
@@ -103,7 +136,7 @@ impl AssistConfig {
             return Err("assist.max_block_bytes must be 1 KiB..256 MiB".into());
         }
         if self.max_journal_bytes < self.max_block_bytes as u64
-            || self.retain_blocks == 0
+            || (self.retain_blocks == 0 && !self.trusted_cluster)
             || self.enter_after_blocks == 0
             || self.enter_after_checks == 0
         {

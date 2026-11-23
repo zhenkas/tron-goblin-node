@@ -83,7 +83,7 @@ for(const role of roles){
   '[index]','enable = true','capture_state_deltas = true',...indexCaptureLines(captureHistory),
   '[index.archive]','enabled = true','mode = "rolling"','retain_blocks = 100000',
   '[index.firehose]','enable = true','retain_mb = 1024',
-  '[index.firehose.history]','enable = true','retain_blocks = 65536','undo_retain_blocks = 10000','batch_blocks = 128','interval_seconds = 3600','ack_port = '+(n+5),
+  '[index.firehose.history]','enable = true','retain_blocks = 100000','undo_retain_blocks = 10000','batch_blocks = 1000','status_port = '+(n+5),
   ...(producer?['[witness]','max_txs_per_block = 1000']:[])
  ];
  await writeFile(join(root,role+'.toml'),lines.join('\n')+'\n',{mode:0o600,flag:'wx'});

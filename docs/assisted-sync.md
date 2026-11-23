@@ -161,9 +161,28 @@ silently switch to an unverified or incomplete state.
 ## Block and event durability
 
 Each protobuf bundle contains chain/profile identity, height and parent ID,
-ordered store deltas with before/after images, original raw block, transaction
+the ordered store changes (key and new value), original raw block, transaction
 receipts, complete Firehose facts (including VM logs, internal transactions and
-native TRX balance changes), undo data and a chained SHA256 digest.
+native TRX balance changes), one hash of the replaced values and a chained
+SHA256 digest.
+
+The values a block replaces are not transmitted. `before_digest` is one XXH64
+over them, taken in the order of the changes: the number of changes, then for
+each one its store, its length-prefixed key and either an "absent" flag or a
+"present" flag with the length-prefixed value. The receiver reads the same keys
+from its own state, computes the same hash and refuses the block with
+`STATE_PREIMAGE_MISMATCH` when it differs. The values it has just read become
+its undo record, so undo data is not transmitted either. A refused block also
+raises the critical event `node_cluster_state_mismatch` (for the first such
+block, then at most once in ten minutes): the node keeps validating on its own,
+but two members with different state need attention. A node's own journal
+records keep the replaced values next to the changes (`preimages`): they restore
+the undo record after a crash and are stripped again on export. The block digest
+is taken over the transmitted form and is the same with or without them.
+
+Journal records are packed on disk according to `compression`: `none`, `low`
+(fast, the default) or `high` (strongest, slower). Records of any level stay
+readable after the setting changes.
 
 The donor exports only canonical solid records. Candidates from uncommitted
 or abandoned branches are never exported. A failed pre-commit journal write
@@ -213,13 +232,13 @@ using them, hardlink only immutable SSTs and copy mutable metadata/event logs.
 An independently executed receipt may contain cache-dependent no-op captures,
 and its earlier journal checksum chain can differ without different state.
 When re-entering assisted mode, Fetch carries an explicit logical anchor proof:
-the canonical block, effective before/after changes, receipts, events and undo,
+the canonical block, effective before/after changes, receipts and events,
 excluding no-op changes and the previous checksum. The donor validates that
 proof before exporting. The receiver checks every incoming preimage before
 durably binding its parent to the donor chain. Original local receipts remain
 preserved when an equivalent donor receipt replaces their active journal path.
 Local-execution ACKs use the same checked proof; no equality by block ID alone
-is used to release required history. Existing journal records/hashes remain valid.
+is used to release required history.
 
 ## Persistent processing statistics
 
@@ -264,7 +283,7 @@ enter_after_blocks = 3
 enter_after_checks = 3
 cooldown_seconds = 30
 retain_blocks = 10000
-max_journal_bytes = 34359738368
+compression = "low"
 
 [[assist.peers]]
 id = "tron-b"
@@ -291,13 +310,32 @@ member to take over; with no eligible member, ordinary P2P validation can contin
 This is trusted execution, not a new consensus or quorum protocol.
 
 There are no inter-node replication ACK messages or per-peer retention cursors.
-Old legacy ACK files are preserved but do not pin the journal. Both block count
-and bytes bound the recent window; the byte limit can shorten the configured
-10,000-block window. At a three-second cadence 10,000 blocks is about 8h20m.
-Unfinalized/reversible records still required for safe execution are not silently
-discarded: an insufficient budget is an explicit error. A disconnected member or
-an unfinished snapshot cannot retain history outside the window. A history gap
-requires ordinary block execution or a new snapshot; blocks are never skipped.
+Old legacy ACK files are preserved but do not pin the journal. The recent window
+is counted in solidified blocks only: `retain_blocks`, 10,000 by default, about
+eight hours at a three-second cadence. `max_journal_bytes` has no effect in cluster
+mode. The window is cut in whole portions of the node's shared
+`[index.firehose.history] batch_blocks` (1,000 by default): nothing is removed
+until a full portion is due, so up to `retain_blocks + batch_blocks` solidified
+records are stored. Records above the solid bound — received or produced but
+not finalized yet — are outside the window; they are never refused or discarded,
+so a member that is far behind can temporarily hold more. A disconnected member
+or an unfinished snapshot cannot retain history outside the window. A member
+names the block it continues from; a request below the window is answered with
+an explicit history gap, which requires ordinary block execution or a new
+snapshot. Blocks are never skipped.
+
+`retain_blocks = 0` makes a member a receiver only. It records nothing for its
+partners, so its own block execution pays nothing for the cluster, and it can
+only take blocks: it announces no history and answers a request with a history
+gap. Having no records of its own, it names the block it continues from without
+a digest; every block it takes is still proved against its state by the hash of
+replaced values, and consecutive imports are chained through its cursor. Use it
+for a slower member next to one that keeps the window.
+
+A journal that cannot continue from the node's current head — written by another
+record format, or interrupted while the member recorded nothing — is dropped at
+start and recording begins again from that head. The window is a cache of recent
+changes, not a ledger.
 
 An empty node can bootstrap from any configured member and resume its durable
 snapshot download after restart. A source change restarts an incomplete download

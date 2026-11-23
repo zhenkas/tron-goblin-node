@@ -54,6 +54,8 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 tar.workspace = true
 flate2.workspace = true
+# Fast non-cryptographic hash of a block's prior values in cluster records.
+twox-hash = "1.6"
 rand = "0.8"
 libc = "0.2"
 

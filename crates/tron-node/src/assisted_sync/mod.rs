@@ -5,7 +5,7 @@ mod bootstrap_transport;
 mod config;
 pub use bootstrap_transport::receive as receive_bootstrap;
 pub mod journal;
-pub use config::{AssistConfig, AssistPeer};
+pub use config::{AssistConfig, AssistPeer, Compression};
 mod runtime;
 pub use runtime::AssistRuntime;
 

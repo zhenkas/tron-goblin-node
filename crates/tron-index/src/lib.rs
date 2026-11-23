@@ -31,7 +31,7 @@ pub mod engine;
 pub mod extract;
 pub mod firehose_log;
 pub mod history_control;
-pub use history_control::{HistoryAck, HistoryControl};
+pub use history_control::HistoryControl;
 pub mod keys;
 pub mod query;
 pub mod rows;

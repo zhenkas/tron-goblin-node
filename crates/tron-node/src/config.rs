@@ -2453,7 +2453,7 @@ pub struct IndexFirehoseConfig {
     /// retained entry (visible as a seq jump). Default 32 GiB.
     #[serde(default = "default_firehose_retain_mb", alias = "retainMb")]
     pub retain_mb: u64,
-    /// Online block/receipt/journal retention, authorized by a memory-only REST ACK.
+    /// Online block/receipt/event-log retention: a fixed window of applied blocks.
     #[serde(default)]
     pub history: HistoryPruningConfig,
 }
@@ -2468,15 +2468,19 @@ impl Default for IndexFirehoseConfig {
 #[serde(default)]
 pub struct HistoryPruningConfig {
     pub enable: bool,
+    /// Window of applied blocks kept for peers and event-log consumers.
     pub retain_blocks: u64,
     /// Independent finalized undo horizon; never gates Firehose replay.
     pub undo_retain_blocks: u64,
+    /// Cleanup portion shared by every history store: nothing is removed
+    /// until this many blocks are due, and exactly this many go at a time.
     pub batch_blocks: usize,
-    pub interval_seconds: u64,
-    pub ack_port: u16,
+    /// Loopback port of the read-only status endpoint (`GET /history`).
+    #[serde(alias = "ack_port")]
+    pub status_port: u16,
 }
 impl Default for HistoryPruningConfig {
-    fn default() -> Self { Self { enable: false, retain_blocks: 1_000_000, undo_retain_blocks: 10_000, batch_blocks: 128, interval_seconds: 3600, ack_port: 28092 } }
+    fn default() -> Self { Self { enable: false, retain_blocks: 100_000, undo_retain_blocks: 10_000, batch_blocks: 1_000, status_port: 28092 } }
 }
 impl HistoryPruningConfig {
     pub fn validate(&self) -> Result<(), String> {
@@ -2487,8 +2491,7 @@ impl HistoryPruningConfig {
             return Err("history.undo_retain_blocks must be positive and fit i64".into());
         }
         if !(1..=4096).contains(&self.batch_blocks) { return Err("history.batch_blocks must be 1..4096".into()); }
-        if !(1..=31_536_000).contains(&self.interval_seconds) { return Err("history.interval_seconds must be 1..31536000".into()); }
-        if self.ack_port == 0 { return Err("history.ack_port must be nonzero".into()); }
+        if self.status_port == 0 { return Err("history.status_port must be nonzero".into()); }
         Ok(())
     }
 }

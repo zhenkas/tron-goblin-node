@@ -1,8 +1,10 @@
-# ACK-limited history pruning and height replay
+# Fixed-window history pruning and height replay
 
-The node owns a loopback ACK endpoint and independent history-maintenance
-task. Block execution, state commits, checkpointing and Firehose fsync cadence
-remain unchanged. There is no indexer backpressure on block apply.
+The node keeps a fixed window of block history and deletes everything older,
+so the data directory grows with the chain state rather than with the number
+of blocks. Maintenance runs in its own tasks. Block execution, state commits,
+checkpointing and Firehose fsync cadence are unchanged, and no consumer can
+slow down or hold block apply.
 
 ## Configuration
 
@@ -17,120 +19,115 @@ enable = true
 
 [index.firehose.history]
 enable = true
-retain_blocks = 150000
+retain_blocks = 100000
 undo_retain_blocks = 10000
-batch_blocks = 128
-interval_seconds = 3600
-ack_port = 28092
+batch_blocks = 1000
+status_port = 28092
 ~~~
 
-retain_blocks is a minimum, not a maximum. Its lower bound is 65,536,
-the block-reference ring required by TRON transaction validation.
-batch_blocks is 1..4096 and bounds raw block bodies per maintenance batch;
-each height-keyed store also receives at most that many deletes per write batch.
-A block can contain many transactions, so transaction-reference deletes and
-memory consumption also depend on block size. interval_seconds is
-1..31,536,000. History maintenance first runs after min(interval_seconds, 30)
-seconds at startup, then at the configured interval. ACK never starts a pass.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `retain_blocks` | 100,000 | Window of applied blocks kept for peers and event-log consumers. At least 65,536, the block-reference ring transaction validation needs. |
+| `undo_retain_blocks` | 10,000 | Undo records kept for reorgs. |
+| `batch_blocks` | 1,000 | Cleanup portion, 1..4096, shared by every history store. |
+| `status_port` | 28092 | Loopback port of the read-only status endpoint. `ack_port` is accepted as an old name. |
 
-The managed mode disables the independent Firehose retain_mb eviction policy,
-including startup gap recovery. Without a fresh ACK, disk use may grow beyond
-the minimum reserve. Monitor free disk; an ACK is permission to discard history,
-not an automatic guarantee of bounded disk use.
+The trusted-cluster write journal has its own window, `[assist] retain_blocks`
+(10,000 by default; 0 records nothing), and uses the same `batch_blocks` portion.
+See [assisted sync](../assisted-sync.md).
 
-## ACK API
+`interval_seconds` from earlier versions is ignored. While this mode is
+enabled the Firehose `retain_mb` byte budget is not applied.
 
-The node binds 127.0.0.1:ack_port, without a public bind option.
+## Window and portions
 
-~~~http
-POST /history/ack
-Content-Type: application/json
-
-{"height":87547127,"block_id":"<64 hexadecimal characters, including height prefix>"}
-~~~
-
-Only ACK a whole block after committing all its derived data in the indexer's
-database. Use a finalized canonical checkpoint, with its exact 32-byte block ID.
-For multiple independent indexers, an aggregator must ACK their lowest safe
-checkpoint; this endpoint represents one monotonically advancing consumer boundary.
-
-The handler checks syntax and monotonicity, then updates RAM only.
-It does not read node databases, fsync, wake the pruning task or delete anything.
-
-~~~json
-{"accepted":true,"changed":true,"persistent":false,"prune_started":false}
-~~~
-
-The identical ACK is idempotent (changed:false). Regression and same-height
-hash conflicts return 409; invalid IDs and height prefixes return 400.
-accepted means recorded in memory, not yet validated against the chain.
-On its timer the pruner requires the ACK to be solidified and its ID to match
-the canonical block index. Failure holds pruning.
-
-GET /history returns the RAM ACK, published prune_before boundary, configuration,
-and counts of removed bodies, Firehose segments and undo records. It also reports
-undo_retain_blocks, the current undo_prune_before target, and undo_interval_seconds.
-prune_before is the logical
-retention boundary, not a claim that events exist at every height above it.
-
-ACKs do not survive a node restart. Resend the indexer's durable checkpoint.
-A previously published pruning boundary does survive and cleanup below it can
-continue without another ACK: that history was already authorized for removal.
-The preserved ACK anchor is checked against the canonical chain at startup.
-Malformed metadata, a mismatched database, or violation of the consensus reserve
-fails closed.
-
-## Retention semantics
-
-For a valid ACK A, current applied head H and minimum reserve K:
+For applied head H, solidified height S, window K and portion B:
 
 ~~~text
-new_floor = max(old_floor, max(1, min(A, H - K + 1)))
-delete heights < new_floor
+target = min(H - K + 1, S)
+if target - floor >= B:  floor += floor((target - floor) / B) * B
+delete heights < floor
 ~~~
 
-The ACK block itself remains available as an anchor. If ACKs stop, pruning stops
-advancing even as the node continues syncing. Genesis and the latest K blocks
-are retained. The pruner does not modify account, contract or current-state data.
+- Nothing is removed until a whole portion is due, and the boundary then moves
+  by whole portions. In steady state exactly B blocks go at a time, and between
+  K and K + B blocks are stored.
+- The window counts applied blocks only. Blocks that are received and waiting
+  to be applied are outside it, so a node that is far behind is not limited by
+  K while it catches up.
+- The solidified block is never removed, even when finality stalls; it is also
+  the persisted chain anchor.
+- On the first start over an old database the boundary jumps to the target in
+  one step (still a multiple of B) and the backlog is deleted in write batches
+  of at most B rows.
+
+Maintenance looks at the chain every 30 seconds; a portion of 1,000 blocks
+takes about 50 minutes to accumulate, so this only bounds how late a due
+portion starts.
 
 Cleanup removes old raw bodies (including stored forks), canonical height rows,
 per-block transaction results, transaction-height references and
 transaction-by-ID results. A reference or receipt reassigned to a newer inclusion
 is preserved. Reference deletion is made durable before deleting its source body;
-an interrupted batch can be rerun. This maintenance durability is separate from
-the unchanged apply/Firehose fsync policy.
+an interrupted batch can be rerun. The pruner does not modify account, contract
+or current-state data.
 
-Undo has an independent undo_retain_blocks setting (default 10,000; positive
-and fitting signed 64-bit). Its cleanup does not depend on an indexer ACK or
-advance the block/event replay boundary. For applied head H, solid height S
-and undo reserve U, it deletes heights below max(1, min(H - U + 1, S + 1)).
-Thus all unfinalized undo is protected even when finalization stalls. The target
-is a retained window after maintenance, with temporary extra rows between passes;
-it is not a hard instantaneous cap.
+Undo records follow their own window: with undo reserve U, heights below
+max(1, min(H - U + 1, S + 1)) are due, so all unfinalized undo is protected
+even when finalization stalls. They are removed by the same rule — only when a
+whole portion is due, one portion at a time. Committed crash recovery uses the
+node's forward checkpoint manifests, not these records.
 
-Undo maintenance starts at startup and repeats every min(interval_seconds, 30)
-seconds. Each write deletes at most batch_blocks undo rows and yields between
-batches. Undo and ordinary history use independent maintenance futures, so a
-large undo backlog cannot postpone the history timer. Both run outside block
-apply, with no extra apply fsync or backpressure.
-A failed batch is retried idempotently. Committed crash recovery uses the node's
-existing forward checkpoint manifests; deleting finalized undo does not remove
-those manifests or change their fsync policy. Consumer replay uses retained
-Firehose events and receipts, not these old state before-images.
+The logical boundary is persisted before physical deletion and survives a
+restart together with its anchor (the solidified block at the time). At startup
+the anchor is checked against the canonical chain; malformed metadata, a
+mismatched database or a boundary inside the consensus reserve fails closed.
+Cleanup below an already published boundary resumes after a restart.
 
-The evaluation now uses 150,000 blocks of ordinary history and 10,000 of undo,
-with 128-row batches and an hourly ordinary-history schedule. Ordinary history
-still requires a valid consumer ACK. Current-state databases are not pruned by history maintenance.
-
-The logical boundary is persisted before physical deletion. gRPC rejects data
-below it immediately; raw wallet/history APIs lose old rows incrementally.
-Closed Firehose segments are removed only when every event is older than the
-boundary. Segment inspection runs outside the apply writer lock; unlink takes
-the lock briefly, one file at a time. The active segment is never removed.
-Segment granularity can retain additional older events.
+gRPC rejects data below the boundary immediately; raw wallet/history APIs lose
+old rows incrementally. Closed Firehose segments are removed only when every
+event is older than the boundary. Segment inspection runs outside the apply
+writer lock; unlink takes the lock briefly, one file at a time. The active
+segment is never removed, and segment granularity can retain some older events.
 
 RocksDB deletes create tombstones. Normal compaction reclaims their disk space
 later; no full online compaction or immediate disk-space reduction is promised.
+
+## No acknowledgements
+
+The window does not depend on any consumer. There is no acknowledgement
+endpoint, and nothing a consumer does or fails to do moves or holds the
+boundary. A consumer keeps its own durable checkpoint and names the block it
+wants to continue from:
+
+- an event-log consumer opens `Firehose.Tail` with `from_height` (below);
+- a cluster partner sends the block it stands on.
+
+When that block is below the window the node answers explicitly — gRPC
+`OUT_OF_RANGE` for the event log, `HISTORY_GAP` for a cluster partner — and the
+consumer recovers on its own: a cluster partner takes a new state snapshot and
+continues with live blocks; an indexer treats it as a critical error and has to
+be caught up from an external source.
+
+Size the window for the longest outage a consumer must survive without that
+recovery: 100,000 blocks is about 83 hours at a three-second cadence.
+
+## Status
+
+The node binds 127.0.0.1:status_port, without a public bind option.
+
+~~~http
+GET /history
+~~~
+
+~~~json
+{"prune_before":88140001,"retain_blocks":100000,"batch_blocks":1000,
+ "undo_retain_blocks":10000,"undo_prune_before":88230001,"undo_removed":4000,
+ "blocks_removed":3000,"segments_removed":2,"check_interval_seconds":30}
+~~~
+
+`prune_before` is the logical retention boundary, not a claim that events exist
+at every height above it. Counters are since process start.
 
 ## Replay without restarting the node
 
@@ -142,9 +139,9 @@ Open a new gRPC Firehose.Tail request:
 ~~~
 
 The height is inclusive. After replaying the retained journal, the same request
-follows new entries. To resume after an indexed finalized ACK, use ACK + 1.
-A reconnect with a different height changes only that subscriber's cursor.
-Existing subscribers and node sync continue normally.
+follows new entries. To resume after an indexed finalized checkpoint C, use
+C + 1. A reconnect with a different height changes only that subscriber's
+cursor. Existing subscribers and node sync continue normally.
 
 Do not also set a nonzero from_seq. Native sequence resume remains available:
 
@@ -161,60 +158,33 @@ Replay preserves UNWIND followed by replacement APPLY entries. Height replay
 rejects skipped heights, missing transaction information, invalid frames or an
 unwind before its starting anchor. Resume from an earlier finalized checkpoint
 when an unwind crosses that anchor. Requests outside retained history fail
-explicitly; managed mode does not silently advance an old sequence cursor.
+explicitly; the node does not silently advance an old cursor.
 
-The first complete Firehose APPLY in this evaluation is height 87,531,735.
 Earlier raw block availability does not mean VM receipts or complete Firehose
 events exist. The source node may still have native crash-recovery gaps or skip
-oversized Firehose frames. This patch detects incomplete height replay; it does
-not change those native delivery guarantees or reconstruct missing VM execution.
+oversized Firehose frames. Height replay detects an incomplete range; it does
+not reconstruct missing VM execution.
 
 ## Validation
 
-From the repository root:
+From the node directory:
 
 ~~~sh
-cargo test --release --locked -p tron-index --lib -- --test-threads=2
-cargo test --release --locked -p tron-grpc --test firehose_tail -- --test-threads=2
-cargo test --release --locked -p tron-node --lib history_pruning -- --test-threads=2
-cargo test --release --locked -p tron-node --lib firehose::tests -- --test-threads=2
-cargo test --release --locked -p tron-node --lib config::tests -- --test-threads=2
-cargo test --release --locked -p tron-node --test sync -- --test-threads=2
-cargo test --release --locked -p tron-chainbase block_undo -- --test-threads=2
-cargo test --release --locked -p tron-chainbase checkpoint -- --test-threads=2
-cargo build --release --locked -p tron-node --bin tron-node
+cargo test --release --locked -p tron-index --lib
+cargo test --release --locked -p tron-grpc --test firehose_tail
+cargo test --release --locked -p tron-node --lib history_pruning
+cargo test --release --locked -p tron-node --lib assisted_sync
+cargo test --release --locked -p tron-node --lib config
 ~~~
 
-Before replacing the service binary, preserve the prior executable and runtime
-configuration outside Git. Ensure the new executable is readable and executable
-by the service user (0755), even when cargo ran under root with umask 077.
-Recreate a collected transient unit if needed, preserving its 6 GiB soft /
-8 GiB hard memory limits and other existing sandbox/resource settings.
+Tests cover whole-portion movement of the boundary, the consensus reserve,
+stalled finality, a partial portion left alone, bounded deletion, same-height
+fork bodies, newer transaction inclusion, injected maintenance-write failures,
+metadata validation, restart with a published boundary, the read-only status
+socket (an acknowledgement request is a 404), independent undo portions, real
+RocksDB reopen, and the cluster journal cut in portions without a byte budget.
+gRPC tests cover simultaneous sequence and height subscribers, the replay/live
+transition, UNWIND and explicit source-gap failure.
 
-Tests cover independent undo limits, stalled finality, real RocksDB reopen,
-undo write failures, startup cleanup without ACK, backward-compatible config,
-and a slow-undo regression proving that history still runs on its timer,
-bounded deletion, reserve/ACK guards, same-height fork bodies,
-newer transaction inclusion, injected maintenance-write failures, metadata
-validation, restart without a RAM ACK, and a real REST socket whose ACK waits
-for the independent timer. gRPC tests cover simultaneous sequence and height
-subscribers, replay/live transition, UNWIND and explicit source-gap failure.
-
-Production history must not be pruned using invented test ACKs. The node-only
-deployment initially started with ACK:null; the connected indexer now sends
-real solid checkpoints. Destructive pruning checks use isolated fixtures. Runtime configuration, database files, original binary, receipts,
-logs and deployment evidence remain outside Git.
-
-Live verification after deployment read the same eight entries from height
-87,531,735 and native seq 1, then replayed height 87,547,291 through 87,547,305
-and followed beyond the pre-request head. Canonical block IDs matched the wallet
-API; 17 peers and zero consensus divergences were observed. An invalid REST ACK
-returned 400 and left ACK:null with zero deleted bodies/segments. All 147 relevant
-tests passed (81 index, 3 gRPC, 9 history pruning, 10 Firehose, 44 configuration).
-
-The independent undo update passed 129 Rust checks: 17 maintenance tests,
-44 configuration tests, 29 sync/reorg tests, 10 Firehose tests, 6 undo-store
-tests and 23 checkpoint tests. The monitoring suite passed 23 tests, including
-older node responses without undo fields. The connected indexer service recovered
-through startup replay after the node restart; all 1,192 saved balances and
-totalSupply matched contract calls again.
+Destructive pruning checks use isolated fixtures. Runtime configuration,
+database files, receipts, logs and deployment evidence remain outside Git.

@@ -513,7 +513,32 @@ retain_blocks = 2592000
 enable = false
 # Retention budget in MiB; oldest segments are pruned past it. Consumers
 # further behind than retention resume at the oldest retained entry.
+# Ignored while [index.firehose.history] is enabled.
 retain_mb = 32768
+
+# Fixed block-history window. With `enable = true` the node keeps the newest
+# `retain_blocks` applied blocks (bodies, receipts, transaction references and
+# the event log above) and deletes older ones, so the data directory grows
+# with the chain state rather than with the number of blocks.
+#
+# The window does not depend on any consumer: nobody acknowledges anything.
+# A consumer names the block it wants to start from; below the window the
+# node answers "out of range" and the consumer has to recover on its own.
+#
+# Cleanup runs in whole portions of `batch_blocks`: nothing is removed until
+# a full portion is due and exactly one portion goes at a time, so between
+# `retain_blocks` and `retain_blocks + batch_blocks` blocks are stored. The
+# same portion applies to the undo log and to the cluster journal ([assist]).
+# Blocks that are received but not applied yet are outside the window.
+[index.firehose.history]
+enable = false
+# At least 65536 — the block-reference window transaction validation needs.
+retain_blocks = 100000
+# Undo records for reorgs; only finalized ones are ever removed.
+undo_retain_blocks = 10000
+batch_blocks = 1000
+# Loopback port of the read-only status endpoint, GET /history.
+status_port = 28092
 
 # -----------------------------------------------------------------------------
 # [index.commitment] — VERIFIABLE STATE-COMMITMENT LAYER

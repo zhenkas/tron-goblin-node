@@ -46,6 +46,9 @@ message Fetch {
 message Delta {
   uint32 store = 1;
   bytes key = 2;
+  // Local annex only (BlockBundle.preimages): never transmitted and not part
+  // of the block digest. Partners prove the same prior values through
+  // BlockBundle.before_digest computed over their own state.
   optional bytes before = 3;
   optional bytes after = 4;
 }
@@ -68,9 +71,15 @@ message BlockBundle {
   // BlockApplied payload; seq belongs to the receiver's own journal.
   // solidified_height is zero in the hashed payload: finality travels in Status.
   bytes firehose_apply = 11;
+  // Format 1 carried the undo record here. It is derived from the prior
+  // values now and this field stays empty.
   bytes undo = 12;
   optional Rotation rotation = 13;
   bytes digest = 14;
+  // XXH64 over the prior value of every delta, in delta order (8 bytes, BE).
+  bytes before_digest = 15;
+  // True only in a node's own records: every Delta.before is filled in.
+  bool preimages = 16;
 }
 message Ack {
   int64 height = 1;

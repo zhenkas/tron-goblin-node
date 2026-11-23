@@ -872,8 +872,8 @@ This fork continues from upstream v1.4.0. It adds, on top of the upstream node:
 | Area | Description |
 |---|---|
 | java-tron 4.8.2.4 | Proposal 102 and TVM storage-key protection; state fixes found by comparing mainnet state with java-tron snapshots store by store |
-| Indexer feed | Whole-block ACK over loopback REST, history pruning driven by ACK / reserve / timer, gRPC replay from a height followed by live events: [history pruning](docs/local/history-pruning.md) |
-| Trusted cluster | Authenticated state and event catch-up between nodes of one operator: [assisted sync](docs/assisted-sync.md) |
+| Indexer feed | gRPC replay from a height followed by live events; the node keeps a fixed window of block history on its own, without acknowledgements from consumers: [history pruning](docs/local/history-pruning.md) |
+| Trusted cluster | Authenticated catch-up between nodes of one operator: blocks travel with their state changes and are proved against the receiver's own state; a member may keep a window of changes or only receive: [assisted sync](docs/assisted-sync.md) |
 | Execution policy | Optional stop on a block whose execution cannot be reproduced (`TRON_STOP_ON_EXECUTION_ERROR=1`): [fail-closed](docs/local/fail-closed.md) |
 | Private network | Producer / observer entry point for a private chain built from captured mainnet parameters: [private network](docs/PRIVATE-NETWORK.md) |
 | Wallet gateway | TronLink / TronWeb compatible gateway for a private network: [wallet gateway](docs/WALLET-GATEWAY.md) |

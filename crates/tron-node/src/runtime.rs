@@ -884,13 +884,13 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
         ));
     }
     if let Some(pruner) = index_parts.as_ref().and_then(|p| p.history.clone()) {
-        // Loopback-only; ACK mutates RAM, and never wakes this independent timer.
+        // Loopback-only, read-only status; the window is never moved from outside.
         let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
             [127, 0, 0, 1],
-            pruner.config.ack_port,
+            pruner.config.status_port,
         )))
         .await
-        .map_err(|e| RunError::Rpc(format!("history ACK bind: {e}")))?;
+        .map_err(|e| RunError::Rpc(format!("history status bind: {e}")))?;
         let app = crate::history_pruning::router(pruner.clone());
         let ack_shutdown = shutdown.clone();
         let mut sd = ack_shutdown.subscribe();
@@ -903,7 +903,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                 })
                 .await
             {
-                error!(error = %e, "history ACK listener exited");
+                error!(error = %e, "history status listener exited");
                     crate::critical_notifications::required_subsystem_failure("node_history_ack_failed", &e);
             }
         }));
@@ -921,9 +921,12 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
         let hook = index_hook.clone().ok_or_else(|| {
             RunError::Configuration("assisted sync requires a working index hook".into())
         })?;
+        // One cleanup portion for every history store, the cluster journal included.
+        let mut assist = config.assist.clone();
+        assist.prune_batch_blocks = config.index.firehose.history.batch_blocks.max(1) as u64;
         Some(std::sync::Arc::new(
             crate::assisted_sync::AssistRuntime::open(
-                config.assist.clone(),
+                assist,
                 &config.data_dir,
                 stores.clone(),
                 hook,

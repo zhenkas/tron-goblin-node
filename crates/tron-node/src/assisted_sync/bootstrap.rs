@@ -22,7 +22,7 @@ pub(super) fn crash_point(_name: &str) {
 
 pub const CHUNK: usize = 4 * 1024 * 1024;
 pub fn profile() -> Vec<u8> {
-    Sha256::digest(b"tron-assist-v1/full-deltas-ret-native-events-undo").to_vec()
+    Sha256::digest(journal::PROFILE).to_vec()
 }
 fn io(e: impl std::fmt::Display) -> String {
     e.to_string()

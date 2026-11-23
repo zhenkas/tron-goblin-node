@@ -6215,6 +6215,7 @@ dependencies = [
  "tron-tvm",
  "tron-types",
  "tron-wallet",
+ "twox-hash",
 ]
 
 [[package]]
