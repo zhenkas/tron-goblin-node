@@ -1015,40 +1015,56 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
             if let Some(archive) = parts.archive.as_ref() {
                 let prune_writer = archive.writer.clone();
                 let retain = config.index.archive.retain_blocks;
+                let portion = config.index.firehose.history.batch_blocks.max(1) as u64;
                 let prune_dyn_props = stores.dyn_props.clone();
                 let mut sd_prune = shutdown.subscribe();
                 handles.push(tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(Duration::from_secs(600));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     ticker.tick().await; // skip the immediate tick
                     loop {
                         tokio::select! {
                             _ = sd_prune.recv() => return,
                             _ = ticker.tick() => {
-                                let head = match prune_writer.coverage() {
-                                    Ok(Some((_, head))) => head,
-                                    _ => continue,
-                                };
-                                // Clamp the prune floor to the irreversible head
-                                // so a re-pinned anchor can never carry a value
-                                // from a reorg-able block.
-                                let solidified = tron_chainbase::DynamicPropertiesStore::new(
-                                    prune_dyn_props.clone(),
-                                )
-                                .latest_solidified_block_num()
-                                .unwrap_or(0);
-                                match prune_writer.prune_for_window(head, retain, solidified) {
-                                    Ok(Some(stats)) if !stats.noop => info!(
+                                // A pass walks the whole archive: keep it off
+                                // the async workers, and run it only once the
+                                // floor has moved by a whole shared portion.
+                                let writer = prune_writer.clone();
+                                let dyn_props = prune_dyn_props.clone();
+                                let pass = tokio::task::spawn_blocking(move || {
+                                    let head = match writer.coverage() {
+                                        Ok(Some((_, head))) => head,
+                                        _ => return Ok(None),
+                                    };
+                                    // Clamp the prune floor to the irreversible
+                                    // head so a kept anchor can never belong to
+                                    // a reorg-able block.
+                                    let solidified =
+                                        tron_chainbase::DynamicPropertiesStore::new(dyn_props)
+                                            .latest_solidified_block_num()
+                                            .unwrap_or(0);
+                                    writer
+                                        .prune_for_window(head, retain, solidified, portion)
+                                        .map(|stats| stats.map(|stats| (head, stats)))
+                                })
+                                .await;
+                                match pass {
+                                    Ok(Ok(Some((head, stats)))) if !stats.noop => info!(
+                                        rows_scanned = stats.rows_scanned,
                                         rows_deleted = stats.rows_deleted,
-                                        rows_repinned = stats.rows_repinned,
                                         base = stats.base_after,
                                         head,
                                         retain_blocks = retain,
                                         "archive: rolling-window prune"
                                     ),
-                                    Ok(_) => {}
-                                    Err(e) => warn!(
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => warn!(
                                         error = %e,
                                         "archive: rolling-window prune failed; will retry"
+                                    ),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "archive: rolling-window prune did not finish; will retry"
                                     ),
                                 }
                             }

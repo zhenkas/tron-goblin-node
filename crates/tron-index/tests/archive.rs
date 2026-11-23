@@ -345,8 +345,8 @@ fn at_height_scans_merge_live_and_archive_correctly() {
 // ---------------------------------------------------------------------------
 
 /// With a zero-block retain window the retention floor is clamped to the
-/// solidified (irreversible) height, so the anchor re-pinned at the floor can
-/// never carry a value from a block a later reorg orphans. After such a prune,
+/// solidified (irreversible) height, so the anchor kept at or below the floor
+/// can never carry a value from a block a later reorg orphans. After such a prune,
 /// a reorg that rewrites the reversible blocks just above the floor resolves
 /// cleanly: the floor's anchor (at the irreversible height) is untouched,
 /// reads at and above the floor reflect the NEW chain, and no read ever
@@ -368,9 +368,9 @@ fn zero_retain_prune_floor_survives_a_reorg_above_solidified() {
     assert_eq!(rig.writer.reader().coverage().unwrap(), Some((9, 20)));
 
     // retain_blocks = 0 would put the floor at head 20, but the solidified
-    // head is 15 — the floor must clamp to 15 so the re-pinned anchor sits at
+    // head is 15 — the floor must clamp to 15 so the kept anchor sits at
     // an irreversible height, never a reorg-able one.
-    let stats = rig.writer.prune_for_window(20, 0, 15).unwrap().unwrap();
+    let stats = rig.writer.prune_for_window(20, 0, 15, 1).unwrap().unwrap();
     assert!(!stats.noop);
     assert_eq!(rig.writer.coverage().unwrap(), Some((15, 20)));
 
@@ -391,12 +391,12 @@ fn zero_retain_prune_floor_survives_a_reorg_above_solidified() {
         let expected = format!("a{h}-new").into_bytes();
         assert_eq!(rig.value_at(b"a", h), AtHeight::Value(expected), "a@{h}");
     }
-    // The key written only on the orphaned chain resolves to absent (its
-    // covered anchor is the pre-creation tombstone re-pinned at the floor) —
-    // never the value it held on the orphaned chain.
-    assert_eq!(rig.value_at(b"orphan", 18), AtHeight::Deleted);
-    assert_eq!(rig.value_at(b"orphan", 20), AtHeight::Deleted);
-    assert_ne!(rig.value_at(b"orphan", 18), AtHeight::Value(b"old-only".to_vec()));
+    // The key written only on the orphaned chain has no rows left: the unwind
+    // removed its version together with the pre-creation pin that block had
+    // added. It reads as never captured, which resolves through the live
+    // state of the new chain — never the value it held on the orphaned one.
+    assert_eq!(rig.value_at(b"orphan", 18), AtHeight::NotCovered);
+    assert_eq!(rig.value_at(b"orphan", 20), AtHeight::NotCovered);
 
     // Coverage base stayed clamped at the solidified floor across the reorg.
     assert_eq!(rig.writer.coverage().unwrap(), Some((15, 20)));

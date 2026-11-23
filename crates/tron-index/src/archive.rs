@@ -248,9 +248,6 @@ pub struct PruneStats {
     /// Version rows deleted (strictly older than each key's retained
     /// anchor).
     pub rows_deleted: u64,
-    /// Anchors re-pinned at the new floor (a key whose newest version
-    /// `<= floor` sat strictly below it).
-    pub rows_repinned: u64,
     /// Coverage base before this pass.
     pub base_before: i64,
     /// Coverage base after this pass (== `floor` when the floor moved,
@@ -687,30 +684,48 @@ impl ArchiveWriter {
     /// covered range is a no-op. Returns `None` when capture has not
     /// started yet (no coverage to prune).
     ///
-    /// **Why clamp to `solidified`.** The floor's anchor is re-pinned as
-    /// the coverage base. If the floor sat at an unsolidified (reorg-able)
-    /// height, that re-pin could carry a value from a block that is later
-    /// orphaned; the reorg unwind deletes only ring-tracked rows, not the
-    /// re-pin, so a read at `>= floor` would serve the orphaned value
-    /// forever. Keeping the floor at or below the irreversible head makes
-    /// the anchor un-orphanable. (With the default multi-million-block
-    /// window the floor is already far below `solidified`; the clamp only
-    /// bites for very small retention windows, e.g. `retain_blocks == 0`.)
+    /// **Why clamp to `solidified`.** Everything older than a key's newest
+    /// version at or below the floor is deleted. If the floor sat at an
+    /// unsolidified (reorg-able) height, that newest version could belong
+    /// to a block that is later orphaned; the reorg unwind would remove it
+    /// and the versions it had replaced would already be gone. Keeping the
+    /// floor at or below the irreversible head makes the anchor
+    /// un-orphanable. (With a wide window the floor is already far below
+    /// `solidified`; the clamp only bites for very small retention windows,
+    /// e.g. `retain_blocks == 0`.)
+    ///
+    /// **Portions.** A pass walks every stored version, so its cost follows
+    /// the size of the window, not the distance the floor moved. `portion`
+    /// is the number of blocks the floor must have advanced past the stored
+    /// base before a pass runs; until then the call is a no-op. Up to
+    /// `retain_blocks + portion` blocks of versions are therefore stored.
+    /// `portion <= 1` prunes on every call.
     ///
     /// The engine stays config-agnostic — the caller supplies the head,
-    /// the window, and the solidified height; **full-history mode is
-    /// simply never calling this.**
+    /// the window, the solidified height and the portion; **full-history
+    /// mode is simply never calling this.**
     pub fn prune_for_window(
         &self,
         head: i64,
         retain_blocks: u64,
         solidified: i64,
+        portion: u64,
     ) -> Result<Option<PruneStats>, IndexError> {
         if self.head()?.is_none() {
             return Ok(None);
         }
         let retain = i64::try_from(retain_blocks).unwrap_or(i64::MAX);
         let floor = head.saturating_sub(retain).min(solidified).max(0);
+        let base = self.base_height()?.unwrap_or(floor);
+        let portion = i64::try_from(portion).unwrap_or(i64::MAX);
+        if floor > base && floor - base < portion {
+            return Ok(Some(PruneStats {
+                base_before: base,
+                base_after: base,
+                noop: true,
+                ..PruneStats::default()
+            }));
+        }
         self.prune_below(floor).map(Some)
     }
 
@@ -725,10 +740,14 @@ impl ArchiveWriter {
     ///
     /// * every version `> floor` is kept (a read at some `H` in
     ///   `(floor, head]` may land on it);
-    /// * the anchor (newest version `<= floor`) is kept, and if it sits
-    ///   strictly below `floor` it is **re-pinned at `floor`** so the
-    ///   new coverage base `floor` has a row to resolve, exactly like
-    ///   the writer's first-write base pin;
+    /// * the anchor (newest version `<= floor`) is kept where it is. It
+    ///   may sit strictly below `floor`: the read seeks the newest
+    ///   version `<= H` and finds it there. It is **not rewritten at the
+    ///   floor** — doing so would rewrite one row for every key ever
+    ///   captured on every pass, a cost that follows the number of keys
+    ///   instead of the number of changes. A later first write of such a
+    ///   key adds the writer's usual base pin holding the same value;
+    ///   the anchor then falls behind it and a later pass removes it;
     /// * every version strictly older than the anchor is deleted.
     ///
     /// In row-key space versions of one key are contiguous and ordered
@@ -777,9 +796,7 @@ impl ArchiveWriter {
         //     UNDER-claim — H < floor is rejected as out-of-coverage while
         //     its rows may still physically exist, which is safe.
         // Re-prune stays idempotent: the next pass runs a higher rolling
-        // floor, which still sweeps any rows a crashed pass left behind, and
-        // an unrepinned anchor below `floor` reads correctly from its
-        // original (lower-height) row until then.
+        // floor, which still sweeps any rows a crashed pass left behind.
         self.backend.write_batch(&[WriteOp::Put(
             meta_key(b"base_height"),
             floor.to_be_bytes().to_vec(),
@@ -790,8 +807,8 @@ impl ArchiveWriter {
         // Stream every version row in byte order, grouping by the
         // (store ‖ escaped-key) prefix. Within a group rows are
         // newest-first; the first row with height <= floor is the
-        // anchor — keep it (re-pinning when it sits below floor), drop
-        // everything after it in the group.
+        // anchor — keep it where it is, drop everything after it in the
+        // group.
         let mut ops: Vec<WriteOp> = Vec::new();
         let mut cur: Vec<u8> = vec![TAG_ROW];
         let mut group: Vec<u8> = Vec::new();
@@ -807,7 +824,7 @@ impl ArchiveWriter {
                 break;
             }
             let n = chunk.len();
-            for (k, v) in &chunk {
+            for (k, _) in &chunk {
                 let Some((prefix, height)) = split_row_key(k) else {
                     // Left the TAG_ROW keyspace (meta rows sort before
                     // TAG_ROW, version rows are the tail) — done.
@@ -828,18 +845,8 @@ impl ArchiveWriter {
                     ops.push(WriteOp::Delete(k.clone()));
                     stats.rows_deleted += 1;
                 } else if height <= floor {
-                    // The anchor: newest version <= floor. Keep it; if it
-                    // sits below the floor, re-pin its value at the floor
-                    // and drop the original so coverage starts cleanly at
-                    // `floor` (mirrors the writer's base pin).
-                    if height < floor {
-                        let mut repin = prefix.to_vec();
-                        repin.extend_from_slice(&height_desc(floor));
-                        ops.push(WriteOp::Put(repin, v.clone()));
-                        ops.push(WriteOp::Delete(k.clone()));
-                        stats.rows_repinned += 1;
-                        stats.rows_deleted += 1;
-                    }
+                    // The anchor: newest version <= floor. Kept untouched,
+                    // at whatever height it was written.
                     past_anchor = true;
                 }
                 // else height > floor → kept, no op.
@@ -848,12 +855,8 @@ impl ArchiveWriter {
                 let drained = std::mem::take(&mut ops);
                 self.backend.write_batch(&drained)?;
             }
-            // Advance the cursor past the last key scanned. The
-            // re-pin Put lands at `height_desc(floor)`, which sorts
-            // *before* the original (lower height) row we delete in the
-            // same batch, and both sort within the group we have already
-            // moved past — so resuming after the last scanned key never
-            // revisits a written row.
+            // Advance the cursor past the last key scanned. A pass only
+            // deletes rows it has already moved past.
             let mut next = chunk[n - 1].0.clone();
             next.push(0);
             cur = next;
@@ -866,7 +869,7 @@ impl ArchiveWriter {
         Ok(stats)
     }
 
-    /// Flush the final delete/re-pin batch, then fsync. The coverage base
+    /// Flush the final delete batch, then fsync. The coverage base
     /// was already advanced to `floor` (durably) at the start of the pass,
     /// so this only has to make the row deletions durable.
     fn commit_prune(
@@ -889,7 +892,6 @@ impl ArchiveWriter {
             base_before = stats.base_before,
             rows_scanned = stats.rows_scanned,
             rows_deleted = stats.rows_deleted,
-            rows_repinned = stats.rows_repinned,
             "archive: retention prune advanced coverage base"
         );
         Ok(())
@@ -1394,17 +1396,16 @@ mod tests {
         let stats = w.prune_below(floor).unwrap();
         assert!(!stats.noop);
         assert_eq!(stats.base_after, floor);
-        assert!(stats.rows_deleted > 0);
-        // Both `b` (anchor = the height-2 write) and `c` (anchor = the
-        // height-0 base-pinned pre-image tombstone) sit below the floor,
-        // so each is re-pinned at the floor exactly once. `a` has a true
-        // version at the floor, so it is not re-pinned.
-        assert_eq!(stats.rows_repinned, 2);
+        // Exactly the superseded versions go: a@1..=9, a's base pin and
+        // b's base pin. The anchors of `b` (the height-2 write) and `c`
+        // (the base-pinned pre-image tombstone) sit below the floor and
+        // are left where they are — nothing is rewritten.
+        assert_eq!(stats.rows_deleted, 11);
         assert_eq!(w.coverage().unwrap(), Some((floor, 20)));
 
         // Reads at and above the floor are byte-exact. `c` did not exist
         // until height 15, so a covered read below it resolves to its
-        // re-pinned pre-image (Deleted), never a stale live fall-through.
+        // pinned pre-image (Deleted), never a stale live fall-through.
         for h in floor..=20 {
             assert_eq!(r.value_at(STORE, &a, h).unwrap(), val(&[h as u8]), "a@{h}");
             assert_eq!(r.value_at(STORE, &b, h).unwrap(), val(b"b-early"), "b@{h}");
@@ -1413,22 +1414,89 @@ mod tests {
         }
 
         // The boundary read at exactly the floor resolves to the anchor
-        // (a@10 is the version written at 10; b's re-pinned anchor).
+        // (a@10 is the version written at 10; b's anchor from height 2).
         assert_eq!(r.value_at(STORE, &a, floor).unwrap(), val(&[10u8]));
         assert_eq!(r.value_at(STORE, &b, floor).unwrap(), val(b"b-early"));
 
-        // Below the floor the deep history is gone: the seek can only
-        // find the anchor (re-pinned at floor), never a true sub-floor
-        // version. The API layer rejects H < base via `coverage`; here
-        // we assert no stale sub-floor row survived for `a`.
+        // Below the floor the deep history is gone. The API layer rejects
+        // H < base via `coverage`; here we assert no superseded sub-floor
+        // row survived for `a`.
         assert!(
             w.backend.get(&row_key(STORE, &a, 9)).unwrap().is_none(),
             "a@9 should have been pruned"
         );
         assert!(w.backend.get(&row_key(STORE, &a, 1)).unwrap().is_none());
-        // b's original sub-floor row is gone; its re-pin sits at floor.
-        assert!(w.backend.get(&row_key(STORE, &b, 2)).unwrap().is_none());
-        assert!(w.backend.get(&row_key(STORE, &b, floor)).unwrap().is_some());
+        // b's anchor stays at its own height; no copy is written at the floor.
+        assert!(w.backend.get(&row_key(STORE, &b, 2)).unwrap().is_some());
+        assert!(w.backend.get(&row_key(STORE, &b, floor)).unwrap().is_none());
+        assert!(w.backend.get(&row_key(STORE, &b, 0)).unwrap().is_none());
+    }
+
+    /// The cost of a pass follows the changes, not the number of keys: a
+    /// key that stays unchanged keeps its single anchor through any number
+    /// of passes without being rewritten, and its next write is captured
+    /// with a base pin exactly as a first write is.
+    #[test]
+    fn unchanged_keys_are_not_rewritten_by_later_passes() {
+        let w = writer();
+        let r = w.reader();
+        let mut model = HashMap::new();
+        let busy = key(0xaa);
+        let quiet = key(0xbb);
+        apply(&w, &mut model, 1, &[(quiet.clone(), Some(b"q1".to_vec()))]);
+        for h in 2..=40i64 {
+            apply(&w, &mut model, h, &[(busy.clone(), Some(vec![h as u8]))]);
+        }
+        // First pass removes quiet's base pin and busy's old versions.
+        assert!(w.prune_below(10).unwrap().rows_deleted > 0);
+        // Later passes touch only busy's superseded versions: ten each.
+        for floor in [20i64, 30] {
+            let stats = w.prune_below(floor).unwrap();
+            assert_eq!(stats.rows_deleted, 10, "floor {floor}");
+            assert!(w.backend.get(&row_key(STORE, &quiet, 1)).unwrap().is_some());
+            assert!(w.backend.get(&row_key(STORE, &quiet, floor)).unwrap().is_none());
+            assert_eq!(r.value_at(STORE, &quiet, floor).unwrap(), val(b"q1"));
+        }
+        // The quiet key changes again above the floor: every height of the
+        // window still reads exactly, on both sides of the change.
+        apply(&w, &mut model, 41, &[(quiet.clone(), Some(b"q41".to_vec()))]);
+        for h in 30..=40 {
+            assert_eq!(r.value_at(STORE, &quiet, h).unwrap(), val(b"q1"), "quiet@{h}");
+        }
+        assert_eq!(r.value_at(STORE, &quiet, 41).unwrap(), val(b"q41"));
+        // The next pass drops the old anchor behind the base pin; reads hold.
+        apply(&w, &mut model, 42, &[(busy.clone(), Some(vec![42]))]);
+        w.prune_below(35).unwrap();
+        assert!(w.backend.get(&row_key(STORE, &quiet, 1)).unwrap().is_none());
+        for h in 35..=40 {
+            assert_eq!(r.value_at(STORE, &quiet, h).unwrap(), val(b"q1"), "quiet@{h}");
+        }
+        assert_eq!(r.value_at(STORE, &quiet, 42).unwrap(), val(b"q41"));
+    }
+
+    /// A pass runs only once the floor has moved by a whole portion.
+    #[test]
+    fn window_prune_waits_for_a_whole_portion() {
+        let w = writer();
+        let mut model = HashMap::new();
+        for h in 1..=100 {
+            apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
+        }
+        // Base 0, floor 60: six portions of ten are due.
+        assert!(!w.prune_for_window(100, 40, 100, 10).unwrap().unwrap().noop);
+        assert_eq!(w.coverage().unwrap().unwrap().0, 60);
+        for h in 101..=109 {
+            apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
+            let waiting = w.prune_for_window(h, 40, h, 10).unwrap().unwrap();
+            assert!(waiting.noop, "head {h}");
+            assert_eq!(waiting.rows_scanned, 0);
+            assert_eq!(w.coverage().unwrap().unwrap().0, 60);
+        }
+        apply(&w, &mut model, 110, &[(key(1), Some(vec![110]))]);
+        let due = w.prune_for_window(110, 40, 110, 10).unwrap().unwrap();
+        assert!(!due.noop);
+        assert_eq!(due.rows_deleted, 10);
+        assert_eq!(w.coverage().unwrap().unwrap().0, 70);
     }
 
     #[test]
@@ -1479,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_key_repinned_below_floor() {
+    fn deleted_key_stays_deleted_below_floor() {
         let w = writer();
         let r = w.reader();
         let mut model = HashMap::new();
@@ -1494,14 +1562,14 @@ mod tests {
 
         let floor = 10;
         w.prune_below(floor).unwrap();
-        // d's last version (a tombstone at 4 < floor) must be re-pinned
-        // at the floor as a tombstone — reads at H >= floor see Deleted.
+        // d's last version (a tombstone at 4 < floor) is its anchor and
+        // stays as a tombstone — reads at H >= floor see Deleted.
         assert_eq!(r.value_at(STORE, &d, floor).unwrap(), AtHeight::Deleted);
         assert_eq!(r.value_at(STORE, &d, 20).unwrap(), AtHeight::Deleted);
-        assert!(w.backend.get(&row_key(STORE, &d, 4)).unwrap().is_none());
+        assert!(w.backend.get(&row_key(STORE, &d, 1)).unwrap().is_none());
         assert_eq!(
             dec_value(
-                &w.backend.get(&row_key(STORE, &d, floor)).unwrap().unwrap(),
+                &w.backend.get(&row_key(STORE, &d, 4)).unwrap().unwrap(),
                 &ArchiveCounters::default()
             ),
             AtHeight::Deleted
@@ -1559,13 +1627,13 @@ mod tests {
             apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
         }
         // Window of 40 blocks at head 100 (solidified 100) → floor 60.
-        let s = w.prune_for_window(100, 40, 100).unwrap().unwrap();
+        let s = w.prune_for_window(100, 40, 100, 1).unwrap().unwrap();
         assert!(!s.noop);
         assert_eq!(w.coverage().unwrap().unwrap().0, 60);
 
         // Window wider than the covered range → floor clamps at 0,
         // which is <= base (now 60) → no-op.
-        let wide = w.prune_for_window(100, 1_000, 100).unwrap().unwrap();
+        let wide = w.prune_for_window(100, 1_000, 100, 1).unwrap().unwrap();
         assert!(wide.noop);
         assert_eq!(w.coverage().unwrap().unwrap().0, 60);
     }
@@ -1578,9 +1646,9 @@ mod tests {
             apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
         }
         // retain_blocks = 0 would put the floor at head 100, but the
-        // solidified head is 90 — the floor must clamp to 90 so the re-pinned
+        // solidified head is 90 — the floor must clamp to 90 so the kept
         // anchor sits at an irreversible height, never a reorg-able one.
-        let s = w.prune_for_window(100, 0, 90).unwrap().unwrap();
+        let s = w.prune_for_window(100, 0, 90, 1).unwrap().unwrap();
         assert!(!s.noop);
         assert_eq!(w.coverage().unwrap().unwrap().0, 90);
         // Reads at and above the clamped floor still resolve exactly.
@@ -1591,7 +1659,7 @@ mod tests {
     #[test]
     fn prune_for_window_before_capture_is_none() {
         let w = writer();
-        assert_eq!(w.prune_for_window(100, 10, 100).unwrap(), None);
+        assert_eq!(w.prune_for_window(100, 10, 100, 1).unwrap(), None);
     }
 
     /// Many keys + a tight chunk-spanning prune: exercises group
@@ -1638,12 +1706,14 @@ mod tests {
                 );
             }
         }
-        // No row strictly below the floor survived for a sampled key.
+        // A sampled key is written at every third height, so its anchor
+        // is the write at 24: that row stays, nothing older survives.
         let sample = vec![0x41u8, 0, 0];
-        for h in 1..floor {
+        assert!(w.backend.get(&row_key(STORE, &sample, 24)).unwrap().is_some());
+        for h in 0..24 {
             assert!(
                 w.backend.get(&row_key(STORE, &sample, h)).unwrap().is_none(),
-                "sample row @{h} below floor survived"
+                "sample row @{h} older than the anchor survived"
             );
         }
     }
@@ -1824,8 +1894,7 @@ mod tests {
 
         // A later prune at a higher floor sweeps every leftover sub-floor row
         // — including the ones the interrupted pass never reached — and
-        // re-pins `b`'s anchor at the new floor. Reads at and above it stay
-        // exact.
+        // leaves `b`'s anchor where it is. Reads at and above it stay exact.
         let higher = 15i64;
         let s = w.prune_below(higher).unwrap();
         assert!(!s.noop);
@@ -1841,8 +1910,9 @@ mod tests {
                 "a@{h} leftover below the new floor"
             );
         }
-        assert!(w.backend.get(&row_key(STORE, &b, 2)).unwrap().is_none());
-        assert!(w.backend.get(&row_key(STORE, &b, higher)).unwrap().is_some());
+        assert!(w.backend.get(&row_key(STORE, &b, 2)).unwrap().is_some());
+        assert!(w.backend.get(&row_key(STORE, &b, 0)).unwrap().is_none());
+        assert!(w.backend.get(&row_key(STORE, &b, higher)).unwrap().is_none());
     }
 
     /// The invariant that makes a lock-free at-height read safe against a
