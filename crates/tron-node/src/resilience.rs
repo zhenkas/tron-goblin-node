@@ -150,6 +150,10 @@ pub struct ResiliencePolicy<'a> {
     /// `isOpenFullTcpDisconnect`). Off-by-default; when off, the
     /// random-elimination rule is skipped entirely.
     pub open_full_tcp_disconnect: bool,
+    /// When the node last received or applied a block from anyone, unix
+    /// ms (0 = unknown). Input of the isolation rule next to the
+    /// per-peer `block_recv_ms`.
+    pub node_block_recv_ms: u64,
 }
 
 impl<'a> ResiliencePolicy<'a> {
@@ -346,7 +350,16 @@ impl<'a> ResiliencePolicy<'a> {
             .iter()
             .filter(|p| !p.need_sync_from_peer && !p.need_sync_from_us)
             .count();
-        let latest_block_ms = self.peers.iter().map(|p| p.block_recv_ms).max().unwrap_or(0);
+        // java-tron measures this against the node's latest saved block,
+        // not against per-connection counters: a chain that is moving is
+        // not isolated, whichever connections are registered right now.
+        let latest_block_ms = self
+            .peers
+            .iter()
+            .map(|p| p.block_recv_ms)
+            .max()
+            .unwrap_or(0)
+            .max(self.node_block_recv_ms);
         let diff = self.now_ms.saturating_sub(latest_block_ms);
         adv_peer_count >= 1 && diff >= self.config.block_not_change_threshold.as_millis() as u64
     }
@@ -371,11 +384,22 @@ impl ResilienceService {
     /// Run one decision pass against a peer-list snapshot. Pulled out
     /// of [`run`] so tests can exercise it without a tokio executor.
     pub fn tick(&self, peers: &[PeerSnapshot], now_ms: u64) -> Vec<ResilienceDecision> {
+        self.tick_with_block_clock(peers, now_ms, 0)
+    }
+
+    /// [`tick`](Self::tick) with the node-wide time of the latest block.
+    pub fn tick_with_block_clock(
+        &self,
+        peers: &[PeerSnapshot],
+        now_ms: u64,
+        node_block_recv_ms: u64,
+    ) -> Vec<ResilienceDecision> {
         let policy = ResiliencePolicy {
             config: &self.config,
             peers,
             now_ms,
             open_full_tcp_disconnect: self.open_full_tcp_disconnect,
+            node_block_recv_ms,
         };
         policy.evaluate()
     }
@@ -384,9 +408,23 @@ impl ResilienceService {
     /// return the current peer snapshot; decisions are sent on
     /// `decisions_tx`. The loop exits when `decisions_tx` is dropped
     /// by the receiver.
-    pub async fn run<F>(self, mut peers_fn: F, decisions_tx: mpsc::Sender<ResilienceDecision>)
+    pub async fn run<F>(self, peers_fn: F, decisions_tx: mpsc::Sender<ResilienceDecision>)
     where
         F: FnMut() -> Vec<PeerSnapshot> + Send + 'static,
+    {
+        self.run_with_block_clock(peers_fn, || 0, decisions_tx).await
+    }
+
+    /// [`run`](Self::run) with `block_clock_fn` polled per tick for the
+    /// node-wide time of the latest block.
+    pub async fn run_with_block_clock<F, B>(
+        self,
+        mut peers_fn: F,
+        mut block_clock_fn: B,
+        decisions_tx: mpsc::Sender<ResilienceDecision>,
+    ) where
+        F: FnMut() -> Vec<PeerSnapshot> + Send + 'static,
+        B: FnMut() -> u64 + Send + 'static,
     {
         let mut ticker = time::interval(self.tick_interval);
         // Skip the first immediate tick — java-tron uses a 300s initial
@@ -396,7 +434,7 @@ impl ResilienceService {
             ticker.tick().await;
             let peers = peers_fn();
             let now_ms = crate::node_statistics::unix_now_ms();
-            for decision in self.tick(&peers, now_ms) {
+            for decision in self.tick_with_block_clock(&peers, now_ms, block_clock_fn()) {
                 self.statistics
                     .record_local_disconnect(&decision.peer_key, decision.cause.reason())
                     .await;
@@ -456,6 +494,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: true,
+            node_block_recv_ms: 0,
         };
         assert!(policy.evaluate().is_empty());
 
@@ -471,6 +510,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: false,
+            node_block_recv_ms: 0,
         };
         assert!(policy.evaluate().is_empty());
 
@@ -480,6 +520,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: true,
+            node_block_recv_ms: 0,
         };
         let decisions = policy.evaluate();
         assert_eq!(decisions.len(), 1);
@@ -504,6 +545,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: true,
+            node_block_recv_ms: 0,
         };
         let decisions = policy.evaluate();
         // Trust peer is exempt even though it'd be the otherwise-oldest pick.
@@ -526,6 +568,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: false, // disable rule 1 to isolate rule 2
+            node_block_recv_ms: 0,
         };
         let decisions = policy.evaluate();
         let lan_decisions: Vec<_> = decisions
@@ -550,6 +593,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: false,
+            node_block_recv_ms: 0,
         };
         assert!(policy
             .evaluate()
@@ -574,6 +618,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: false,
+            node_block_recv_ms: 0,
         };
         let decisions = policy.evaluate();
         let causes: Vec<_> = decisions.iter().map(|d| d.cause).collect();
@@ -590,6 +635,31 @@ mod tests {
         assert!(causes.contains(&DisconnectCause::IsolatedPassive));
     }
 
+    /// The chain is moving (the node applied a block seconds ago) while
+    /// no registered connection carries a fresh block time — a new
+    /// connection has not delivered one yet. That is not isolation.
+    #[test]
+    fn moving_chain_is_not_isolated_whatever_the_peers_report() {
+        let cfg = config_for_tests();
+        let now = 1_000_000;
+        let peers = vec![
+            peer("a", true, now - 30_000, 0),
+            // Passive, so the all-dialers rule stays out of the picture.
+            peer("b", false, now - 10_000, now - 120_000),
+        ];
+        let policy = |node_block_recv_ms| ResiliencePolicy {
+            config: &cfg,
+            peers: &peers,
+            now_ms: now,
+            open_full_tcp_disconnect: false,
+            node_block_recv_ms,
+        };
+        assert!(policy(now - 3_000).evaluate().is_empty());
+        // The same peers with a stalled node: the rule still fires.
+        let causes: Vec<_> = policy(now - 120_000).evaluate().iter().map(|d| d.cause).collect();
+        assert_eq!(causes, vec![DisconnectCause::IsolatedActive]);
+    }
+
     #[test]
     fn no_decisions_when_node_is_healthy() {
         let cfg = config_for_tests();
@@ -603,6 +673,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: true,
+            node_block_recv_ms: 0,
         };
         assert!(policy.evaluate().is_empty());
     }
@@ -625,6 +696,7 @@ mod tests {
             peers: &peers,
             now_ms: now,
             open_full_tcp_disconnect: true,
+            node_block_recv_ms: 0,
         };
         let decisions = policy.evaluate();
         let mut keys: Vec<&str> = decisions.iter().map(|d| d.peer_key.as_str()).collect();

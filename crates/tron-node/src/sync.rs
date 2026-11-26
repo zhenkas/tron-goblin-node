@@ -2236,6 +2236,10 @@ impl SyncDriver {
 
     fn log_sync_progress(&mut self, block: &Block, block_num: i64, peer: &str) {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Called once per applied block: the chain moved, whoever fed it.
+        if let Some(reg) = &self.peer_registry {
+            reg.note_block(crate::node_statistics::unix_now_ms());
+        }
         if self.config.progress_log_interval == 0 {
             return;
         }
@@ -4876,6 +4880,7 @@ impl SyncDriver {
                     // (java-tron's `block_recv_ms`) — the isolation-breakout
                     // rule fires only when NO peer has delivered one recently.
                     if let Some(reg) = &self.peer_registry {
+                        reg.note_block(now_ms);
                         reg.touch(peer, |s| s.block_recv_ms = now_ms);
                     }
                     // Release the live-tip single-slot scheduler if the

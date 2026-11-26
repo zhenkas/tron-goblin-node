@@ -7,6 +7,7 @@
 //! java-tron's `TronNetDelegate.getActivePeer()` view.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::resilience::PeerSnapshot;
@@ -17,11 +18,26 @@ use crate::resilience::PeerSnapshot;
 #[derive(Clone, Debug, Default)]
 pub struct PeerRegistry {
     inner: Arc<Mutex<HashMap<String, PeerSnapshot>>>,
+    /// When the node last received or applied a block from anyone, unix
+    /// ms. Node-wide on purpose: the isolation rule asks whether the
+    /// chain is moving, and that must not depend on which connections
+    /// happen to be registered at the moment of the check.
+    block_clock_ms: Arc<AtomicU64>,
 }
 
 impl PeerRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that a block arrived or was applied at `now_ms`.
+    pub fn note_block(&self, now_ms: u64) {
+        self.block_clock_ms.fetch_max(now_ms, Ordering::Relaxed);
+    }
+
+    /// Latest [`note_block`](Self::note_block) time; 0 before the first.
+    pub fn last_block_ms(&self) -> u64 {
+        self.block_clock_ms.load(Ordering::Relaxed)
     }
 
     /// Insert / replace the snapshot for `peer_key`. Called by the
@@ -120,6 +136,18 @@ mod tests {
         let r = PeerRegistry::new();
         r.touch("ghost", |s| s.last_interactive_ms = 9_999);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn block_clock_is_shared_and_never_goes_back() {
+        let r1 = PeerRegistry::new();
+        let r2 = r1.clone();
+        assert_eq!(r1.last_block_ms(), 0);
+        r1.note_block(5_000);
+        r2.note_block(4_000);
+        assert_eq!(r2.last_block_ms(), 5_000);
+        // No peer needs to be registered for the clock to advance.
+        assert!(r1.is_empty());
     }
 
     #[test]

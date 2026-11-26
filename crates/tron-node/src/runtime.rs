@@ -1673,9 +1673,56 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
     let dynamic_pool: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    if !config.p2p.disabled && config.p2p.discover_enable && !seed_peers.is_empty() {
-        let seed_socks: Vec<std::net::SocketAddr> =
-            seed_peers.iter().filter_map(|s| s.parse().ok()).collect();
+    // DNS-tree discovery (EIP-1459-style). For each configured
+    // `tree://{pubkey}@{domain}` URL, walk the TXT-record tree and
+    // merge the discovered endpoints into the dial list. This is the
+    // production peer-discovery path — the mainnet tree typically
+    // returns 2000+ endpoints. It runs before the Kad service starts so a
+    // node with no configured peers still has endpoints to bootstrap from.
+    if !config.p2p.disabled && !config.p2p.discover_tree_urls.is_empty() {
+        let query_timeout = Duration::from_millis(config.p2p.discover_tree_query_timeout_ms);
+        let mut tree_total = 0usize;
+        let mut seen: std::collections::HashSet<String> = combined_peers.iter().cloned().collect();
+        for url in &config.p2p.discover_tree_urls {
+            match tron_net::resolve_dns_tree(url, query_timeout).await {
+                Ok(eps) => {
+                    let n = eps.len();
+                    tree_total += n;
+                    for addr in eps {
+                        let s = addr.to_string();
+                        if seen.insert(s.clone()) {
+                            combined_peers.push(s);
+                        }
+                    }
+                    info!(
+                        url = url.as_str(),
+                        endpoints = n,
+                        total_unique = combined_peers.len(),
+                        "dns: tree walk complete"
+                    );
+                }
+                Err(e) => {
+                    warn!(url = url.as_str(), error = %e,
+                          "dns: tree walk failed; continuing");
+                }
+            }
+        }
+        if tree_total > 0 {
+            info!(
+                tree_endpoints_total = tree_total,
+                combined_peers = combined_peers.len(),
+                "dns: discovery complete"
+            );
+        }
+    }
+
+    // The Kad service is how other nodes learn this one exists: without it
+    // nobody ever dials the inbound listener. It bootstraps from whatever is
+    // known by now — configured peers first, then the persisted table, then
+    // the DNS tree — so it also starts when no peer is configured.
+    let kad_seeds = kad_bootstrap_seeds(&combined_peers, KAD_BOOTSTRAP_SEEDS);
+    if !config.p2p.disabled && config.p2p.discover_enable && !kad_seeds.is_empty() {
+        let seed_socks = kad_seeds;
         let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.p2p.advertise_port)
             .parse()
             .unwrap();
@@ -1692,6 +1739,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
         let network_id = tron_net::MAINNET_P2P_VERSION;
         #[cfg(feature = "private-network")]
         let network_id = private_profile.p2p_network_id;
+        let kad_seed_count = seed_socks.len();
         match tron_net::KadService::new(bind_addr, home_id, public_addr, network_id, seed_socks)
             .await
         {
@@ -1720,7 +1768,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                     }
                 }
                 info!(
-                    seeds = seed_peers.len(),
+                    seeds = kad_seed_count,
                     discovered = discovered_n,
                     total_unique = combined_peers.len(),
                     "kad: bootstrap snapshot taken"
@@ -1814,48 +1862,6 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                 warn!(error = %e, port = config.p2p.advertise_port,
                       "kad: UDP bind failed; continuing with seed-only dial list");
             }
-        }
-    }
-
-    // DNS-tree discovery (EIP-1459-style). For each configured
-    // `tree://{pubkey}@{domain}` URL, walk the TXT-record tree and
-    // merge the discovered endpoints into the dial list. This is the
-    // production peer-discovery path — the mainnet tree typically
-    // returns 2000+ endpoints, dwarfing the 13 hardcoded seeds.
-    if !config.p2p.disabled && !config.p2p.discover_tree_urls.is_empty() {
-        let query_timeout = Duration::from_millis(config.p2p.discover_tree_query_timeout_ms);
-        let mut tree_total = 0usize;
-        let mut seen: std::collections::HashSet<String> = combined_peers.iter().cloned().collect();
-        for url in &config.p2p.discover_tree_urls {
-            match tron_net::resolve_dns_tree(url, query_timeout).await {
-                Ok(eps) => {
-                    let n = eps.len();
-                    tree_total += n;
-                    for addr in eps {
-                        let s = addr.to_string();
-                        if seen.insert(s.clone()) {
-                            combined_peers.push(s);
-                        }
-                    }
-                    info!(
-                        url = url.as_str(),
-                        endpoints = n,
-                        total_unique = combined_peers.len(),
-                        "dns: tree walk complete"
-                    );
-                }
-                Err(e) => {
-                    warn!(url = url.as_str(), error = %e,
-                          "dns: tree walk failed; continuing");
-                }
-            }
-        }
-        if tree_total > 0 {
-            info!(
-                tree_endpoints_total = tree_total,
-                combined_peers = combined_peers.len(),
-                "dns: discovery complete"
-            );
         }
     }
 
@@ -2246,6 +2252,8 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
         // on every SyncBlockChain it serves, and `block_recv_ms` on every
         // Block frame — so the isolation-breakout rule (no block from ANY
         // peer for 60s while we hold adv-eligible peers) can actually fire.
+        // The registry's node-wide block clock is the other input of that
+        // rule: a chain that is moving is never isolated.
         // `open_full_tcp_disconnect` stays false deliberately: the random-
         // elimination rule exists for nodes accepting inbound connections at
         // their cap, which we don't yet do; with all-outbound dialers it
@@ -2266,6 +2274,7 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
                 open_full_tcp_disconnect: false,
             };
             let registry_for_peers_fn = peer_registry.clone();
+            let registry_for_block_clock = peer_registry.clone();
             let eviction_tx_resilience = eviction_tx.clone();
             let (decisions_tx, mut decisions_rx) =
                 tokio::sync::mpsc::channel::<crate::resilience::ResilienceDecision>(64);
@@ -2291,7 +2300,11 @@ async fn run_inner(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), R
             }));
             handles.push(tokio::spawn(async move {
                 resilience
-                    .run(move || registry_for_peers_fn.snapshot(), decisions_tx)
+                    .run_with_block_clock(
+                        move || registry_for_peers_fn.snapshot(),
+                        move || registry_for_block_clock.last_block_ms(),
+                        decisions_tx,
+                    )
                     .await;
             }));
         }
@@ -3820,6 +3833,17 @@ pub(crate) fn assemble_peers(p2p: &crate::config::P2pConfig) -> Vec<String> {
     out
 }
 
+/// How many known endpoints the Kad service pings at start. Enough to reach
+/// live nodes through a partly stale list without a burst at every endpoint
+/// of the DNS tree.
+const KAD_BOOTSTRAP_SEEDS: usize = 64;
+
+/// The first `cap` endpoints of the assembled peer list that are plain socket
+/// addresses, in order: configured peers, then persisted, then discovered.
+pub(crate) fn kad_bootstrap_seeds(peers: &[String], cap: usize) -> Vec<std::net::SocketAddr> {
+    peers.iter().filter_map(|s| s.parse().ok()).take(cap).collect()
+}
+
 #[cfg(test)]
 mod assemble_peers_tests {
     use super::assemble_peers;
@@ -3830,6 +3854,24 @@ mod assemble_peers_tests {
         // No explicit peers: the startup dial list is empty and the node
         // bootstraps purely via discovery (DNS tree + Kad DHT).
         assert!(assemble_peers(&P2pConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn discovery_bootstraps_without_configured_peers() {
+        // No configured peer, only endpoints found on disk and in the DNS
+        // tree: the Kad service still gets seeds, so the node announces
+        // itself. Unparseable entries are skipped and the burst is capped.
+        assert!(assemble_peers(&P2pConfig::default()).is_empty());
+        let found: Vec<String> = ["10.0.0.1:18888", "not-an-endpoint", "10.0.0.2:18888", "10.0.0.3:18888"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let seeds = super::kad_bootstrap_seeds(&found, 2);
+        assert_eq!(
+            seeds,
+            vec!["10.0.0.1:18888".parse().unwrap(), "10.0.0.2:18888".parse().unwrap()]
+        );
+        assert!(super::kad_bootstrap_seeds(&[], 2).is_empty());
     }
 
     #[test]
