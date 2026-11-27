@@ -2665,6 +2665,8 @@ impl SyncDriver {
         // avoid-cooldown. Reset whenever we actually dial; capped at the pool
         // size so a fully-cooling-down pool still gets dialed (no idle deadlock).
         let mut avoid_skips = 0usize;
+        // Consecutive peers skipped because another driver holds them.
+        let mut claim_skips = 0usize;
 
         loop {
             // Check shutdown first so we exit promptly even mid-loop.
@@ -2726,6 +2728,26 @@ impl SyncDriver {
                 continue;
             }
             avoid_skips = 0;
+            // One driver per peer. Another driver is already dialing or
+            // connected to this one: a second connection would only take a
+            // slot on both sides, and its end would drop the registry entry
+            // of the live one. Move on; pace once a whole pass found nothing
+            // free (a single-peer driver waits here for its peer).
+            if let Some(reg) = &self.peer_registry {
+                if !reg.try_claim(&peer) {
+                    claim_skips += 1;
+                    cursor = (cursor + 1) % shuffled.len();
+                    if claim_skips >= shuffled.len() {
+                        claim_skips = 0;
+                        tokio::select! {
+                            _ = shutdown.recv() => return self.stats.clone(),
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        }
+                    }
+                    continue;
+                }
+            }
+            claim_skips = 0;
             // Stamp the dial-recency tracker before we dial, so even
             // if we crash mid-attempt the next restart knows we tried
             // this peer recently.
@@ -2739,7 +2761,7 @@ impl SyncDriver {
                     // dropping a SyncDriver mid-handshake would leave
                     // stale entries otherwise.
                     if let Some(reg) = &self.peer_registry {
-                        reg.unregister(&peer);
+                        reg.release(&peer);
                     }
                     return self.stats.clone();
                 }
@@ -2748,12 +2770,12 @@ impl SyncDriver {
             // The pass is over, so this driver no longer leads: bodies it
             // still holds go back to the pool for whoever leads next.
             self.return_orphans_to_pool();
-            // Drop the live registry entry now — the peer-pass is
-            // over either way. Stats table retains the disconnect
-            // record (set just above PeerFailure / inside the
+            // Drop the live registry entry and free the peer now — the
+            // peer-pass is over either way. Stats table retains the
+            // disconnect record (set just above PeerFailure / inside the
             // P2pDisconnect branch).
             if let Some(reg) = &self.peer_registry {
-                reg.unregister(&peer);
+                reg.release(&peer);
             }
             match outcome {
                 PeerOutcome::CaughtUp => {

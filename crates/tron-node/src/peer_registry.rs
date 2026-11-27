@@ -6,7 +6,7 @@
 //! the registry's snapshot to decide eviction candidates. Mirrors
 //! java-tron's `TronNetDelegate.getActivePeer()` view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,11 +23,34 @@ pub struct PeerRegistry {
     /// chain is moving, and that must not depend on which connections
     /// happen to be registered at the moment of the check.
     block_clock_ms: Arc<AtomicU64>,
+    /// Peers a driver is dialing or connected to right now. One driver
+    /// per peer: a second connection to the same peer adds nothing, and
+    /// its end would drop the registry entry of the first.
+    claims: Arc<Mutex<HashSet<String>>>,
 }
 
 impl PeerRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserve `peer_key` for the calling driver before it dials. `false`
+    /// means another driver already holds this peer; the caller picks a
+    /// different one. Pair every `true` with [`release`](Self::release).
+    pub fn try_claim(&self, peer_key: &str) -> bool {
+        match self.claims.lock() {
+            Ok(mut g) => g.insert(peer_key.to_string()),
+            Err(_) => true,
+        }
+    }
+
+    /// End of the claiming driver's pass: free the peer for others and
+    /// drop its snapshot.
+    pub fn release(&self, peer_key: &str) {
+        if let Ok(mut g) = self.claims.lock() {
+            g.remove(peer_key);
+        }
+        self.unregister(peer_key);
     }
 
     /// Record that a block arrived or was applied at `now_ms`.
@@ -136,6 +159,23 @@ mod tests {
         let r = PeerRegistry::new();
         r.touch("ghost", |s| s.last_interactive_ms = 9_999);
         assert!(r.is_empty());
+    }
+
+    /// Two drivers picking the same peer: the second is turned away, so
+    /// its exit cannot remove the entry of the connection that is alive.
+    #[test]
+    fn one_driver_per_peer() {
+        let r = PeerRegistry::new();
+        let other = r.clone();
+        assert!(r.try_claim("a"));
+        r.register("a", sample("a"));
+        assert!(!other.try_claim("a"));
+        assert!(other.try_claim("b"));
+        other.release("b");
+        assert_eq!(r.len(), 1, "the live connection keeps its entry");
+        r.release("a");
+        assert!(r.is_empty());
+        assert!(other.try_claim("a"), "free again after release");
     }
 
     #[test]
